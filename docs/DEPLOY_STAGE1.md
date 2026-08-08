@@ -106,9 +106,12 @@ chmod 600 .env
 
 ```bash
 mysql -u <пользователь> -p www-root_bondkeeper < database/001_schema.sql
+mysql -u <пользователь> -p www-root_bondkeeper < database/002_issuer_moex_emitter_id.sql
 ```
 
-Вариант Б — через phpMyAdmin (он уже установлен по конфигурации ПО): зайти в базу `www-root_bondkeeper` → вкладка **Импорт** → выбрать файл `database/001_schema.sql` → Выполнить.
+Вариант Б — через phpMyAdmin (он уже установлен по конфигурации ПО): зайти в базу `www-root_bondkeeper` → вкладка **Импорт** → выбрать файл `database/001_schema.sql` → Выполнить → повторить для `database/002_issuer_moex_emitter_id.sql`.
+
+`002_...sql` обязателен — без него `issuers.inn` останется `NOT NULL`, а ISS API его не отдаёт (см. README, раздел «Что бесплатно»), и `seed_market.php` не запишет ни одного эмитента.
 
 Проверка сразу после накатки:
 
@@ -126,7 +129,7 @@ SELECT * FROM tariffs;                              -- ожидается 4 ст
 
 ## Шаг 5. Первый ручной прогон — и это главная часть тестирования
 
-`README.md` в репозитории прямо предупреждает: импортёры проверены на структуре БД и на тестовых данных, но **не проверены против живого `iss.moex.com`**, потому что в среде разработки не было исходящего доступа в интернет. Первый запуск на сервере — это и есть недостающая часть проверки пункта дорожной карты «всё ли можно вытащить бесплатно».
+Схема и маппинг полей уже проверены на реальном ответе ISS API (bondkeeper.ru, август 2026 — см. README, раздел «Что бесплатно»), но точечно, на паре ISIN через `bin/debug_iss_security.php`. Первый полный прогон `seed_market.php` на всём рынке (~3000 бумаг) на сервере — это проверка, что маппинг держится не только на паре примеров.
 
 ```bash
 php bin/seed_market.php 2>&1 | tee /tmp/seed_market_first_run.log
@@ -135,7 +138,8 @@ php bin/seed_market.php 2>&1 | tee /tmp/seed_market_first_run.log
 Смотреть в вывод построчно:
 
 - `Обнаружено бумаг для импорта: N` — если N = 0, значит discovery-эндпоинт (`/engines/stock/markets/bonds/boards/{TQCB,TQIR,TQOB}/securities.json`) вернул не то, что ожидалось, — открыть его напрямую (`curl https://iss.moex.com/iss/engines/stock/markets/bonds/boards/TQCB/securities.json`) и свериться со списком колонок в `SecuritiesImporter::discoverIsinList()`.
-- Строки `Поля с пропусками...` в конце отчёта — ожидаемая часть работы, не баг: там всегда будут `coupon_type`, `is_subordinated`, `is_structured`, `is_qualified_investors_only` (осознанно не автоматизированы, см. README) и, вероятно, часть `issuers.inn` — это и есть тот самый неподтверждённый пробел (связка ISIN → ИНН эмитента), который нужно оценить количественно на реальных данных: если `Пропущено (не найден ИНН эмитента)` окажется близко к общему числу бумаг — значит, поле, которое пробует код (`EMITTER_INN`/`ISSUER_INN`/`EMITENT_INN`), в реальном ответе называется иначе, и его нужно поправить в `resolveOrCreateIssuer()` по факту реального JSON.
+- `Пропущено (нет даже EMITTER_ID): N` — должно быть близко к нулю (в проверенных примерах `EMITTER_ID` был всегда). Если тут окажется много бумаг — открыть `bin/debug_iss_security.php` на нескольких из них и посмотреть, что не так.
+- Строки `Поля с пропусками...` в конце отчёта — ожидаемая часть работы, не баг: `issuers.inn` там будет всегда (ISS API его не отдаёт в принципе, это подтверждённый факт, не пробел в коде — см. README), `is_subordinated`/`is_structured` тоже (поле не найдено). А вот `is_qualified_investors_only` расти не должно — оно теперь читается из реального поля `ISQUALIFIEDINVESTORS`; если растёт — значит, у части бумаг это поле в ответе отсутствует, стоит проверить через `debug_iss_security.php`.
 
 Затем:
 
@@ -166,6 +170,10 @@ SELECT s.isin, s.nominal_value, r.value_per_bond
 FROM redemptions r JOIN securities s ON s.id = r.security_id
 WHERE r.redemption_type = 'scheduled_maturity' AND r.value_per_bond < s.nominal_value
 LIMIT 20;
+
+-- Список эмитентов без ИНН (ожидаемо — все, ISS API его не отдаёт) — это
+-- не ошибка, а рабочий список на будущее дообогащение отдельным источником.
+SELECT COUNT(*) AS без_инн, (SELECT COUNT(*) FROM issuers) AS всего FROM issuers WHERE inn IS NULL;
 ```
 
 Проверка идемпотентности — запустить оба скрипта повторно и убедиться, что:
@@ -211,5 +219,6 @@ mkdir -p /var/www/www-root/data/bondkeeper-app/var/log
 | `Не удалось получить ответ от ISS API` | нет исходящего доступа в интернет с сервера, либо блокировка firewall/DNS | `curl -I https://iss.moex.com/iss/index.json` с сервера; если не отвечает — вопрос к хостеру/файрволу, не к коду |
 | `SQLSTATE[HY000] [1045] Access denied` | неверные данные в `.env` | перепроверить пользователя/пароль/имя БД из шага 2 |
 | `Обнаружено бумаг для импорта: 0` | discovery-эндпоинт/имена колонок разошлись с реальным ответом API | см. шаг 5, свериться напрямую через `curl` |
-| Почти все бумаги пропущены с `не удалось определить ИНН эмитента` | поле ИНН в реальном ответе называется не так, как в коде | поправить список алиасов в `SecuritiesImporter::resolveOrCreateIssuer()` по фактическому JSON |
+| Почти все бумаги пропущены с `в description нет даже EMITTER_ID` | это уже не про ИНН (тот вопрос закрыт в `002_issuer_moex_emitter_id.sql`) — если пропадает даже `EMITTER_ID`, значит поменялась сама форма ответа `description` | прогнать `bin/debug_iss_security.php <ISIN>` на паре пропущенных бумаг, сверить с кодом в `resolveOrCreateIssuer()` |
+| `SQLSTATE[42S22] Unknown column 'moex_emitter_id'` | забыли применить `database/002_issuer_moex_emitter_id.sql` | накатить миграцию 002 (шаг 4) |
 | `.env` открывается в браузере по `https://bondkeeper.ru/.env` | код лежит внутри DocumentRoot без `.htaccess`-защиты | перенести код за пределы DocumentRoot (шаг 1) или добавить `.htaccess` |
