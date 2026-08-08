@@ -16,6 +16,7 @@ PHP 8.3+ (CLI, `pdo_mysql`, `curl`), MySQL 8.0+, cron. Без composer/фрей�
 ```
 database/001_schema.sql              — базовая схема БД (см. "Изменения относительно v2" ниже)
 database/002_issuer_moex_emitter_id.sql — миграция: ИНН эмитента не отдаётся ISS API (см. ниже)
+database/003_widen_value_per_bond.sql   — миграция: DECIMAL(12,4) тесна для номиналов от 100 млн ₽
 src/Database.php                     — подключение к MySQL (PDO)
 src/Iss/IssClient.php                — HTTP-клиент ISS API Мосбиржи
 src/Iss/SecuritiesImporter.php       — issuers/securities/redemptions(scheduled_maturity)
@@ -32,6 +33,7 @@ cp .env.example .env   # прописать реальные DB_* значени
 mysql -u root -p -e "CREATE DATABASE bondkeeper CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
 mysql -u root -p bondkeeper < database/001_schema.sql
 mysql -u root -p bondkeeper < database/002_issuer_moex_emitter_id.sql
+mysql -u root -p bondkeeper < database/003_widen_value_per_bond.sql
 
 php bin/seed_market.php        # issuers, securities, redemptions(scheduled_maturity)
 php bin/seed_bondization.php   # coupons, amortizations
@@ -66,3 +68,5 @@ ISIN, SECID, рег. номер, краткое/полное наименова�
 НКД на произвольную дату (считается по графику купонов), `full_default_date_planned` (плановая дата полного дефолта — считается сами: `period_end_date` + 10 рабочих дней по производственному календарю), доходность к оферте отдельно от доходности к погашению.
 
 Практический вывод: справочник **бумаг и графика выплат** (кластер 1 почти целиком, включая часть риск-флагов) сидируется бесплатно и автоматически прямо сейчас. Связка **бумага → эмитент-юрлицо с ИНН** — единственное реальное узкое место, но оно больше не блокирует импорт: эмитенты создаются по `EMITTER_ID`, а ИНН — отдельная, самостоятельная задача дообогащения.
+
+**Итог первого полного боевого прогона** (`seed_market.php` на bondkeeper.ru, весь рынок ~3061 бумага): **2995 успешно (97,8%)**, 59 — нет `EMITTER_ID` (нестандартные инструменты, не исследовано отдельно), 7 упали на `DECIMAL(12,4)` тесной для номинала 100 000 000 ₽ (институциональные лоты — исправлено в `003_widen_value_per_bond.sql`).

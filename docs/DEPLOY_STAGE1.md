@@ -107,11 +107,12 @@ chmod 600 .env
 ```bash
 mysql -u <пользователь> -p www-root_bondkeeper < database/001_schema.sql
 mysql -u <пользователь> -p www-root_bondkeeper < database/002_issuer_moex_emitter_id.sql
+mysql -u <пользователь> -p www-root_bondkeeper < database/003_widen_value_per_bond.sql
 ```
 
-Вариант Б — через phpMyAdmin (он уже установлен по конфигурации ПО): зайти в базу `www-root_bondkeeper` → вкладка **Импорт** → выбрать файл `database/001_schema.sql` → Выполнить → повторить для `database/002_issuer_moex_emitter_id.sql`.
+Вариант Б — через phpMyAdmin (он уже установлен по конфигурации ПО): зайти в базу `www-root_bondkeeper` → вкладка **Импорт** → выбрать файл `database/001_schema.sql` → Выполнить → повторить для `database/002_issuer_moex_emitter_id.sql` и `database/003_widen_value_per_bond.sql`.
 
-`002_...sql` обязателен — без него `issuers.inn` останется `NOT NULL`, а ISS API его не отдаёт (см. README, раздел «Что бесплатно»), и `seed_market.php` не запишет ни одного эмитента.
+`002_...sql` обязателен — без него `issuers.inn` останется `NOT NULL`, а ISS API его не отдаёт (см. README, раздел «Что бесплатно»), и `seed_market.php` не запишет ни одного эмитента. `003_...sql` нужен для бумаг с крупным номиналом (от 100 млн ₽ за бумагу) — без него часть институциональных выпусков будет падать с `SQLSTATE 22003 Out of range`.
 
 Проверка сразу после накатки:
 
