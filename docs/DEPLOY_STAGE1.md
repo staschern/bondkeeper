@@ -139,8 +139,9 @@ php bin/seed_market.php 2>&1 | tee /tmp/seed_market_first_run.log
 Смотреть в вывод построчно:
 
 - `Обнаружено бумаг для импорта: N` — если N = 0, значит discovery-эндпоинт (`/engines/stock/markets/bonds/boards/{TQCB,TQIR,TQOB}/securities.json`) вернул не то, что ожидалось, — открыть его напрямую (`curl https://iss.moex.com/iss/engines/stock/markets/bonds/boards/TQCB/securities.json`) и свериться со списком колонок в `SecuritiesImporter::discoverIsinList()`.
-- `Пропущено (нет даже EMITTER_ID): N` — должно быть близко к нулю (в проверенных примерах `EMITTER_ID` был всегда). Если тут окажется много бумаг — открыть `bin/debug_iss_security.php` на нескольких из них и посмотреть, что не так.
-- Строки `Поля с пропусками...` в конце отчёта — ожидаемая часть работы, не баг: `issuers.inn` там будет всегда (ISS API его не отдаёт в принципе, это подтверждённый факт, не пробел в коде — см. README), `is_subordinated`/`is_structured` тоже (поле не найдено). А вот `is_qualified_investors_only` расти не должно — оно теперь читается из реального поля `ISQUALIFIEDINVESTORS`; если растёт — значит, у части бумаг это поле в ответе отсутствует, стоит проверить через `debug_iss_security.php`.
+- `Пропущено (не нашлась в поиске ISS API): N` — импортёр ищет каждую бумагу через `/iss/securities.json?q={ISIN}`; должно быть близко к нулю. Если тут много бумаг — открыть `bin/debug_iss_security.php` на нескольких из них.
+- Строки `Поля с пропусками...` в конце отчёта — ожидаемая часть работы, не баг: `is_subordinated`/`is_structured` (поле в ISS API не найдено) там будут всегда. А вот `issuers.inn` и `is_qualified_investors_only` расти не должны (или должны быть единичными) — оба теперь читаются из реальных полей ответа (`emitent_inn` из поиска и `ISQUALIFIEDINVESTORS` из карточки бумаги соответственно); если растут — стоит проверить через `debug_iss_security.php`, что изменилось в ответе API.
+- Если на сервере уже есть эмитенты, созданные более ранней версией импортёра (без ИНН — только `moex_emitter_id`), повторный прогон дозаполнит им `inn`/названия автоматически: `resolveOrCreateIssuer()` перезаписывает эти поля при каждом апсерте, а не только при первом создании.
 
 Затем:
 
@@ -172,8 +173,8 @@ FROM redemptions r JOIN securities s ON s.id = r.security_id
 WHERE r.redemption_type = 'scheduled_maturity' AND r.value_per_bond < s.nominal_value
 LIMIT 20;
 
--- Список эмитентов без ИНН (ожидаемо — все, ISS API его не отдаёт) — это
--- не ошибка, а рабочий список на будущее дообогащение отдельным источником.
+-- Эмитенты без ИНН — теперь должно быть близко к нулю (ИНН резолвится через
+-- /iss/securities.json?q=, см. README). Если тут много строк — см. шаг 5.
 SELECT COUNT(*) AS без_инн, (SELECT COUNT(*) FROM issuers) AS всего FROM issuers WHERE inn IS NULL;
 ```
 
