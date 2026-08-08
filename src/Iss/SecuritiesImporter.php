@@ -17,17 +17,27 @@ use PDO;
  * записей удалось заполнить, а сколько пришлось пропустить из-за отсутствия
  * данных в бесплатном источнике. Это статистика и есть ответ на вопрос
  * "всё ли можно вытащить" — а не предположение, а факт, полученный по
- * итогам реального прогона (см. README.md, "Как читать отчёт после прогона").
+ * итогам реального прогона.
  *
- * Маппинг полей ниже проверен на реальном ответе ISS API по нескольким
- * бумагам (bondkeeper.ru, август 2026), не на предположениях — см.
- * database/002_issuer_moex_emitter_id.sql для истории находки про ИНН.
+ * Два запроса на бумагу, оба проверены на реальном ответе ISS API
+ * (bondkeeper.ru, август 2026):
+ *   1. /iss/securities.json?q={ISIN} — общий поиск. Отдаёт emitent_id/
+ *      emitent_title/emitent_inn напрямую (то, чего НЕ было в /iss/
+ *      securities/{ISIN}.json — см. database/002_issuer_moex_emitter_id.sql
+ *      про более раннюю, ошибочную попытку через EMITTER_ID без ИНН).
+ *      Также отдаёт secid — который для гособлигаций (ОФЗ) НЕ совпадает
+ *      с ISIN (например ISIN RU0002868001 = SECID SU46012RMFS9), в
+ *      отличие от большинства корпоративных бумаг, где они совпадают.
+ *   2. /iss/securities/{SECID}.json — карточка самой бумаги (description):
+ *      номинал, даты, купон и т.д. Ключевая правка: раньше эту карточку
+ *      запрашивали по ISIN, что молча возвращало пустой ответ для всех
+ *      ОФЗ — 59 бумаг из 3061 пропадали именно поэтому.
  */
 final class SecuritiesImporter
 {
     private int $securitiesSeen = 0;
     private int $securitiesImported = 0;
-    private int $skippedNoEmitterId = 0;
+    private int $skippedNotFoundInSearch = 0;
     private int $skippedOther = 0;
 
     /** @var array<string, int> поле схемы => сколько раз осталось NULL из-за отсутствия в ISS-ответе */
@@ -110,25 +120,53 @@ final class SecuritiesImporter
 
     private function importOne(string $isin): void
     {
-        $response = $this->iss->getJson("/securities/{$isin}.json", [
+        $identity = $this->searchIdentity($isin);
+        if ($identity === null) {
+            $this->skippedNotFoundInSearch++;
+            Logger::warn("{$isin}: не нашёлся в /iss/securities.json?q= — бумага пропущена (см. отчёт)");
+            return;
+        }
+
+        $issuerId = $this->resolveOrCreateIssuer($identity);
+
+        $secid = $identity['secid'] ?? $isin;
+        $response = $this->iss->getJson("/securities/{$secid}.json", [
             'iss.only' => 'description,boards',
         ]);
-
         $description = $this->descriptionMap(IssClient::block($response, 'description'));
         $boards = IssClient::block($response, 'boards');
         $primaryBoard = $this->pickPrimaryBoard($boards);
 
-        $issuerId = $this->resolveOrCreateIssuer($description);
-        if ($issuerId === null) {
-            $this->skippedNoEmitterId++;
-            Logger::warn("{$isin}: в description нет даже EMITTER_ID — бумага пропущена (см. отчёт)");
-            return;
-        }
-
-        $securityId = $this->upsertSecurity($isin, $issuerId, $description, $primaryBoard);
+        $securityId = $this->upsertSecurity($isin, $issuerId, $identity, $description, $primaryBoard);
         $this->upsertScheduledRedemption($securityId, $issuerId, $description);
 
         $this->securitiesImported++;
+    }
+
+    /**
+     * Общий поиск ISS API по ISIN — единственный подтверждённый источник
+     * emitent_inn/emitent_title/emitent_id, и заодно правильного secid
+     * (для ОФЗ он не совпадает с ISIN). Ищем точное совпадение по полю
+     * isin в результатах, а не берём первую строку — на случай, если
+     * поиск вернёт несколько похожих бумаг.
+     *
+     * @return array<string, mixed>|null
+     */
+    private function searchIdentity(string $isin): ?array
+    {
+        $response = $this->iss->getJson('/securities.json', [
+            'q' => $isin,
+            'iss.only' => 'securities',
+        ]);
+        $rows = IssClient::block($response, 'securities');
+
+        foreach ($rows as $row) {
+            if (($row['isin'] ?? null) === $isin) {
+                return $row;
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -158,75 +196,79 @@ final class SecuritiesImporter
     }
 
     /**
-     * ГЛАВНЫЙ ВЫВОД шага "проверить всё ли можно вытащить" (проверено на
-     * реальном ответе ISS API, а не в теории — см. database/002_...sql):
-     * ИНН эмитента (issuers.inn) ISS API не отдаёт ни в одном подтверждённом
-     * ресурсе — ни в description бумаги, ни через /iss/emitents (такого
-     * ресурса в ISS API нет вообще: /iss/index.json перечисляет ровно 8
-     * групп ресурсов, эмитентов среди них нет).
+     * ИНН эмитента (issuers.inn) — раньше считался недоступным бесплатно
+     * (см. историю в database/002_issuer_moex_emitter_id.sql), пока не
+     * выяснилось, что /iss/securities.json?q= отдаёт его прямым полем
+     * emitent_inn. issuers.moex_emitter_id сохраняем тоже — он остаётся
+     * полезным как более стабильный числовой ключ на случай технических
+     * расхождений в написании ИНН между источниками в будущем (сверка с
+     * ФНС/e-disclosure).
      *
-     * Единственное, что ISS даёт стабильно, — EMITTER_ID: внутренний
-     * числовой ID эмитента на Мосбирже, одинаковый у всех выпусков одной
-     * компании. Используем его как естественный ключ эмитента прямо
-     * сейчас, а inn оставляем NULL — это не потеря данных, а честная
-     * граница того, что бесплатно достаёт именно ISS API. Список на
-     * дообогащение ИНН — `SELECT * FROM issuers WHERE inn IS NULL`.
+     * ON DUPLICATE KEY UPDATE перезаписывает inn/имена при каждом повторном
+     * прогоне — в отличие от предыдущей ревизии (когда апдейтился только
+     * updated_at), потому что теперь есть реальные юридические данные,
+     * которые стоит держать актуальными, а не консервировать первое
+     * попавшееся приближение.
      *
-     * short_name/full_name здесь — название САМОЙ БУМАГИ (SHORTNAME/NAME),
-     * а не выверенное юридическое наименование компании; для первого
-     * найденного выпуска эмитента оно фиксируется и дальше не переписывается
-     * последующими выпусками той же компании (см. ON DUPLICATE KEY UPDATE
-     * ниже — обновляется только updated_at).
-     *
-     * @param array<string, mixed> $description
+     * @param array<string, mixed> $identity
      */
-    private function resolveOrCreateIssuer(array $description): ?int
+    private function resolveOrCreateIssuer(array $identity): int
     {
-        $emitterId = $this->firstPresent($description, ['EMITTER_ID']);
-        if ($emitterId === null) {
-            $this->recordMissing('issuers.moex_emitter_id');
-            return null;
+        $emitterId = $identity['emitent_id'] ?? null;
+        $inn = $identity['emitent_inn'] ?? null;
+        $title = $identity['emitent_title'] ?? null;
+
+        if ($inn === null || $inn === '') {
+            $this->recordMissing('issuers.inn (отсутствовал в конкретном ответе поиска)');
+            $inn = null;
+        }
+        if ($title === null || $title === '') {
+            $title = $emitterId !== null ? "MOEX-{$emitterId}" : 'Неизвестный эмитент';
         }
 
-        $shortName = $this->firstPresent($description, ['SHORTNAME'])
-            ?? $this->firstPresent($description, ['NAME'])
-            ?? "MOEX-{$emitterId}";
-
-        $this->recordMissing('issuers.inn (ISS API не отдаёт — нужно дообогащение отдельным источником)');
-
         $stmt = $this->db->prepare(
-            'INSERT INTO issuers (moex_emitter_id, full_name, short_name)
-             VALUES (:emitter_id, :full_name, :short_name)
+            'INSERT INTO issuers (moex_emitter_id, inn, full_name, short_name)
+             VALUES (:emitter_id, :inn, :full_name, :short_name)
              ON DUPLICATE KEY UPDATE
+                inn = VALUES(inn),
+                full_name = VALUES(full_name),
+                short_name = VALUES(short_name),
                 updated_at = CURRENT_TIMESTAMP'
         );
         $stmt->execute([
-            'emitter_id' => (int) $emitterId,
-            'full_name' => $shortName,
-            'short_name' => $shortName,
+            'emitter_id' => $emitterId !== null ? (int) $emitterId : null,
+            'inn' => $inn,
+            'full_name' => $title,
+            'short_name' => $title,
         ]);
 
-        $idStmt = $this->db->prepare('SELECT id FROM issuers WHERE moex_emitter_id = :emitter_id');
-        $idStmt->execute(['emitter_id' => (int) $emitterId]);
+        if ($emitterId !== null) {
+            $idStmt = $this->db->prepare('SELECT id FROM issuers WHERE moex_emitter_id = :emitter_id');
+            $idStmt->execute(['emitter_id' => (int) $emitterId]);
+        } else {
+            $idStmt = $this->db->prepare('SELECT id FROM issuers WHERE inn = :inn');
+            $idStmt->execute(['inn' => $inn]);
+        }
         return (int) $idStmt->fetchColumn();
     }
 
     /**
-     * @param array<string, mixed> $description
+     * @param array<string, mixed> $identity данные из /iss/securities.json?q=
+     * @param array<string, mixed> $description данные из /iss/securities/{secid}.json
      * @param array<string, mixed>|null $primaryBoard
      */
-    private function upsertSecurity(string $isin, int $issuerId, array $description, ?array $primaryBoard): int
+    private function upsertSecurity(string $isin, int $issuerId, array $identity, array $description, ?array $primaryBoard): int
     {
-        $secid = $this->firstPresent($description, ['SECID']) ?? $primaryBoard['boardid'] ?? $primaryBoard['SECID'] ?? null;
-        $regNumber = $this->firstPresent($description, ['REGNUMBER']);
-        $shortName = $this->firstPresent($description, ['SHORTNAME']) ?? $isin;
-        $fullName = $this->firstPresent($description, ['NAME']);
+        $secid = $identity['secid'] ?? $this->firstPresent($description, ['SECID']) ?? $isin;
+        $regNumber = $identity['regnumber'] ?? $this->firstPresent($description, ['REGNUMBER']);
+        $shortName = $identity['shortname'] ?? $this->firstPresent($description, ['SHORTNAME']) ?? $isin;
+        $fullName = $identity['name'] ?? $this->firstPresent($description, ['NAME']);
         $nominal = $this->firstPresent($description, ['FACEVALUE', 'INITIALFACEVALUE']);
         $currency = $this->normalizeCurrency($this->firstPresent($description, ['FACEUNIT']));
         $maturityDate = $this->nullableDate($this->firstPresent($description, ['MATDATE']));
         $issueVolume = $this->firstPresent($description, ['ISSUESIZE', 'ISSUESIZEPLACED']);
         $listingLevel = $this->firstPresent($description, ['LISTLEVEL']);
-        $moexBoard = $primaryBoard['boardid'] ?? $primaryBoard['BOARDID'] ?? null;
+        $moexBoard = $identity['primary_boardid'] ?? $primaryBoard['boardid'] ?? $primaryBoard['BOARDID'] ?? null;
 
         $isQualifiedOnly = $this->firstPresent($description, ['ISQUALIFIEDINVESTORS']);
         $couponFrequency = $this->mapCouponFrequency($this->firstPresent($description, ['COUPONFREQUENCY']));
@@ -241,8 +283,8 @@ final class SecuritiesImporter
         foreach (['is_subordinated', 'is_structured'] as $uncertainField) {
             // По-прежнему не найдено подтверждённого поля в ISS API — в
             // отличие от is_qualified_investors_only/coupon_type/
-            // coupon_frequency, которые в этой ревизии уже замаплены на
-            // реальные поля (ISQUALIFIEDINVESTORS/BOND_TYPE/COUPONFREQUENCY).
+            // coupon_frequency, которые уже замаплены на реальные поля
+            // (ISQUALIFIEDINVESTORS/BOND_TYPE/COUPONFREQUENCY).
             $this->recordMissing("securities.{$uncertainField} (поле в ISS API не найдено)");
         }
 
@@ -425,7 +467,7 @@ final class SecuritiesImporter
         Logger::info('=== Отчёт по импорту справочника (проверка "всё ли можно вытащить бесплатно") ===');
         Logger::info("Бумаг обработано: {$this->securitiesSeen}");
         Logger::info("Импортировано полностью: {$this->securitiesImported}");
-        Logger::info("Пропущено (нет даже EMITTER_ID): {$this->skippedNoEmitterId}");
+        Logger::info("Пропущено (не нашлась в поиске ISS API): {$this->skippedNotFoundInSearch}");
         Logger::info("Пропущено (другая ошибка): {$this->skippedOther}");
         Logger::info('Поля с пропусками (сколько раз не удалось заполнить из бесплатного источника):');
         foreach ($this->missingFieldCounts as $field => $count) {
