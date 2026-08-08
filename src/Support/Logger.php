@@ -5,9 +5,17 @@ declare(strict_types=1);
 namespace BondKeeper\Support;
 
 /**
- * Простой лог в stdout/stderr для cron-джобов — этого достаточно для этапа 1,
+ * Простой лог в stdout для cron-джобов — этого достаточно для этапа 1,
  * без внешних зависимостей (PSR-логгер можно подключить позже, когда
  * появится событийный движок и понадобится единый формат логов).
+ *
+ * Раньше писал через fwrite(STDOUT/STDERR, ...) — на боевом сервере
+ * bondkeeper.ru это молча не давало никакого вывода (скрипт отрабатывал
+ * до конца с exit code 0, без единой строки лога), хотя обычный echo в
+ * том же php-cli в том же окружении выводил как положено (проверено на
+ * bin/debug_iss_security.php). Причину константного поведения STDOUT/
+ * STDERR в этой конкретной сборке PHP не выясняли — echo надёжнее и
+ * ничем не хуже для простого cron-логгера.
  */
 final class Logger
 {
@@ -23,13 +31,12 @@ final class Logger
 
     public static function error(string $message): void
     {
-        self::write('ERROR', $message, STDERR);
+        self::write('ERROR', $message);
     }
 
-    /** @param resource|null $stream */
-    private static function write(string $level, string $message, $stream = STDOUT): void
+    private static function write(string $level, string $message): void
     {
         $ts = date('Y-m-d H:i:s');
-        fwrite($stream, "[{$ts}] {$level}: {$message}" . PHP_EOL);
+        echo "[{$ts}] {$level}: {$message}" . PHP_EOL;
     }
 }
