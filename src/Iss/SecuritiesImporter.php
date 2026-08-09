@@ -280,6 +280,9 @@ final class SecuritiesImporter
         if ($isQualifiedOnly === null) {
             $this->recordMissing('securities.is_qualified_investors_only');
         }
+        if ($couponType === 'unknown') {
+            $this->recordMissing('securities.coupon_type (BOND_TYPE не про характер ставки у этой бумаги)');
+        }
         foreach (['is_subordinated', 'is_structured'] as $uncertainField) {
             // По-прежнему не найдено подтверждённого поля в ISS API — в
             // отличие от is_qualified_investors_only/coupon_type/
@@ -369,19 +372,29 @@ final class SecuritiesImporter
     }
 
     /**
-     * BOND_TYPE — свободный текст на русском (подтверждённый пример:
-     * "Фикс с известным купоном"). Точный список всех возможных значений
-     * не наблюдался — эвристика ниже покрывает распознанные ключевые слова
-     * и по умолчанию считает бумагу 'fixed', если не нашла явных признаков
-     * плавающего/индексируемого/бескупонного типа. Стоит расширить список
-     * ключевых слов по мере накопления реальных значений BOND_TYPE в БД
-     * (например: `SELECT DISTINCT coupon_type, COUNT(*) FROM securities
-     * GROUP BY coupon_type` после первого полного прогона на боевых данных).
+     * BOND_TYPE — НЕ таксономия "тип купона", а тег самой заметной
+     * особенности бумаги: у одних это характер ставки ("Фикс с известным
+     * купоном"), у других — структура погашения ("Амортизируемые
+     * облигации", ДОМ.РФ) или валюта номинала ("Валютные облигации" — и
+     * это, как выяснилось, включает даже бессрочные бумаги). Значит,
+     * отсутствие ключевых слов floating/indexed/zero_coupon НЕ означает
+     * "точно fixed" — это означает "BOND_TYPE сейчас про что-то другое, а
+     * не про ставку". Раньше здесь по умолчанию возвращался 'fixed', из-за
+     * чего 46 бумаг (в основном ипотечные/валютные) получили неверную
+     * классификацию, и это маскировало настоящую причину, по которой у
+     * части их купонов не было rate_percent — см.
+     * database/004_coupon_type_unknown.sql.
+     *
+     * 'fixed' теперь возвращается только при явном совпадении с "фикс" —
+     * во всех остальных неопределённых случаях честно 'unknown', а не
+     * угаданное значение. Список ключевых слов стоит расширять по мере
+     * накопления реальных значений BOND_TYPE в БД (`SELECT DISTINCT
+     * coupon_type, COUNT(*) FROM securities GROUP BY coupon_type`).
      */
     private function mapCouponType(?string $bondType): string
     {
         if ($bondType === null) {
-            return 'fixed';
+            return 'unknown';
         }
         $normalized = mb_strtolower($bondType);
 
@@ -394,7 +407,10 @@ final class SecuritiesImporter
         if (str_contains($normalized, 'дисконт') || str_contains($normalized, 'без купон')) {
             return 'zero_coupon';
         }
-        return 'fixed';
+        if (str_contains($normalized, 'фикс')) {
+            return 'fixed';
+        }
+        return 'unknown';
     }
 
     /**
