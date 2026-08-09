@@ -16,10 +16,12 @@ use PDO;
  * По умолчанию запускается по бумагам, у которых ещё нет ни одной строки
  * в coupons ("ещё не сеяли график") — дёшево для ежедневного cron, не
  * трогает уже загруженные бумаги. $forceAll=true обрабатывает вообще все
- * активные бумаги заново поверх уже существующих строк (апсерт) — нужен
- * для разового backfill, когда меняется сама логика маппинга полей (так
- * нашли и чинили путаницу rate_percent/valueprc, см. коммит), а не только
- * для новых бумаг.
+ * активные бумаги заново — нужен для разового backfill, когда меняется
+ * сама логика маппинга полей (так нашли и чинили путаницу
+ * rate_percent/valueprc, см. коммиты), а не только для новых бумаг.
+ *
+ * Пересев бумаги — это DELETE старого графика + INSERT нового в одной
+ * транзакции (не апсерт "поверх") — см. importOne().
  */
 final class BondizationImporter
 {
@@ -60,6 +62,28 @@ final class BondizationImporter
         Logger::info("Ошибок: {$this->failed}");
     }
 
+    /**
+     * DELETE перед INSERT, а не чистый апсерт — намеренно, найдено на
+     * реальном баге: coupon_number считается нами же (порядковый номер
+     * после сортировки по дате), а не берётся из API. Если ответ API на
+     * повторный запрос вернул для бумаги МЕНЬШЕ строк, чем в прошлый раз
+     * (сегодня для 435 бумаг из 3061 так и случилось), апсерт по ключу
+     * (security_id, coupon_number) просто не доходит до "лишних" старых
+     * номеров — они остаются в таблице от предыдущего прогона нетронутыми,
+     * со старыми (в тот раз ошибочными) значениями. Удаление старого
+     * графика бумаги перед вставкой нового устраняет этот класс проблем
+     * полностью: таблица всегда точно отражает последний ответ API.
+     *
+     * Оборачиваем в транзакцию — без неё сбой на середине вставки (например,
+     * обрыв сети на 5-м из 10 купонов) оставил бы бумагу с ГОРАЗДО меньшим
+     * графиком, чем был до запуска, что хуже отсутствия обновления вообще.
+     *
+     * DELETE безопасен на этом этапе: event_stories.coupon_id/amortization_id
+     * ссылаются на эти таблицы с ON DELETE SET NULL, но строк в event_stories
+     * ещё не существует (событийный движок — задача следующего этапа). Когда
+     * он появится, этот метод придётся пересмотреть — переписывание графика
+     * не должно молча обнулять ссылки на уже случившиеся события.
+     */
     private function importOne(int $securityId, string $isin, int $issuerId): void
     {
         $response = $this->iss->getJson(
@@ -72,71 +96,75 @@ final class BondizationImporter
 
         usort($coupons, static fn ($a, $b) => strcmp((string) ($a['coupondate'] ?? ''), (string) ($b['coupondate'] ?? '')));
 
-        $couponNumber = 0;
-        foreach ($coupons as $coupon) {
-            $couponDate = $coupon['coupondate'] ?? null;
-            $couponValue = $coupon['value'] ?? null;
-            if ($couponDate === null || $couponValue === null) {
-                continue;
-            }
-            $couponNumber++;
+        $this->db->beginTransaction();
+        try {
+            $this->db->prepare('DELETE FROM coupons WHERE security_id = :security_id')
+                ->execute(['security_id' => $securityId]);
+            $this->db->prepare('DELETE FROM amortizations WHERE security_id = :security_id')
+                ->execute(['security_id' => $securityId]);
 
-            $stmt = $this->db->prepare(
-                'INSERT INTO coupons (security_id, issuer_id, coupon_number, period_start_date, period_end_date, rate_percent, value_per_bond)
-                 VALUES (:security_id, :issuer_id, :coupon_number, :period_start, :period_end, :rate, :value)
-                 ON DUPLICATE KEY UPDATE
-                    period_start_date = VALUES(period_start_date),
-                    rate_percent = VALUES(rate_percent),
-                    value_per_bond = VALUES(value_per_bond)'
-            );
-            $stmt->execute([
-                'security_id' => $securityId,
-                'issuer_id' => $issuerId,
-                'coupon_number' => $couponNumber,
-                'period_start' => $coupon['startdate'] ?? null,
-                'period_end' => $couponDate,
-                // Реальное имя поля со ставкой купона в bondization-ответе —
-                // valueprc (проверено на bondkeeper.ru: 'value'=16.44 руб.,
-                // 'valueprc'=20 — то есть 20% годовых). Поля 'couponpercent'
-                // в этом эндпоинте не существует вообще — раньше здесь была
-                // ошибка, из-за которой rate_percent писался NULL у всех
-                // 35708 купонов первого прогона.
-                'rate' => $coupon['valueprc'] ?? null,
-                'value' => $couponValue,
-            ]);
-            $this->couponsImported++;
-        }
+            $couponNumber = 0;
+            foreach ($coupons as $coupon) {
+                $couponDate = $coupon['coupondate'] ?? null;
+                $couponValue = $coupon['value'] ?? null;
+                if ($couponDate === null || $couponValue === null) {
+                    continue;
+                }
+                $couponNumber++;
 
-        foreach ($amortizations as $amortization) {
-            $amortDate = $amortization['amortdate'] ?? null;
-            $amortValue = $amortization['value'] ?? null;
-            if ($amortDate === null || $amortValue === null) {
-                continue;
+                $stmt = $this->db->prepare(
+                    'INSERT INTO coupons (security_id, issuer_id, coupon_number, period_start_date, period_end_date, rate_percent, value_per_bond)
+                     VALUES (:security_id, :issuer_id, :coupon_number, :period_start, :period_end, :rate, :value)'
+                );
+                $stmt->execute([
+                    'security_id' => $securityId,
+                    'issuer_id' => $issuerId,
+                    'coupon_number' => $couponNumber,
+                    'period_start' => $coupon['startdate'] ?? null,
+                    'period_end' => $couponDate,
+                    // Реальное имя поля со ставкой купона в bondization-ответе —
+                    // valueprc (проверено на bondkeeper.ru: 'value'=16.44 руб.,
+                    // 'valueprc'=20 — то есть 20% годовых). Поля 'couponpercent'
+                    // в этом эндпоинте не существует вообще.
+                    'rate' => $coupon['valueprc'] ?? null,
+                    'value' => $couponValue,
+                ]);
+                $this->couponsImported++;
             }
 
-            $stmt = $this->db->prepare(
-                'INSERT INTO amortizations (security_id, issuer_id, payment_date_planned, value_per_bond, percent_of_nominal)
-                 VALUES (:security_id, :issuer_id, :payment_date, :value, :percent)
-                 ON DUPLICATE KEY UPDATE
-                    value_per_bond = VALUES(value_per_bond),
-                    percent_of_nominal = VALUES(percent_of_nominal)'
-            );
-            $stmt->execute([
-                'security_id' => $securityId,
-                'issuer_id' => $issuerId,
-                'payment_date' => $amortDate,
-                'value' => $amortValue,
-                'percent' => $amortization['valueprc'] ?? null,
-            ]);
-            $this->amortizationsImported++;
-        }
+            foreach ($amortizations as $amortization) {
+                $amortDate = $amortization['amortdate'] ?? null;
+                $amortValue = $amortization['value'] ?? null;
+                if ($amortDate === null || $amortValue === null) {
+                    continue;
+                }
 
-        // Если у бумаги была амортизация, плановая сумма scheduled_maturity
-        // должна быть остатком номинала, а не полным номиналом, который
-        // проставил SecuritiesImporter — досчитываем здесь, когда график
-        // уже известен.
-        if ($amortizations !== []) {
-            $this->adjustScheduledRedemption($securityId, $amortizations);
+                $stmt = $this->db->prepare(
+                    'INSERT INTO amortizations (security_id, issuer_id, payment_date_planned, value_per_bond, percent_of_nominal)
+                     VALUES (:security_id, :issuer_id, :payment_date, :value, :percent)'
+                );
+                $stmt->execute([
+                    'security_id' => $securityId,
+                    'issuer_id' => $issuerId,
+                    'payment_date' => $amortDate,
+                    'value' => $amortValue,
+                    'percent' => $amortization['valueprc'] ?? null,
+                ]);
+                $this->amortizationsImported++;
+            }
+
+            // Если у бумаги была амортизация, плановая сумма scheduled_maturity
+            // должна быть остатком номинала, а не полным номиналом, который
+            // проставил SecuritiesImporter — досчитываем здесь, когда график
+            // уже известен.
+            if ($amortizations !== []) {
+                $this->adjustScheduledRedemption($securityId, $amortizations);
+            }
+
+            $this->db->commit();
+        } catch (\Throwable $e) {
+            $this->db->rollBack();
+            throw $e;
         }
     }
 
