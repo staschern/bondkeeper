@@ -13,9 +13,13 @@ use PDO;
  * и уже прошедшие купоны/амортизации), в отличие от description-блока,
  * который даёт только текущий купон и дату ближайшей оферты/погашения.
  *
- * Запускается отдельным прогоном после SecuritiesImporter — по всем
- * бумагам, у которых ещё нет ни одной строки в coupons (простая эвристика
- * "ещё не сеяли график"), либо по одной конкретной бумаге через --isin.
+ * По умолчанию запускается по бумагам, у которых ещё нет ни одной строки
+ * в coupons ("ещё не сеяли график") — дёшево для ежедневного cron, не
+ * трогает уже загруженные бумаги. $forceAll=true обрабатывает вообще все
+ * активные бумаги заново поверх уже существующих строк (апсерт) — нужен
+ * для разового backfill, когда меняется сама логика маппинга полей (так
+ * нашли и чинили путаницу rate_percent/valueprc, см. коммит), а не только
+ * для новых бумаг.
  */
 final class BondizationImporter
 {
@@ -30,14 +34,14 @@ final class BondizationImporter
     ) {
     }
 
-    public function importForAllPending(): void
+    public function importForAllPending(bool $forceAll = false): void
     {
-        $stmt = $this->db->query(
-            'SELECT s.id, s.isin, s.issuer_id
-             FROM securities s
-             LEFT JOIN coupons c ON c.security_id = s.id
-             WHERE c.id IS NULL AND s.status = "active"'
-        );
+        $sql = 'SELECT s.id, s.isin, s.issuer_id FROM securities s';
+        $sql .= $forceAll
+            ? ' WHERE s.status = "active"'
+            : ' LEFT JOIN coupons c ON c.security_id = s.id WHERE c.id IS NULL AND s.status = "active"';
+
+        $stmt = $this->db->query($sql);
 
         while ($row = $stmt->fetch()) {
             $this->processed++;
@@ -71,7 +75,7 @@ final class BondizationImporter
         $couponNumber = 0;
         foreach ($coupons as $coupon) {
             $couponDate = $coupon['coupondate'] ?? null;
-            $couponValue = $coupon['value'] ?? $coupon['valueprc'] ?? null;
+            $couponValue = $coupon['value'] ?? null;
             if ($couponDate === null || $couponValue === null) {
                 continue;
             }
@@ -91,7 +95,13 @@ final class BondizationImporter
                 'coupon_number' => $couponNumber,
                 'period_start' => $coupon['startdate'] ?? null,
                 'period_end' => $couponDate,
-                'rate' => $coupon['couponpercent'] ?? null,
+                // Реальное имя поля со ставкой купона в bondization-ответе —
+                // valueprc (проверено на bondkeeper.ru: 'value'=16.44 руб.,
+                // 'valueprc'=20 — то есть 20% годовых). Поля 'couponpercent'
+                // в этом эндпоинте не существует вообще — раньше здесь была
+                // ошибка, из-за которой rate_percent писался NULL у всех
+                // 35708 купонов первого прогона.
+                'rate' => $coupon['valueprc'] ?? null,
                 'value' => $couponValue,
             ]);
             $this->couponsImported++;
