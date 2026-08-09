@@ -17,6 +17,7 @@ PHP 8.3+ (CLI, `pdo_mysql`, `curl`), MySQL 8.0+, cron. Без composer/фрей�
 database/001_schema.sql              — базовая схема БД (см. "Изменения относительно v2" ниже)
 database/002_issuer_moex_emitter_id.sql — миграция: ИНН эмитента не отдаётся ISS API (см. ниже)
 database/003_widen_value_per_bond.sql   — миграция: DECIMAL(12,4) тесна для номиналов от 100 млн ₽
+database/004_coupon_type_unknown.sql    — миграция: coupon_type='unknown' вместо угаданного 'fixed'
 src/Database.php                     — подключение к MySQL (PDO)
 src/Iss/IssClient.php                — HTTP-клиент ISS API Мосбиржи
 src/Iss/SecuritiesImporter.php       — issuers/securities/redemptions(scheduled_maturity)
@@ -34,6 +35,7 @@ mysql -u root -p -e "CREATE DATABASE bondkeeper CHARACTER SET utf8mb4 COLLATE ut
 mysql -u root -p bondkeeper < database/001_schema.sql
 mysql -u root -p bondkeeper < database/002_issuer_moex_emitter_id.sql
 mysql -u root -p bondkeeper < database/003_widen_value_per_bond.sql
+mysql -u root -p bondkeeper < database/004_coupon_type_unknown.sql
 
 php bin/seed_market.php        # issuers, securities, redemptions(scheduled_maturity)
 php bin/seed_bondization.php   # coupons, amortizations
@@ -63,7 +65,9 @@ php bin/seed_bondization.php   # coupons, amortizations
 Заодно нашлась и вторая, независимая причина части пропусков: **у гособлигаций (ОФЗ) `SECID` не совпадает с `ISIN`** (пример: ISIN `RU0002868001` = SECID `SU46012RMFS9`) — карточку бумаги (`description`) нужно запрашивать по `secid` (который теперь тоже приходит из `/iss/securities.json?q=`), а не по ISIN. Раньше запрос по ISIN для ОФЗ молча возвращал пустой ответ — из-за этого пропадали все 59 ОФЗ в первом прогоне.
 
 **Подтверждено вживую, на реальном ответе ISS API (bondkeeper.ru, август 2026):**
-ИНН эмитента, юридическое название эмитента, ISIN, SECID, рег. номер, краткое/полное наименование бумаги, номинал, дата погашения, объём выпуска, уровень листинга, признак «только квалифицированным инвесторам» (`ISQUALIFIEDINVESTORS`), частота купона (`COUPONFREQUENCY` — число выплат в год), тип купона по свободному тексту (`BOND_TYPE`, эвристика по ключевым словам — не идеальна, см. код), весь график купонов и амортизаций (bondization-эндпоинт). Отдельно: валюта в ISS API приходит как `FACEUNIT='SUR'` — устаревший код рубля до деноминации 1998 года, а не `RUB`; импортёр нормализует это на входе.
+ИНН эмитента, юридическое название эмитента, ISIN, SECID, рег. номер, краткое/полное наименование бумаги, номинал, дата погашения, объём выпуска, уровень листинга, признак «только квалифицированным инвесторам» (`ISQUALIFIEDINVESTORS`), частота купона (`COUPONFREQUENCY` — число выплат в год), весь график купонов и амортизаций (bondization-эндпоинт, включая реальную ставку купона — поле `valueprc`, не `couponpercent`, которого в ответе не существует). Отдельно: валюта в ISS API приходит как `FACEUNIT='SUR'` — устаревший код рубля до деноминации 1998 года, а не `RUB`; импортёр нормализует это на входе.
+
+**`BOND_TYPE` — не таксономия типа купона, а тег самой заметной особенности бумаги.** У одних бумаг это характер ставки («Фикс с известным купоном»), у других — структура погашения («Амортизируемые облигации», ипотечные бумаги ДОМ.РФ) или валюта номинала («Валютные облигации» — причём один из наблюдавшихся примеров этой категории вдобавок оказался ещё и бессрочной облигацией). Значит, отсутствие ключевых слов floating/indexed/zero_coupon не означает «точно fixed» — значит «BOND_TYPE сейчас про что-то другое». `coupon_type` в схеме (миграция `004_coupon_type_unknown.sql`) получил значение `unknown`: `fixed` теперь ставится только при явном совпадении с «фикс», иначе — честно «не определено», а не угаданное значение по умолчанию.
 
 **Точно НЕДОСТУПНО бесплатно через ISS API** (не предположение — проверено):
 - Вид оферты (put/call), `is_instruction_based` — в проверенном ответе описания бумаги без активной оферты этих полей не было; требует проверки на бумаге, у которой оферта реально есть.
