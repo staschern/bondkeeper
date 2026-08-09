@@ -132,6 +132,7 @@ final class BondizationImporter
                 $this->couponsImported++;
             }
 
+            $insertedAmortizations = [];
             foreach ($amortizations as $amortization) {
                 $amortDate = $amortization['amortdate'] ?? null;
                 $amortValue = $amortization['value'] ?? null;
@@ -151,14 +152,23 @@ final class BondizationImporter
                     'percent' => $amortization['valueprc'] ?? null,
                 ]);
                 $this->amortizationsImported++;
+                $insertedAmortizations[] = $amortization;
             }
+
+            // is_amortized выставляется по факту реально записанных строк
+            // (не по сырому $amortizations — там могут быть строки, которые
+            // выше отфильтровались из-за отсутствия даты/суммы). Раньше это
+            // поле нигде не выставлялось вообще и оставалось FALSE по
+            // умолчанию для всех бумаг, независимо от факта амортизации.
+            $this->db->prepare('UPDATE securities SET is_amortized = :flag WHERE id = :security_id')
+                ->execute(['flag' => $insertedAmortizations !== [] ? 1 : 0, 'security_id' => $securityId]);
 
             // Если у бумаги была амортизация, плановая сумма scheduled_maturity
             // должна быть остатком номинала, а не полным номиналом, который
             // проставил SecuritiesImporter — досчитываем здесь, когда график
             // уже известен.
-            if ($amortizations !== []) {
-                $this->adjustScheduledRedemption($securityId, $amortizations);
+            if ($insertedAmortizations !== []) {
+                $this->adjustScheduledRedemption($securityId, $insertedAmortizations);
             }
 
             $this->db->commit();

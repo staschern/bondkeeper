@@ -272,7 +272,9 @@ final class SecuritiesImporter
 
         $isQualifiedOnly = $this->firstPresent($description, ['ISQUALIFIEDINVESTORS']);
         $couponFrequency = $this->mapCouponFrequency($this->firstPresent($description, ['COUPONFREQUENCY']));
-        $couponType = $this->mapCouponType($this->firstPresent($description, ['BOND_TYPE']));
+        $bondType = $this->firstPresent($description, ['BOND_TYPE']);
+        $couponType = $this->mapCouponType($bondType);
+        $isStructured = $this->isStructured($bondType);
 
         if ($nominal === null) {
             $this->recordMissing('securities.nominal_value');
@@ -283,25 +285,26 @@ final class SecuritiesImporter
         if ($couponType === 'unknown') {
             $this->recordMissing('securities.coupon_type (BOND_TYPE не про характер ставки у этой бумаги)');
         }
-        foreach (['is_subordinated', 'is_structured'] as $uncertainField) {
-            // По-прежнему не найдено подтверждённого поля в ISS API — в
-            // отличие от is_qualified_investors_only/coupon_type/
-            // coupon_frequency, которые уже замаплены на реальные поля
-            // (ISQUALIFIEDINVESTORS/BOND_TYPE/COUPONFREQUENCY).
-            $this->recordMissing("securities.{$uncertainField} (поле в ISS API не найдено)");
-        }
+        // is_subordinated по-прежнему без подтверждённого поля в ISS API —
+        // в отличие от is_structured, который нашёлся в том же BOND_TYPE,
+        // что и coupon_type, просто по другому ключевому слову
+        // ("Структурная облигация" — самая частая причина coupon_type =
+        // 'unknown': 9 из 15 в случайной выборке). is_amortized сюда не
+        // входит — он выставляется в BondizationImporter по факту наличия
+        // строк в amortizations, это надёжнее текстового BOND_TYPE.
+        $this->recordMissing('securities.is_subordinated (поле в ISS API не найдено)');
 
         $stmt = $this->db->prepare(
             'INSERT INTO securities
                 (isin, secid, reg_number, issuer_id, short_name, full_name,
                  nominal_value, currency, maturity_date, initial_issue_volume,
                  listing_level, moex_board, coupon_type, coupon_frequency,
-                 is_qualified_investors_only, last_synced_at)
+                 is_qualified_investors_only, is_structured, last_synced_at)
              VALUES
                 (:isin, :secid, :reg_number, :issuer_id, :short_name, :full_name,
                  :nominal_value, :currency, :maturity_date, :issue_volume,
                  :listing_level, :moex_board, :coupon_type, :coupon_frequency,
-                 :is_qualified_only, NOW())
+                 :is_qualified_only, :is_structured, NOW())
              ON DUPLICATE KEY UPDATE
                 secid = VALUES(secid),
                 reg_number = VALUES(reg_number),
@@ -316,6 +319,7 @@ final class SecuritiesImporter
                 coupon_type = VALUES(coupon_type),
                 coupon_frequency = VALUES(coupon_frequency),
                 is_qualified_investors_only = VALUES(is_qualified_investors_only),
+                is_structured = VALUES(is_structured),
                 last_synced_at = NOW()'
         );
         $stmt->execute([
@@ -334,6 +338,7 @@ final class SecuritiesImporter
             'coupon_type' => $couponType,
             'coupon_frequency' => $couponFrequency,
             'is_qualified_only' => $isQualifiedOnly === null ? 0 : (int) $isQualifiedOnly,
+            'is_structured' => (int) $isStructured,
         ]);
 
         $idStmt = $this->db->prepare('SELECT id FROM securities WHERE isin = :isin');
@@ -411,6 +416,19 @@ final class SecuritiesImporter
             return 'fixed';
         }
         return 'unknown';
+    }
+
+    /**
+     * "Структурная облигация" — самое частое конкретное значение BOND_TYPE
+     * среди тех, что не про характер купона (см. mapCouponType) — 9 из 15
+     * в случайной выборке coupon_type='unknown' на bondkeeper.ru. Логично:
+     * у структурных облигаций выплата часто зависит от базового актива и
+     * не сводится к простому fixed/floating, так что coupon_type у них
+     * останется 'unknown' и после этой правки — это ожидаемо, а не пробел.
+     */
+    private function isStructured(?string $bondType): bool
+    {
+        return $bondType !== null && str_contains(mb_strtolower($bondType), 'структурн');
     }
 
     /**
