@@ -18,6 +18,7 @@ database/001_schema.sql              — базовая схема БД (см. "
 database/002_issuer_moex_emitter_id.sql — миграция: ИНН эмитента не отдаётся ISS API (см. ниже)
 database/003_widen_value_per_bond.sql   — миграция: DECIMAL(12,4) тесна для номиналов от 100 млн ₽
 database/004_coupon_type_unknown.sql    — миграция: coupon_type='unknown' вместо угаданного 'fixed'
+database/005_is_mortgage_backed.sql     — миграция: флаг ИЦБ (ипотечные бумаги без полного графика вперёд)
 src/Database.php                     — подключение к MySQL (PDO)
 src/Iss/IssClient.php                — HTTP-клиент ISS API Мосбиржи
 src/Iss/SecuritiesImporter.php       — issuers/securities/redemptions(scheduled_maturity)
@@ -36,6 +37,7 @@ mysql -u root -p bondkeeper < database/001_schema.sql
 mysql -u root -p bondkeeper < database/002_issuer_moex_emitter_id.sql
 mysql -u root -p bondkeeper < database/003_widen_value_per_bond.sql
 mysql -u root -p bondkeeper < database/004_coupon_type_unknown.sql
+mysql -u root -p bondkeeper < database/005_is_mortgage_backed.sql
 
 php bin/seed_market.php        # issuers, securities, redemptions(scheduled_maturity)
 php bin/seed_bondization.php   # coupons, amortizations
@@ -83,3 +85,10 @@ php bin/seed_bondization.php   # coupons, amortizations
 **Итог боевых прогонов** (`seed_market.php` на bondkeeper.ru, весь рынок 3061 бумага):
 - До находки про `/iss/securities.json?q=`: 3002/3061 (98,1%), `inn = NULL` у всех эмитентов, 59 ОФЗ пропущены (SECID≠ISIN).
 - После переписывания на новый эндпоинт: **3061/3061 (100%)**, 495 эмитентов, 3004 строки `redemptions`. Из 495 эмитентов `inn` отсутствует ровно у 2 — `RZD Capital P.L.C.` и `SUEK Securities Designated Activity Company` (ирландские SPV для выпуска евробондов, ISIN с префиксом `XS`, вне НРД/Euroclear-Clearstream) — у них физически нет российского ИНН, `NULL` здесь корректен, а не пробел. 57 бумаг (~1,9%) без даты/номинала для `redemptions` — не исследовано отдельно, не блокирует остальное.
+
+## Пост-обработка этапа 1
+
+После первого прогона нашлось ещё несколько незаполненных полей в
+`issuers`/`securities` — разбор по каждому (что уже закрыто кодом, что
+нужно диагностировать на боевой БД, что требует внешнего сервиса или
+вашего решения) — `docs/STAGE1_POSTPROCESSING.md`.

@@ -276,6 +276,19 @@ final class SecuritiesImporter
         $couponType = $this->mapCouponType($bondType);
         $isStructured = $this->isStructured($bondType);
 
+        // Пост-обработка этапа 1 (documents/2026.08.10_BondKeeper_issuers_securities_QA.md):
+        // три поля ниже читаются из уже вызываемых эндпоинтов, новых
+        // HTTP-запросов не требуется.
+        $tradingStartDate = $this->nullableDate($this->firstPresent($description, ['ISSUEDATE', 'STARTDATEMOEX']));
+        $securityType = $this->mapSecurityType($identity['type'] ?? null);
+        // BUYBACKDATE — то же самое, что даёт description-эндпоинт (не путать
+        // с OFFERDATE из доска-специфичного marketdata, который импортёр
+        // пока не запрашивает — см. STAGE1_POSTPROCESSING.md, has_offer
+        // остаётся рабочей гипотезой до проверки на бумаге с активной офертой).
+        $hasOffer = $this->nullableDate($this->firstPresent($description, ['BUYBACKDATE'])) !== null;
+        $issuerTitle = $identity['emitent_title'] ?? null;
+        $isMortgageBacked = $this->isMortgageBacked($bondType, is_string($issuerTitle) ? $issuerTitle : null);
+
         if ($nominal === null) {
             $this->recordMissing('securities.nominal_value');
         }
@@ -284,6 +297,12 @@ final class SecuritiesImporter
         }
         if ($couponType === 'unknown') {
             $this->recordMissing('securities.coupon_type (BOND_TYPE не про характер ставки у этой бумаги)');
+        }
+        if ($tradingStartDate === null) {
+            $this->recordMissing('securities.trading_start_date (ни ISSUEDATE, ни STARTDATEMOEX не пришли)');
+        }
+        if (!isset($identity['type']) || $identity['type'] === null || $identity['type'] === '') {
+            $this->recordMissing('securities.security_type (поле type отсутствовало в /securities.json?q=, использован default corporate)');
         }
         // is_subordinated по-прежнему без подтверждённого поля в ISS API —
         // в отличие от is_structured, который нашёлся в том же BOND_TYPE,
@@ -299,12 +318,14 @@ final class SecuritiesImporter
                 (isin, secid, reg_number, issuer_id, short_name, full_name,
                  nominal_value, currency, maturity_date, initial_issue_volume,
                  listing_level, moex_board, coupon_type, coupon_frequency,
-                 is_qualified_investors_only, is_structured, last_synced_at)
+                 is_qualified_investors_only, is_structured, trading_start_date,
+                 security_type, has_offer, is_mortgage_backed, last_synced_at)
              VALUES
                 (:isin, :secid, :reg_number, :issuer_id, :short_name, :full_name,
                  :nominal_value, :currency, :maturity_date, :issue_volume,
                  :listing_level, :moex_board, :coupon_type, :coupon_frequency,
-                 :is_qualified_only, :is_structured, NOW())
+                 :is_qualified_only, :is_structured, :trading_start_date,
+                 :security_type, :has_offer, :is_mortgage_backed, NOW())
              ON DUPLICATE KEY UPDATE
                 secid = VALUES(secid),
                 reg_number = VALUES(reg_number),
@@ -320,6 +341,10 @@ final class SecuritiesImporter
                 coupon_frequency = VALUES(coupon_frequency),
                 is_qualified_investors_only = VALUES(is_qualified_investors_only),
                 is_structured = VALUES(is_structured),
+                trading_start_date = VALUES(trading_start_date),
+                security_type = VALUES(security_type),
+                has_offer = VALUES(has_offer),
+                is_mortgage_backed = VALUES(is_mortgage_backed),
                 last_synced_at = NOW()'
         );
         $stmt->execute([
@@ -339,6 +364,10 @@ final class SecuritiesImporter
             'coupon_frequency' => $couponFrequency,
             'is_qualified_only' => $isQualifiedOnly === null ? 0 : (int) $isQualifiedOnly,
             'is_structured' => (int) $isStructured,
+            'trading_start_date' => $tradingStartDate,
+            'security_type' => $securityType,
+            'has_offer' => (int) $hasOffer,
+            'is_mortgage_backed' => (int) $isMortgageBacked,
         ]);
 
         $idStmt = $this->db->prepare('SELECT id FROM securities WHERE isin = :isin');
@@ -429,6 +458,46 @@ final class SecuritiesImporter
     private function isStructured(?string $bondType): bool
     {
         return $bondType !== null && str_contains(mb_strtolower($bondType), 'структурн');
+    }
+
+    /**
+     * ISS API отдаёт классификацию 'type' в /iss/securities.json?q= (тот же
+     * поиск, что уже даёт emitent_inn/emitent_title): 'ofz_bond' — ОФЗ,
+     * 'subfederal_bond'/'municipal_bond' — региональный/муниципальный долг,
+     * остальное ('corporate_bond', 'exchange_bond', 'cb_bond', 'euro_bond',
+     * 'ifi_bond' и т.п.) сводится к 'corporate' — в текущей схеме нет более
+     * узких категорий под эти случаи (см. STAGE1_POSTPROCESSING.md, решение
+     * не расширять ENUM без явного продуктового запроса). 'short_term' в
+     * схеме остаётся не задействован — прямого соответствия среди значений
+     * ISS 'type' не найдено.
+     */
+    private function mapSecurityType(mixed $type): string
+    {
+        return match ($type) {
+            'ofz_bond' => 'ofz',
+            'subfederal_bond', 'municipal_bond' => 'municipal',
+            default => 'corporate',
+        };
+    }
+
+    /**
+     * ИЦБ ДОМ.РФ (documents/2026.08.10_BondKeeper_issuers_securities_QA.md,
+     * пример RU000A0JQAM6): купон = фактические поступления по пулу
+     * закладных, а не заранее известная ставка — у ISS структурно не может
+     * быть полного графика вперёд для таких бумаг. Обнаруживаем по тегу
+     * "ипотечн" в BOND_TYPE или по имени эмитента ("...Ипотечный агент..." —
+     * стандартное имя SPV для этого типа выпусков), а не считаем это
+     * пробелом импортёра, требующим починки.
+     */
+    private function isMortgageBacked(?string $bondType, ?string $issuerTitle): bool
+    {
+        if ($bondType !== null && str_contains(mb_strtolower($bondType), 'ипотечн')) {
+            return true;
+        }
+        if ($issuerTitle !== null && str_contains(mb_strtolower($issuerTitle), 'ипотечный агент')) {
+            return true;
+        }
+        return false;
     }
 
     /**

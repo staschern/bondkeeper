@@ -109,9 +109,10 @@ mysql -u <пользователь> -p www-root_bondkeeper < database/001_schema
 mysql -u <пользователь> -p www-root_bondkeeper < database/002_issuer_moex_emitter_id.sql
 mysql -u <пользователь> -p www-root_bondkeeper < database/003_widen_value_per_bond.sql
 mysql -u <пользователь> -p www-root_bondkeeper < database/004_coupon_type_unknown.sql
+mysql -u <пользователь> -p www-root_bondkeeper < database/005_is_mortgage_backed.sql
 ```
 
-Вариант Б — через phpMyAdmin (он уже установлен по конфигурации ПО): зайти в базу `www-root_bondkeeper` → вкладка **Импорт** → выбрать файл `database/001_schema.sql` → Выполнить → повторить по очереди для `002_issuer_moex_emitter_id.sql`, `003_widen_value_per_bond.sql`, `004_coupon_type_unknown.sql`.
+Вариант Б — через phpMyAdmin (он уже установлен по конфигурации ПО): зайти в базу `www-root_bondkeeper` → вкладка **Импорт** → выбрать файл `database/001_schema.sql` → Выполнить → повторить по очереди для `002_issuer_moex_emitter_id.sql`, `003_widen_value_per_bond.sql`, `004_coupon_type_unknown.sql`, `005_is_mortgage_backed.sql`.
 
 `002_...sql` обязателен — без него `issuers.inn` останется `NOT NULL`, а ISS API его не отдаёт (см. README, раздел «Что бесплатно»), и `seed_market.php` не запишет ни одного эмитента. `003_...sql` нужен для бумаг с крупным номиналом (от 100 млн ₽ за бумагу) — без него часть институциональных выпусков будет падать с `SQLSTATE 22003 Out of range`. `004_...sql` добавляет честное значение `unknown` для `coupon_type` вместо угаданного `fixed` — без него `seed_market.php` отработает, но часть бумаг (ипотечные/валютные/бессрочные, где `BOND_TYPE` не про ставку) останется неверно помечена как `fixed`.
 
