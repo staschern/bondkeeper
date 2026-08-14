@@ -19,6 +19,7 @@ database/002_issuer_moex_emitter_id.sql — миграция: ИНН эмите�
 database/003_widen_value_per_bond.sql   — миграция: DECIMAL(12,4) тесна для номиналов от 100 млн ₽
 database/004_coupon_type_unknown.sql    — миграция: coupon_type='unknown' вместо угаданного 'fixed'
 database/005_is_mortgage_backed.sql     — миграция: флаг ИЦБ (ипотечные бумаги без полного графика вперёд)
+database/006_coupons_amortizations_upsert.sql — миграция: coupons/amortizations больше не "замерзают" после первой строки
 src/Database.php                     — подключение к MySQL (PDO)
 src/Iss/IssClient.php                — HTTP-клиент ISS API Мосбиржи
 src/Iss/SecuritiesImporter.php       — issuers/securities/redemptions(scheduled_maturity)
@@ -38,6 +39,7 @@ mysql -u root -p bondkeeper < database/002_issuer_moex_emitter_id.sql
 mysql -u root -p bondkeeper < database/003_widen_value_per_bond.sql
 mysql -u root -p bondkeeper < database/004_coupon_type_unknown.sql
 mysql -u root -p bondkeeper < database/005_is_mortgage_backed.sql
+mysql -u root -p bondkeeper < database/006_coupons_amortizations_upsert.sql
 
 php bin/seed_market.php        # issuers, securities, redemptions(scheduled_maturity)
 php bin/seed_bondization.php   # coupons, amortizations

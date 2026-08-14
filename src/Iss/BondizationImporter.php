@@ -13,21 +13,38 @@ use PDO;
  * и уже прошедшие купоны/амортизации), в отличие от description-блока,
  * который даёт только текущий купон и дату ближайшей оферты/погашения.
  *
- * По умолчанию запускается по бумагам, у которых ещё нет ни одной строки
- * в coupons ("ещё не сеяли график") — дёшево для ежедневного cron, не
- * трогает уже загруженные бумаги. $forceAll=true обрабатывает вообще все
- * активные бумаги заново — нужен для разового backfill, когда меняется
- * сама логика маппинга полей (так нашли и чинили путаницу
- * rate_percent/valueprc, см. коммиты), а не только для новых бумаг.
+ * Пост-обработка этапа 1 (docs/STAGE1_POSTPROCESSING.md): переписано после
+ * находки, что обе таблицы фактически "замерзали" после первого прогона.
+ * Причина была в связке двух решений:
+ *   1. Отбор "что обрабатывать сегодня" проверял буквально "есть ли у
+ *      бумаги хоть одна строка" (LEFT JOIN ... WHERE c.id IS NULL). Как
+ *      только строка появлялась — бумага навсегда выпадала из ежедневной
+ *      обработки, даже если график ещё не полон.
+ *   2. `value_per_bond NOT NULL` заставлял тихо выбрасывать (`continue`)
+ *      любую выплату, для которой API ещё не знает сумму — типичный
+ *      случай для флоатеров и структурных облигаций, где сумма будущего
+ *      купона зависит от ещё не наступившей даты фиксации базовой ставки.
+ * Вместе это значило: у такой бумаги первая же прошедшая (уже известная)
+ * выплата блокировала бумагу от дальнейшей обработки навсегда, а будущие
+ * выплаты с неизвестной суммой никогда не попадали в таблицу вообще —
+ * не как NULL, а как полностью отсутствующий факт.
  *
- * Пересев бумаги — это DELETE старого графика + INSERT нового в одной
- * транзакции (не апсерт "поверх") — см. importOne().
+ * Теперь: 1) строка со ЗНАЧЕНИЕМ даты, но неизвестной суммой — всё равно
+ * вставляется (status='planned', rate_percent/value_per_bond=NULL), а не
+ * пропускается; 2) отбор "что обрабатывать сегодня" смотрит не на факт
+ * существования строк, а на то, есть ли у бумаги незаполненные "плейсхолдеры"
+ * (см. importForAllPending()); 3) апсерт по естественному ключу
+ * (security_id, period_end_date)/(security_id, payment_date_planned) вместо
+ * DELETE+INSERT — coupon_number (порядковый номер, который мы считали сами)
+ * убран из схемы (миграция 006), поэтому исходная причина держать
+ * DELETE+INSERT (нестабильность порядковых номеров между прогонами) больше
+ * не существует: дата не "сдвигается" от прогона к прогону.
  */
 final class BondizationImporter
 {
     private int $processed = 0;
-    private int $couponsImported = 0;
-    private int $amortizationsImported = 0;
+    private int $couponsUpserted = 0;
+    private int $amortizationsUpserted = 0;
     private int $failed = 0;
 
     public function __construct(
@@ -36,12 +53,55 @@ final class BondizationImporter
     ) {
     }
 
+    /**
+     * "Нужно обработать сегодня" = у бумаги есть незаполненные данные, к
+     * которым стоит вернуться:
+     *   - вообще ни одной строки ещё нет (первый сев для этой бумаги —
+     *     единственный случай, где для coupons отбор смотрит на факт
+     *     существования строк, а не на их содержимое: пустой график
+     *     бывает у настоящих zero_coupon-бумаг, и это нормально, но
+     *     отличить "ещё не сеяли" от "сеяли и график пуст" без строк
+     *     нельзя, поэтому такая бумага будет открываться на bondization
+     *     каждый день — это лишний, но безвредный HTTP-запрос, а не
+     *     потеря данных);
+     *   - ИЛИ у бумаги есть купон с известной датой, но неизвестной суммой
+     *     (status='planned' AND value_per_bond IS NULL) — типично для
+     *     флоатеров/структурных облигаций, ждём, когда биржа опубликует
+     *     факт;
+     *   - ИЛИ у бумаги, уже отмеченной как амортизируемая
+     *     (securities.is_amortized), есть амортизация с известной датой,
+     *     но неизвестной суммой — та же логика, но не проверяется для
+     *     НЕ-амортизируемых бумаг: у подавляющего большинства бумаг
+     *     amortizations пуста НАВСЕГДА (обычный bullet-бонд без
+     *     амортизации) — если бы отсутствие строк в amortizations само по
+     *     себе считалось "нужно обработать", это фактически означало бы
+     *     пересев всего рынка каждый день, а не только реально
+     *     недозаполненных бумаг.
+     */
     public function importForAllPending(bool $forceAll = false): void
     {
-        $sql = 'SELECT s.id, s.isin, s.issuer_id FROM securities s';
-        $sql .= $forceAll
-            ? ' WHERE s.status = "active"'
-            : ' LEFT JOIN coupons c ON c.security_id = s.id WHERE c.id IS NULL AND s.status = "active"';
+        $this->processed = 0;
+        $this->couponsUpserted = 0;
+        $this->amortizationsUpserted = 0;
+        $this->failed = 0;
+
+        $sql = 'SELECT s.id, s.isin, s.issuer_id FROM securities s WHERE s.status = "active"';
+        if (!$forceAll) {
+            $sql .= ' AND (
+                NOT EXISTS (SELECT 1 FROM coupons c WHERE c.security_id = s.id)
+                OR EXISTS (
+                    SELECT 1 FROM coupons c
+                    WHERE c.security_id = s.id AND c.status = "planned" AND c.value_per_bond IS NULL
+                )
+                OR (
+                    s.is_amortized = 1
+                    AND EXISTS (
+                        SELECT 1 FROM amortizations a
+                        WHERE a.security_id = s.id AND a.status = "planned" AND a.value_per_bond IS NULL
+                    )
+                )
+            )';
+        }
 
         $stmt = $this->db->query($sql);
 
@@ -57,32 +117,21 @@ final class BondizationImporter
 
         Logger::info('=== Отчёт по импорту графика выплат (bondization) ===');
         Logger::info("Бумаг обработано: {$this->processed}");
-        Logger::info("Купонов импортировано: {$this->couponsImported}");
-        Logger::info("Амортизаций импортировано: {$this->amortizationsImported}");
+        Logger::info("Купонов записано (вставлено/обновлено): {$this->couponsUpserted}");
+        Logger::info("Амортизаций записано (вставлено/обновлено): {$this->amortizationsUpserted}");
         Logger::info("Ошибок: {$this->failed}");
     }
 
     /**
-     * DELETE перед INSERT, а не чистый апсерт — намеренно, найдено на
-     * реальном баге: coupon_number считается нами же (порядковый номер
-     * после сортировки по дате), а не берётся из API. Если ответ API на
-     * повторный запрос вернул для бумаги МЕНЬШЕ строк, чем в прошлый раз
-     * (сегодня для 435 бумаг из 3061 так и случилось), апсерт по ключу
-     * (security_id, coupon_number) просто не доходит до "лишних" старых
-     * номеров — они остаются в таблице от предыдущего прогона нетронутыми,
-     * со старыми (в тот раз ошибочными) значениями. Удаление старого
-     * графика бумаги перед вставкой нового устраняет этот класс проблем
-     * полностью: таблица всегда точно отражает последний ответ API.
+     * Апсерт вместо DELETE+INSERT: и coupons, и amortizations теперь имеют
+     * UNIQUE KEY на естественном ключе (security_id, дата), поэтому нет
+     * нужды удалять весь график перед перезаписью — ON DUPLICATE KEY UPDATE
+     * обновляет ровно те строки, которые реально пришли в новом ответе API,
+     * не трогая остальные.
      *
-     * Оборачиваем в транзакцию — без неё сбой на середине вставки (например,
-     * обрыв сети на 5-м из 10 купонов) оставил бы бумагу с ГОРАЗДО меньшим
-     * графиком, чем был до запуска, что хуже отсутствия обновления вообще.
-     *
-     * DELETE безопасен на этом этапе: event_stories.coupon_id/amortization_id
-     * ссылаются на эти таблицы с ON DELETE SET NULL, но строк в event_stories
-     * ещё не существует (событийный движок — задача следующего этапа). Когда
-     * он появится, этот метод придётся пересмотреть — переписывание графика
-     * не должно молча обнулять ссылки на уже случившиеся события.
+     * Строка вставляется, если у выплаты известна дата — сумма/ставка
+     * необязательны (см. класс-докблок). Пропускается только полностью
+     * бесполезная строка без даты вообще.
      */
     private function importOne(int $securityId, string $isin, int $issuerId): void
     {
@@ -94,81 +143,86 @@ final class BondizationImporter
         $coupons = IssClient::block($response, 'coupons');
         $amortizations = IssClient::block($response, 'amortizations');
 
-        usort($coupons, static fn ($a, $b) => strcmp((string) ($a['coupondate'] ?? ''), (string) ($b['coupondate'] ?? '')));
-
         $this->db->beginTransaction();
         try {
-            $this->db->prepare('DELETE FROM coupons WHERE security_id = :security_id')
-                ->execute(['security_id' => $securityId]);
-            $this->db->prepare('DELETE FROM amortizations WHERE security_id = :security_id')
-                ->execute(['security_id' => $securityId]);
+            $couponUpsert = $this->db->prepare(
+                'INSERT INTO coupons (security_id, issuer_id, period_start_date, period_end_date, rate_percent, value_per_bond)
+                 VALUES (:security_id, :issuer_id, :period_start, :period_end, :rate, :value)
+                 ON DUPLICATE KEY UPDATE
+                    period_start_date = VALUES(period_start_date),
+                    rate_percent = VALUES(rate_percent),
+                    value_per_bond = VALUES(value_per_bond),
+                    updated_at = CURRENT_TIMESTAMP'
+            );
 
-            $couponNumber = 0;
             foreach ($coupons as $coupon) {
                 $couponDate = $coupon['coupondate'] ?? null;
-                $couponValue = $coupon['value'] ?? null;
-                if ($couponDate === null || $couponValue === null) {
+                if ($couponDate === null) {
                     continue;
                 }
-                $couponNumber++;
 
-                $stmt = $this->db->prepare(
-                    'INSERT INTO coupons (security_id, issuer_id, coupon_number, period_start_date, period_end_date, rate_percent, value_per_bond)
-                     VALUES (:security_id, :issuer_id, :coupon_number, :period_start, :period_end, :rate, :value)'
-                );
-                $stmt->execute([
+                $couponUpsert->execute([
                     'security_id' => $securityId,
                     'issuer_id' => $issuerId,
-                    'coupon_number' => $couponNumber,
                     'period_start' => $coupon['startdate'] ?? null,
                     'period_end' => $couponDate,
                     // Реальное имя поля со ставкой купона в bondization-ответе —
                     // valueprc (проверено на bondkeeper.ru: 'value'=16.44 руб.,
                     // 'valueprc'=20 — то есть 20% годовых). Поля 'couponpercent'
-                    // в этом эндпоинте не существует вообще.
+                    // в этом эндпоинте не существует вообще. Оба поля
+                    // намеренно НЕ форсируются в NULL, если API их не даёт —
+                    // просто передаём то, что реально пришло: у флоатера
+                    // ставка и сумма обычно неизвестны вместе, но если
+                    // когда-нибудь придёт одно без другого, не теряем то,
+                    // что есть.
                     'rate' => $coupon['valueprc'] ?? null,
-                    'value' => $couponValue,
+                    'value' => $coupon['value'] ?? null,
                 ]);
-                $this->couponsImported++;
+                $this->couponsUpserted++;
             }
 
-            $insertedAmortizations = [];
+            $amortUpsert = $this->db->prepare(
+                'INSERT INTO amortizations (security_id, issuer_id, payment_date_planned, value_per_bond, percent_of_nominal)
+                 VALUES (:security_id, :issuer_id, :payment_date, :value, :percent)
+                 ON DUPLICATE KEY UPDATE
+                    value_per_bond = VALUES(value_per_bond),
+                    percent_of_nominal = VALUES(percent_of_nominal),
+                    updated_at = CURRENT_TIMESTAMP'
+            );
+
+            $upsertedAmortizations = [];
             foreach ($amortizations as $amortization) {
                 $amortDate = $amortization['amortdate'] ?? null;
-                $amortValue = $amortization['value'] ?? null;
-                if ($amortDate === null || $amortValue === null) {
+                if ($amortDate === null) {
                     continue;
                 }
 
-                $stmt = $this->db->prepare(
-                    'INSERT INTO amortizations (security_id, issuer_id, payment_date_planned, value_per_bond, percent_of_nominal)
-                     VALUES (:security_id, :issuer_id, :payment_date, :value, :percent)'
-                );
-                $stmt->execute([
+                $amortUpsert->execute([
                     'security_id' => $securityId,
                     'issuer_id' => $issuerId,
                     'payment_date' => $amortDate,
-                    'value' => $amortValue,
+                    'value' => $amortization['value'] ?? null,
                     'percent' => $amortization['valueprc'] ?? null,
                 ]);
-                $this->amortizationsImported++;
-                $insertedAmortizations[] = $amortization;
+                $this->amortizationsUpserted++;
+                $upsertedAmortizations[] = $amortization;
             }
 
             // is_amortized выставляется по факту реально записанных строк
-            // (не по сырому $amortizations — там могут быть строки, которые
-            // выше отфильтровались из-за отсутствия даты/суммы). Раньше это
-            // поле нигде не выставлялось вообще и оставалось FALSE по
-            // умолчанию для всех бумаг, независимо от факта амортизации.
+            // (в т.ч. плейсхолдеров с известной датой, но пока неизвестной
+            // суммой — бумага уже точно амортизируемая, просто не все суммы
+            // ещё опубликованы биржей).
             $this->db->prepare('UPDATE securities SET is_amortized = :flag WHERE id = :security_id')
-                ->execute(['flag' => $insertedAmortizations !== [] ? 1 : 0, 'security_id' => $securityId]);
+                ->execute(['flag' => $upsertedAmortizations !== [] ? 1 : 0, 'security_id' => $securityId]);
 
             // Если у бумаги была амортизация, плановая сумма scheduled_maturity
             // должна быть остатком номинала, а не полным номиналом, который
             // проставил SecuritiesImporter — досчитываем здесь, когда график
-            // уже известен.
-            if ($insertedAmortizations !== []) {
-                $this->adjustScheduledRedemption($securityId, $insertedAmortizations);
+            // уже известен. Неизвестные (ещё не опубликованные) суммы
+            // амортизации считаются как 0 в этой сумме — как только биржа
+            // опубликует их, следующий прогон пересчитает остаток заново.
+            if ($upsertedAmortizations !== []) {
+                $this->adjustScheduledRedemption($securityId, $upsertedAmortizations);
             }
 
             $this->db->commit();
