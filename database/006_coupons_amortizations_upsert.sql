@@ -31,12 +31,18 @@
 -- не "сдвигается" от прогона к прогону, в отличие от порядкового номера.
 -- =====================================================================
 
+-- value_per_bond остаётся DECIMAL(18,4), а не (12,4) — миграция 003 уже
+-- расширяла эту колонку (100 000 000 ₽ на бумагу у части институциональных
+-- размещений не влезает в (12,4)). Здесь меняем только nullability, а не
+-- точность/разрядность — сужение обратно до (12,4) роняет ALTER на
+-- реальных данных с "Out of range value" (найдено вживую на bondkeeper.ru
+-- при накатке этой миграции).
 ALTER TABLE coupons
     DROP KEY uq_coupons_security_number,
     DROP COLUMN coupon_number,
-    MODIFY COLUMN value_per_bond DECIMAL(12,4) NULL,
+    MODIFY COLUMN value_per_bond DECIMAL(18,4) NULL,
     ADD UNIQUE KEY uq_coupons_security_period_end (security_id, period_end_date);
 
 ALTER TABLE amortizations
-    MODIFY COLUMN value_per_bond DECIMAL(12,4) NULL,
+    MODIFY COLUMN value_per_bond DECIMAL(18,4) NULL,
     ADD UNIQUE KEY uq_amortizations_security_period (security_id, payment_date_planned);
