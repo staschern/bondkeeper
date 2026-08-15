@@ -143,6 +143,12 @@ final class SecuritiesImporter
         $this->securitiesImported++;
     }
 
+    /** @param array<string, mixed> $description */
+    private function initialNominalFrom(array $description): ?string
+    {
+        return $this->firstPresent($description, ['INITIALFACEVALUE', 'FACEVALUE']);
+    }
+
     /**
      * Общий поиск ISS API по ISIN — единственный подтверждённый источник
      * emitent_inn/emitent_title/emitent_id, и заодно правильного secid
@@ -275,6 +281,22 @@ final class SecuritiesImporter
         $bondType = $this->firstPresent($description, ['BOND_TYPE']);
         $couponType = $this->mapCouponType($bondType);
         $isStructured = $this->isStructured($bondType);
+        // Обратный порядок относительно $nominal (там нужен ТЕКУЩИЙ номинал,
+        // здесь — исходный, зафиксированный раз и навсегда): см. миграцию
+        // 007 и docs/STAGE1_POSTPROCESSING.md про формулу redemptions.
+        $initialNominal = $this->initialNominalFrom($description);
+        // Спекулятивный, текстовый сигнал is_amortized — независимый от
+        // BondizationImporter (который ставит TRUE по факту реально
+        // загруженных строк amortizations). Нужен как страховка: если в
+        // конкретный день bondization-эндпоинт по этой бумаге вернул пустой
+        // amortizations (разовый сбой ответа API — такое уже случалось на
+        // 435 бумагах за один день), а BOND_TYPE прямо говорит "амортизируемые",
+        // мы всё равно знаем, что бумага амортизируемая, и не должны
+        // навсегда терять её из pending-отбора BondizationImporter — см.
+        // GREATEST(...) в ON DUPLICATE KEY UPDATE ниже: этот сигнал может
+        // только ВКЛЮЧИТЬ флаг, никогда не выключить то, что уже подтвердил
+        // BondizationImporter реальными строками.
+        $looksAmortized = $bondType !== null && str_contains(mb_strtolower($bondType), 'амортизир');
 
         // Пост-обработка этапа 1 (documents/2026.08.10_BondKeeper_issuers_securities_QA.md):
         // три поля ниже читаются из уже вызываемых эндпоинтов, новых
@@ -313,18 +335,40 @@ final class SecuritiesImporter
         // строк в amortizations, это надёжнее текстового BOND_TYPE.
         $this->recordMissing('securities.is_subordinated (поле в ISS API не найдено)');
 
+        // initial_nominal_value обновляется через COALESCE(старое, новое) —
+        // НЕ через VALUES() напрямую, как обычные поля, и НЕ пропускается
+        // полностью, как created_at. Разница важна: если исключить поле из
+        // UPDATE целиком, оно НИКОГДА не заполнится для строк, вставленных
+        // ДО этой миграции (а таких — весь текущий рынок, ~3061 бумага) —
+        // ON DUPLICATE KEY UPDATE трогает только перечисленные там колонки,
+        // при конфликте по isin VALUES() из INSERT-части для остальных
+        // полей просто не применяется. COALESCE(initial_nominal_value,
+        // VALUES(initial_nominal_value)) даёт нужное поведение в обоих
+        // случаях: для уже существующей строки, где поле уже заполнено —
+        // остаётся как было (VALUES игнорируется); для существующей строки,
+        // где поле ещё NULL (первый прогон после миграции 007) —
+        // заполняется сегодняшним значением из API один-единственный раз,
+        // дальше снова не трогается. INITIALFACEVALUE по спецификации ISS —
+        // номинал НА МОМЕНТ ВЫПУСКА, не меняется со временем сам по себе,
+        // поэтому даже "запоздалое" первое чтение (бумага уже годы как
+        // торгуется и явно проходила амортизацию до нас) должно вернуть
+        // корректное историческое значение, а не сегодняшний слепок.
+        // is_amortized — тот же принцип монотонного апдейта, но через
+        // GREATEST(): текстовый сигнал из BOND_TYPE может только ВКЛЮЧИТЬ
+        // флаг, никогда не выключить то, что уже подтвердил
+        // BondizationImporter реальными строками amortizations.
         $stmt = $this->db->prepare(
             'INSERT INTO securities
                 (isin, secid, reg_number, issuer_id, short_name, full_name,
-                 nominal_value, currency, maturity_date, initial_issue_volume,
+                 nominal_value, initial_nominal_value, currency, maturity_date, initial_issue_volume,
                  listing_level, moex_board, coupon_type, coupon_frequency,
-                 is_qualified_investors_only, is_structured, trading_start_date,
+                 is_qualified_investors_only, is_structured, is_amortized, trading_start_date,
                  security_type, has_offer, is_mortgage_backed, last_synced_at)
              VALUES
                 (:isin, :secid, :reg_number, :issuer_id, :short_name, :full_name,
-                 :nominal_value, :currency, :maturity_date, :issue_volume,
+                 :nominal_value, :initial_nominal_value, :currency, :maturity_date, :issue_volume,
                  :listing_level, :moex_board, :coupon_type, :coupon_frequency,
-                 :is_qualified_only, :is_structured, :trading_start_date,
+                 :is_qualified_only, :is_structured, :looks_amortized, :trading_start_date,
                  :security_type, :has_offer, :is_mortgage_backed, NOW())
              ON DUPLICATE KEY UPDATE
                 secid = VALUES(secid),
@@ -332,6 +376,7 @@ final class SecuritiesImporter
                 short_name = VALUES(short_name),
                 full_name = VALUES(full_name),
                 nominal_value = VALUES(nominal_value),
+                initial_nominal_value = COALESCE(initial_nominal_value, VALUES(initial_nominal_value)),
                 currency = VALUES(currency),
                 maturity_date = VALUES(maturity_date),
                 initial_issue_volume = VALUES(initial_issue_volume),
@@ -341,6 +386,7 @@ final class SecuritiesImporter
                 coupon_frequency = VALUES(coupon_frequency),
                 is_qualified_investors_only = VALUES(is_qualified_investors_only),
                 is_structured = VALUES(is_structured),
+                is_amortized = GREATEST(is_amortized, VALUES(is_amortized)),
                 trading_start_date = VALUES(trading_start_date),
                 security_type = VALUES(security_type),
                 has_offer = VALUES(has_offer),
@@ -355,6 +401,7 @@ final class SecuritiesImporter
             'short_name' => $shortName,
             'full_name' => $fullName,
             'nominal_value' => $nominal ?? 1000,
+            'initial_nominal_value' => $initialNominal ?? $nominal ?? 1000,
             'currency' => $currency,
             'maturity_date' => $maturityDate,
             'issue_volume' => $issueVolume,
@@ -364,6 +411,7 @@ final class SecuritiesImporter
             'coupon_frequency' => $couponFrequency,
             'is_qualified_only' => $isQualifiedOnly === null ? 0 : (int) $isQualifiedOnly,
             'is_structured' => (int) $isStructured,
+            'looks_amortized' => (int) $looksAmortized,
             'trading_start_date' => $tradingStartDate,
             'security_type' => $securityType,
             'has_offer' => (int) $hasOffer,
@@ -506,26 +554,49 @@ final class SecuritiesImporter
      * bondization-эндпоинта и заполняется сразу при импорте справочника.
      * value_per_bond здесь равен номиналу целиком — если у бумаги есть
      * амортизация, BondizationImporter корректирует это значение до остатка
-     * номинала после уже импортированных amortizations (см. adjustScheduledRedemption).
+     * номинала после уже импортированных amortizations (см. adjustScheduledRedemption
+     * в BondizationImporter, формула через securities.initial_nominal_value).
+     *
+     * MATDATE не считался неизменным навсегда — в исключительных случаях
+     * (досрочное погашение, реструктуризация) дата погашения у биржи может
+     * измениться уже после того, как строка redemptions создана. Раньше
+     * проверялся только факт существования строки — если она уже была,
+     * повторный MATDATE молча игнорировался, даже если реально изменился.
+     * Теперь: если существующая строка и текущий MATDATE совпадают — не
+     * трогаем её (в том числе value_per_bond, который мог уже
+     * скорректировать BondizationImporter под остаток после амортизации);
+     * если НЕ совпадают — обновляем только дату, тоже не трогая
+     * value_per_bond по той же причине.
      *
      * @param array<string, mixed> $description
      */
     private function upsertScheduledRedemption(int $securityId, int $issuerId, array $description): void
     {
         $maturityDate = $this->nullableDate($this->firstPresent($description, ['MATDATE']));
-        $nominal = $this->firstPresent($description, ['FACEVALUE', 'INITIALFACEVALUE']);
+        $nominal = $this->initialNominalFrom($description) ?? $this->firstPresent($description, ['FACEVALUE']);
 
         if ($maturityDate === null || $nominal === null) {
             $this->recordMissing('redemptions.payment_date_planned/value_per_bond');
             return;
         }
 
-        $exists = $this->db->prepare(
-            "SELECT id FROM redemptions
+        $existing = $this->db->prepare(
+            "SELECT id, payment_date_planned FROM redemptions
              WHERE security_id = :security_id AND redemption_type = 'scheduled_maturity'"
         );
-        $exists->execute(['security_id' => $securityId]);
-        if ($exists->fetchColumn() !== false) {
+        $existing->execute(['security_id' => $securityId]);
+        $row = $existing->fetch();
+
+        if ($row !== false) {
+            if ($row['payment_date_planned'] === $maturityDate) {
+                return;
+            }
+            $this->db->prepare(
+                'UPDATE redemptions SET payment_date_planned = :payment_date_planned WHERE id = :id'
+            )->execute([
+                'payment_date_planned' => $maturityDate,
+                'id' => $row['id'],
+            ]);
             return;
         }
 

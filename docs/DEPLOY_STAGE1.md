@@ -111,11 +111,14 @@ mysql -u <пользователь> -p www-root_bondkeeper < database/003_widen_
 mysql -u <пользователь> -p www-root_bondkeeper < database/004_coupon_type_unknown.sql
 mysql -u <пользователь> -p www-root_bondkeeper < database/005_is_mortgage_backed.sql
 mysql -u <пользователь> -p www-root_bondkeeper < database/006_coupons_amortizations_upsert.sql
+mysql -u <пользователь> -p www-root_bondkeeper < database/007_initial_nominal_value.sql
 ```
 
-Вариант Б — через phpMyAdmin (он уже установлен по конфигурации ПО): зайти в базу `www-root_bondkeeper` → вкладка **Импорт** → выбрать файл `database/001_schema.sql` → Выполнить → повторить по очереди для `002_issuer_moex_emitter_id.sql`, `003_widen_value_per_bond.sql`, `004_coupon_type_unknown.sql`, `005_is_mortgage_backed.sql`, `006_coupons_amortizations_upsert.sql`.
+Вариант Б — через phpMyAdmin (он уже установлен по конфигурации ПО): зайти в базу `www-root_bondkeeper` → вкладка **Импорт** → выбрать файл `database/001_schema.sql` → Выполнить → повторить по очереди для `002_issuer_moex_emitter_id.sql`, `003_widen_value_per_bond.sql`, `004_coupon_type_unknown.sql`, `005_is_mortgage_backed.sql`, `006_coupons_amortizations_upsert.sql`, `007_initial_nominal_value.sql`.
 
 После миграции `006` обязательно прогнать `php bin/seed_bondization.php --force` один раз (не обычный режим) — это разово пересеет график для ВСЕХ активных бумаг под новой upsert-логикой, включая те, что раньше "замёрзли" с первой строки. После этого разового прогона обычный (без `--force`) режим по расписанию продолжит донаполнять только реально незаполненные бумаги — подробности в `docs/STAGE1_POSTPROCESSING.md`.
+
+После миграции `007` обязательно прогнать `php bin/seed_market.php` (обычный режим — он один backfill'ит `initial_nominal_value` у уже существующих бумаг через `COALESCE`) и следом `php bin/seed_bondization.php --force` — пересчитает `redemptions.value_per_bond` по исправленной формуле для всех амортизируемых бумаг. Порядок важен: `seed_market.php` обязательно раньше, иначе `initial_nominal_value` ещё не заполнен, а `adjustScheduledRedemption` подстрахуется через `COALESCE(initial_nominal_value, nominal_value)`, дав менее точный (но не сломанный) результат — подробности в `docs/STAGE1_POSTPROCESSING.md`.
 
 `002_...sql` обязателен — без него `issuers.inn` останется `NOT NULL`, а ISS API его не отдаёт (см. README, раздел «Что бесплатно»), и `seed_market.php` не запишет ни одного эмитента. `003_...sql` нужен для бумаг с крупным номиналом (от 100 млн ₽ за бумагу) — без него часть институциональных выпусков будет падать с `SQLSTATE 22003 Out of range`. `004_...sql` добавляет честное значение `unknown` для `coupon_type` вместо угаданного `fixed` — без него `seed_market.php` отработает, но часть бумаг (ипотечные/валютные/бессрочные, где `BOND_TYPE` не про ставку) останется неверно помечена как `fixed`.
 

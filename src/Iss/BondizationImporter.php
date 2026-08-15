@@ -70,13 +70,27 @@ final class BondizationImporter
      *     факт;
      *   - ИЛИ у бумаги, уже отмеченной как амортизируемая
      *     (securities.is_amortized), есть амортизация с известной датой,
-     *     но неизвестной суммой — та же логика, но не проверяется для
-     *     НЕ-амортизируемых бумаг: у подавляющего большинства бумаг
+     *     но неизвестной суммой, ИЛИ амортизации нет вообще ни одной
+     *     строки. Обе проверки — только для is_amortized=1, не проверяются
+     *     для НЕ-амортизируемых бумаг: у подавляющего большинства бумаг
      *     amortizations пуста НАВСЕГДА (обычный bullet-бонд без
      *     амортизации) — если бы отсутствие строк в amortizations само по
-     *     себе считалось "нужно обработать", это фактически означало бы
-     *     пересев всего рынка каждый день, а не только реально
+     *     себе считалось "нужно обработать" для ВСЕХ бумаг, это означало
+     *     бы пересев всего рынка каждый день, а не только реально
      *     недозаполненных бумаг.
+     *
+     *     Часть "амортизации нет вообще ни одной строки" — страховка от
+     *     конкретного найденного сценария: бумага реально амортизируемая
+     *     (SecuritiesImporter уже поставил is_amortized=1 по тегу
+     *     "амортизир" в BOND_TYPE — см. её докблок), но в день первого
+     *     запроса bondization-эндпоинт вернул купоны полностью, а блок
+     *     amortizations — пустым (тот же класс разового неполного ответа
+     *     API, что уже случался). Без этой проверки: coupons полностью
+     *     заполнены → первое условие ложно; amortizations пуста, но
+     *     is_amortized уже TRUE (от текстового сигнала) → без явной
+     *     проверки NOT EXISTS бумага никогда больше не открылась бы на
+     *     bondization — is_amortized=1 сам по себе не запускает
+     *     переобработку, нужен ещё и факт отсутствия строк.
      */
     public function importForAllPending(bool $forceAll = false): void
     {
@@ -95,9 +109,12 @@ final class BondizationImporter
                 )
                 OR (
                     s.is_amortized = 1
-                    AND EXISTS (
-                        SELECT 1 FROM amortizations a
-                        WHERE a.security_id = s.id AND a.status = "planned" AND a.value_per_bond IS NULL
+                    AND (
+                        NOT EXISTS (SELECT 1 FROM amortizations a WHERE a.security_id = s.id)
+                        OR EXISTS (
+                            SELECT 1 FROM amortizations a
+                            WHERE a.security_id = s.id AND a.status = "planned" AND a.value_per_bond IS NULL
+                        )
                     )
                 )
             )';
@@ -208,21 +225,29 @@ final class BondizationImporter
                 $upsertedAmortizations[] = $amortization;
             }
 
-            // is_amortized выставляется по факту реально записанных строк
-            // (в т.ч. плейсхолдеров с известной датой, но пока неизвестной
-            // суммой — бумага уже точно амортизируемая, просто не все суммы
-            // ещё опубликованы биржей).
-            $this->db->prepare('UPDATE securities SET is_amortized = :flag WHERE id = :security_id')
-                ->execute(['flag' => $upsertedAmortizations !== [] ? 1 : 0, 'security_id' => $securityId]);
-
-            // Если у бумаги была амортизация, плановая сумма scheduled_maturity
-            // должна быть остатком номинала, а не полным номиналом, который
-            // проставил SecuritiesImporter — досчитываем здесь, когда график
-            // уже известен. Неизвестные (ещё не опубликованные) суммы
-            // амортизации считаются как 0 в этой сумме — как только биржа
-            // опубликует их, следующий прогон пересчитает остаток заново.
+            // is_amortized — монотонный флаг, выставляется В ЭТОМ методе
+            // ТОЛЬКО в TRUE, никогда обратно в FALSE. Раньше сюда писали
+            // 0, если сегодняшний ответ API не содержал ни одной строки
+            // амортизации — а bondization-эндпоинт уже ловили на разовых
+            // неполных ответах (435 бумаг за один день, см. историю в
+            // README). Для бумаги с реальной амортизацией это означало:
+            // один неудачный день — и is_amortized тихо становится FALSE
+            // навсегда, а вместе с ним бумага перестаёт даже проверяться
+            // на предмет "не пришла ли амортизация" в pending-отборе
+            // importForAllPending() (см. её докблок). SecuritiesImporter
+            // отдельно, по тегу "амортизир" в BOND_TYPE, может выставить
+            // тот же флаг ДО того, как здесь появятся реальные строки —
+            // оба источника пишут через GREATEST()/только-TRUE, поэтому
+            // не конфликтуют между собой.
             if ($upsertedAmortizations !== []) {
-                $this->adjustScheduledRedemption($securityId, $upsertedAmortizations);
+                $this->db->prepare('UPDATE securities SET is_amortized = 1 WHERE id = :security_id')
+                    ->execute(['security_id' => $securityId]);
+
+                // Плановая сумма scheduled_maturity должна быть остатком
+                // номинала, а не полным номиналом, который проставил
+                // SecuritiesImporter — досчитываем здесь, когда график уже
+                // известен.
+                $this->adjustScheduledRedemption($securityId);
             }
 
             $this->db->commit();
@@ -233,23 +258,42 @@ final class BondizationImporter
     }
 
     /**
-     * Пересчитывает от исходного номинала (securities.nominal_value), а не
-     * вычитает из текущего value_per_bond — так пересчёт идемпотентен и
-     * не зависит от того, запускался ли он раньше для этой бумаги.
+     * Пересчитывает от НЕИЗМЕННОГО номинала на момент выпуска
+     * (securities.initial_nominal_value, миграция 007), а НЕ от текущего
+     * securities.nominal_value. Текущий nominal_value — это тот же
+     * FACEVALUE, который синкается ежедневно и у амортизируемой бумаги УЖЕ
+     * САМ ПО СЕБЕ является остатком после прошлых амортизаций. Если из него
+     * ещё раз вычесть сумму по ВСЕЙ амортизации (bondization отдаёт график
+     * целиком — и прошлые, и будущие транши), прошлая амортизация
+     * вычитается дважды, а будущая — раньше времени: у бумаги с
+     * существенной историей амортизации итог легко уходит в минус.
+     * COALESCE на nominal_value — подстраховка на случай, если
+     * initial_nominal_value почему-то не заполнился (см. миграцию 007).
      *
-     * @param array<int, array<string, mixed>> $amortizations
+     * Сумма амортизации берётся запросом к самой таблице (SUM по всем
+     * сохранённым строкам securities_id), а не из аргументов текущего
+     * вызова — так пересчёт корректен даже если СЕГОДНЯШНИЙ ответ API
+     * вернул амортизацию не полностью (разовый неполный ответ уже
+     * случался, см. README): в сумму попадёт всё, что реально накоплено
+     * в таблице к этому моменту, включая строки из прошлых успешных
+     * прогонов. Идемпотентен и не зависит от того, запускался ли пересчёт
+     * раньше для этой бумаги. SUM() в MySQL игнорирует NULL — неизвестные
+     * (ещё не опубликованные биржей) суммы амортизации по умолчанию не
+     * увеличивают вычитаемое, как только они появятся, следующий пересчёт
+     * учтёт их автоматически.
      */
-    private function adjustScheduledRedemption(int $securityId, array $amortizations): void
+    private function adjustScheduledRedemption(int $securityId): void
     {
-        $totalAmortized = array_sum(array_map(
-            static fn ($row) => (float) ($row['value'] ?? 0),
-            $amortizations
-        ));
+        $sumStmt = $this->db->prepare(
+            'SELECT SUM(value_per_bond) FROM amortizations WHERE security_id = :security_id'
+        );
+        $sumStmt->execute(['security_id' => $securityId]);
+        $totalAmortized = (float) $sumStmt->fetchColumn();
 
         $this->db->prepare(
             "UPDATE redemptions r
              JOIN securities s ON s.id = r.security_id
-             SET r.value_per_bond = s.nominal_value - :amortized
+             SET r.value_per_bond = COALESCE(s.initial_nominal_value, s.nominal_value) - :amortized
              WHERE r.security_id = :security_id
                AND r.redemption_type = 'scheduled_maturity'"
         )->execute([
