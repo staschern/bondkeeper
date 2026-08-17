@@ -129,11 +129,23 @@ final class NalogBiClient implements NalogBiClientInterface
         if ($raw === false || $error !== '') {
             throw new RuntimeException("bi2-proc.json: cURL ошибка: {$error}");
         }
+
+        $decoded = json_decode((string) $raw, true);
+
+        // Вторая, отдельная от HTTP 200 {captchaRequired:true} форма
+        // капчи — подтверждена вживую (bondkeeper.ru, август 2026):
+        // HTTP 400 с телом {"ERRORS":{"captcha":["Требуется ввести цифры
+        // с картинки..."]}}. По смыслу это то же самое "нужна капча", а
+        // не ошибка нашего запроса — приводим к общей форме
+        // {captchaRequired:true}, чтобы NalogBiResult::fromJson и вызывающий
+        // код (FnsBlocksImporter) не различали, откуда пришёл сигнал.
+        if ($httpCode === 400 && is_array($decoded) && !empty($decoded['ERRORS']['captcha'] ?? null)) {
+            return ['captchaRequired' => true];
+        }
+
         if ($httpCode !== 200) {
             throw new RuntimeException("bi2-proc.json вернул HTTP {$httpCode}: " . substr((string) $raw, 0, 300));
         }
-
-        $decoded = json_decode((string) $raw, true);
         if (!is_array($decoded)) {
             throw new RuntimeException('bi2-proc.json: не удалось распарсить JSON: ' . substr((string) $raw, 0, 300));
         }
