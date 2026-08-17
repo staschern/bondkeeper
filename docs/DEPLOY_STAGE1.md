@@ -112,9 +112,16 @@ mysql -u <пользователь> -p www-root_bondkeeper < database/004_coupon
 mysql -u <пользователь> -p www-root_bondkeeper < database/005_is_mortgage_backed.sql
 mysql -u <пользователь> -p www-root_bondkeeper < database/006_coupons_amortizations_upsert.sql
 mysql -u <пользователь> -p www-root_bondkeeper < database/007_initial_nominal_value.sql
+mysql -u <пользователь> -p www-root_bondkeeper < database/008_fns_blocks_upsert_keys.sql
 ```
 
-Вариант Б — через phpMyAdmin (он уже установлен по конфигурации ПО): зайти в базу `www-root_bondkeeper` → вкладка **Импорт** → выбрать файл `database/001_schema.sql` → Выполнить → повторить по очереди для `002_issuer_moex_emitter_id.sql`, `003_widen_value_per_bond.sql`, `004_coupon_type_unknown.sql`, `005_is_mortgage_backed.sql`, `006_coupons_amortizations_upsert.sql`, `007_initial_nominal_value.sql`.
+Вариант Б — через phpMyAdmin (он уже установлен по конфигурации ПО): зайти в базу `www-root_bondkeeper` → вкладка **Импорт** → выбрать файл `database/001_schema.sql` → Выполнить → повторить по очереди для `002_issuer_moex_emitter_id.sql`, `003_widen_value_per_bond.sql`, `004_coupon_type_unknown.sql`, `005_is_mortgage_backed.sql`, `006_coupons_amortizations_upsert.sql`, `007_initial_nominal_value.sql`, `008_fns_blocks_upsert_keys.sql`.
+
+После миграции `008` — точечная проверка блокировок счетов (не часть общего `seed_market.php`/`seed_bondization.php`, отдельный инструмент, намеренно не по всему рынку сразу):
+```bash
+php bin/check_fns_blocks.php --inns=1101148661,3702151662,7730176955,7805485840,7826108963,9727020246
+```
+Подробности — `docs/STAGE1_POSTPROCESSING.md`, раздел про `fns_blocks`.
 
 После миграции `006` обязательно прогнать `php bin/seed_bondization.php --force` один раз (не обычный режим) — это разово пересеет график для ВСЕХ активных бумаг под новой upsert-логикой, включая те, что раньше "замёрзли" с первой строки. После этого разового прогона обычный (без `--force`) режим по расписанию продолжит донаполнять только реально незаполненные бумаги — подробности в `docs/STAGE1_POSTPROCESSING.md`.
 

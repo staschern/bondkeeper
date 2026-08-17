@@ -21,12 +21,16 @@ database/004_coupon_type_unknown.sql    — миграция: coupon_type='unkno
 database/005_is_mortgage_backed.sql     — миграция: флаг ИЦБ (ипотечные бумаги без полного графика вперёд)
 database/006_coupons_amortizations_upsert.sql — миграция: coupons/amortizations больше не "замерзают" после первой строки
 database/007_initial_nominal_value.sql        — миграция: фиксированная база для расчёта остатка номинала в redemptions
+database/008_fns_blocks_upsert_keys.sql       — миграция: ключ для апсерта блокировок счетов (несколько банков на эмитента)
 src/Database.php                     — подключение к MySQL (PDO)
 src/Iss/IssClient.php                — HTTP-клиент ISS API Мосбиржи
 src/Iss/SecuritiesImporter.php       — issuers/securities/redemptions(scheduled_maturity)
 src/Iss/BondizationImporter.php      — coupons/amortizations
+src/Fns/NalogBiClient.php            — HTTP-клиент service.nalog.ru/bi.do (блокировки счетов)
+src/Fns/FnsBlocksImporter.php        — fns_blocks, issuers.is_fns_blocked
 bin/seed_market.php                  — запуск сидирования справочника (шаг 1)
 bin/seed_bondization.php             — запуск сидирования графика выплат (шаг 2)
+bin/check_fns_blocks.php             — точечная проверка блокировок счетов (см. docs/STAGE1_POSTPROCESSING.md)
 bin/debug_iss_security.php           — разовая диагностика сырого ответа ISS API по ISIN
 ```
 
@@ -42,6 +46,7 @@ mysql -u root -p bondkeeper < database/004_coupon_type_unknown.sql
 mysql -u root -p bondkeeper < database/005_is_mortgage_backed.sql
 mysql -u root -p bondkeeper < database/006_coupons_amortizations_upsert.sql
 mysql -u root -p bondkeeper < database/007_initial_nominal_value.sql
+mysql -u root -p bondkeeper < database/008_fns_blocks_upsert_keys.sql
 
 php bin/seed_market.php        # issuers, securities, redemptions(scheduled_maturity)
 php bin/seed_bondization.php   # coupons, amortizations
