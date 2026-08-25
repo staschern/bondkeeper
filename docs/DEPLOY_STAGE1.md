@@ -114,9 +114,12 @@ mysql -u <пользователь> -p www-root_bondkeeper < database/006_coupon
 mysql -u <пользователь> -p www-root_bondkeeper < database/007_initial_nominal_value.sql
 mysql -u <пользователь> -p www-root_bondkeeper < database/008_fns_blocks_upsert_keys.sql
 mysql -u <пользователь> -p www-root_bondkeeper < database/009_fns_verification_tracking.sql
+mysql -u <пользователь> -p www-root_bondkeeper < database/010_fns_blocks_one_row_per_issuer.sql
 ```
 
-Вариант Б — через phpMyAdmin (он уже установлен по конфигурации ПО): зайти в базу `www-root_bondkeeper` → вкладка **Импорт** → выбрать файл `database/001_schema.sql` → Выполнить → повторить по очереди для `002_issuer_moex_emitter_id.sql`, `003_widen_value_per_bond.sql`, `004_coupon_type_unknown.sql`, `005_is_mortgage_backed.sql`, `006_coupons_amortizations_upsert.sql`, `007_initial_nominal_value.sql`, `008_fns_blocks_upsert_keys.sql`, `009_fns_verification_tracking.sql`.
+Вариант Б — через phpMyAdmin (он уже установлен по конфигурации ПО): зайти в базу `www-root_bondkeeper` → вкладка **Импорт** → выбрать файл `database/001_schema.sql` → Выполнить → повторить по очереди для `002_issuer_moex_emitter_id.sql`, `003_widen_value_per_bond.sql`, `004_coupon_type_unknown.sql`, `005_is_mortgage_backed.sql`, `006_coupons_amortizations_upsert.sql`, `007_initial_nominal_value.sql`, `008_fns_blocks_upsert_keys.sql`, `009_fns_verification_tracking.sql`, `010_fns_blocks_one_row_per_issuer.sql`.
+
+**Миграция 010 очищает `fns_blocks`** (`DELETE FROM fns_blocks`) — старые построчные данные по банкам устарели по формату (см. `docs/STAGE1_POSTPROCESSING.md`), пересобираются повторным прогоном `bin/check_fns_blocks.php` на тех же ИНН.
 
 После миграции `008` — точечная проверка блокировок счетов (не часть общего `seed_market.php`/`seed_bondization.php`, отдельный инструмент, намеренно не по всему рынку сразу):
 ```bash

@@ -14,11 +14,20 @@ use PDO;
  *
  * Источник — "действующие приостановления" на сегодня, не история. Значит
  * при каждой проверке эмитента ответ — это полный СРЕЗ его активных
- * блокировок прямо сейчас, а не дельта. Отсюда два следствия для логики:
- *   - строки, которых не было в БД, но которые пришли сейчас — INSERT;
- *   - строки, которые БЫЛИ активны (unblock_date IS NULL) в БД, но не
- *     пришли в этом ответе — считаются снятыми, unblock_date = CURDATE()
- *     (см. applyResult). Строки не удаляются — это история блокировок.
+ * блокировок прямо сейчас, а не дельта.
+ *
+ * Пост-обработка (миграция 010): одна строка на ЭМИТЕНТА, не на банк.
+ * Раньше (миграция 008) хранили по строке на каждую пару БИК+номер
+ * решения — но на реальных данных (ООО "Контрол Лизинг") выяснилось, что
+ * одна и та же непрерывная блокировка периодически переиздаётся ФНС под
+ * новым номером решения даже без факта разблокировки — ключ по номеру
+ * решения принимал это за "снята старая, появилась новая" и плодил
+ * дубли. Плюс дата/сумма/основание оказались одинаковыми во всех банках
+ * одного эмитента — построчное хранение по банкам не несло
+ * дополнительного смысла, только количество. Теперь: данные берутся из
+ * ПЕРВОЙ валидной строки ответа, а число банков — в `active_bank_count`
+ * (см. consolidateRows). Строка не удаляется при снятии всех
+ * блокировок — так же, как раньше, помечается `unblock_date = CURDATE()`.
  *
  * Пост-обработка (миграция 009): раньше неудачная попытка (капча, сетевая
  * ошибка) вообще не оставляла следа в БД — нельзя было отличить "ещё не
@@ -103,10 +112,46 @@ final class FnsBlocksImporter
     {
         $this->db->beginTransaction();
         try {
-            $seenKeys = $this->upsertActiveRows($issuerId, $rows);
-            $this->markMissingRowsUnblocked($issuerId, $seenKeys);
+            $summary = $this->consolidateRows($rows);
+            $isBlocked = $summary !== null;
 
-            $isBlocked = $this->hasActiveBlocks($issuerId);
+            if ($summary !== null) {
+                $stmt = $this->db->prepare(
+                    'INSERT INTO fns_blocks
+                        (issuer_id, active_bank_count, decision_number, block_date, blocked_amount, reason, reason_category, source_reference)
+                     VALUES
+                        (:issuer_id, :active_bank_count, :decision_number, :block_date, :blocked_amount, :reason, :reason_category, :source_reference)
+                     ON DUPLICATE KEY UPDATE
+                        active_bank_count = VALUES(active_bank_count),
+                        decision_number = VALUES(decision_number),
+                        block_date = VALUES(block_date),
+                        unblock_date = NULL,
+                        blocked_amount = VALUES(blocked_amount),
+                        reason = VALUES(reason),
+                        reason_category = VALUES(reason_category),
+                        source_reference = VALUES(source_reference),
+                        updated_at = CURRENT_TIMESTAMP'
+                );
+                $stmt->execute([
+                    'issuer_id' => $issuerId,
+                    'active_bank_count' => $summary['active_bank_count'],
+                    'decision_number' => $summary['decision_number'],
+                    'block_date' => $summary['block_date'],
+                    'blocked_amount' => $summary['blocked_amount'],
+                    'reason' => $summary['reason'],
+                    'reason_category' => $summary['reason_category'],
+                    'source_reference' => $summary['source_reference'],
+                ]);
+            } else {
+                // Ни одной валидной строки в ответе — считаем блокировки
+                // снятыми. Строка не удаляется, только помечается датой —
+                // это та же логика "не потерять историю", что была раньше.
+                $this->db->prepare(
+                    'UPDATE fns_blocks SET unblock_date = CURDATE()
+                     WHERE issuer_id = :issuer_id AND unblock_date IS NULL'
+                )->execute(['issuer_id' => $issuerId]);
+            }
+
             $this->db->prepare(
                 "UPDATE issuers
                  SET is_fns_blocked = :blocked,
@@ -118,7 +163,7 @@ final class FnsBlocksImporter
 
             if ($isBlocked) {
                 $this->blockedFound++;
-                Logger::info("ФНС: ИНН {$inn} — активная блокировка счёта подтверждена");
+                Logger::info("ФНС: ИНН {$inn} — активная блокировка счёта подтверждена ({$summary['active_bank_count']} банк(ов))");
             }
 
             $this->db->commit();
@@ -129,27 +174,18 @@ final class FnsBlocksImporter
     }
 
     /**
+     * Сводит все строки ответа в одну запись на эмитента: дата, сумма и
+     * основание берутся из ПЕРВОЙ валидной строки (на практике совпадают
+     * во всех банках одного эмитента — см. докблок класса), а число
+     * валидных строк идёт в active_bank_count вместо перечисления
+     * конкретных БИК, которые сами по себе не несут продуктовой ценности.
+     *
      * @param array<int, array<string, mixed>> $rows
-     * @return array<int, array{0: string, 1: string}> замеченные (bank_bik, decision_number)
+     * @return array{active_bank_count: int, decision_number: string, block_date: string, blocked_amount: ?string, reason: ?string, reason_category: ?string, source_reference: string}|null
      */
-    private function upsertActiveRows(int $issuerId, array $rows): array
+    private function consolidateRows(array $rows): ?array
     {
-        $stmt = $this->db->prepare(
-            'INSERT INTO fns_blocks
-                (issuer_id, bank_bik, decision_number, block_date, blocked_amount, reason, reason_category, source_reference)
-             VALUES
-                (:issuer_id, :bank_bik, :decision_number, :block_date, :blocked_amount, :reason, :reason_category, :source_reference)
-             ON DUPLICATE KEY UPDATE
-                block_date = VALUES(block_date),
-                unblock_date = NULL,
-                blocked_amount = VALUES(blocked_amount),
-                reason = VALUES(reason),
-                reason_category = VALUES(reason_category),
-                source_reference = VALUES(source_reference),
-                updated_at = CURRENT_TIMESTAMP'
-        );
-
-        $seenKeys = [];
+        $valid = [];
         foreach ($rows as $row) {
             $bik = trim((string) ($row['BIK'] ?? ''));
             $decisionNumber = trim((string) ($row['NOMER'] ?? ''));
@@ -160,28 +196,30 @@ final class FnsBlocksImporter
                 continue;
             }
 
-            $kodOsnov = trim((string) ($row['KODOSNOV'] ?? ''));
-            $stmt->execute([
-                'issuer_id' => $issuerId,
-                'bank_bik' => $bik,
-                'decision_number' => $decisionNumber,
-                'block_date' => $blockDate,
-                'blocked_amount' => $this->parseAmount($row['SALDOENS'] ?? null),
-                'reason' => $this->reasonText($kodOsnov),
-                'reason_category' => $this->reasonCategory($kodOsnov),
-                'source_reference' => sprintf(
-                    'service.nalog.ru bi.do, решение №%s от %s, БИК %s, опубликовано %s',
-                    $decisionNumber,
-                    (string) ($row['DATA'] ?? '?'),
-                    $bik,
-                    (string) ($row['DATABI'] ?? '?')
-                ),
-            ]);
-
-            $seenKeys[] = [$bik, $decisionNumber];
+            $valid[] = ['row' => $row, 'decision_number' => $decisionNumber, 'block_date' => $blockDate];
         }
 
-        return $seenKeys;
+        if ($valid === []) {
+            return null;
+        }
+
+        $first = $valid[0];
+        $kodOsnov = trim((string) ($first['row']['KODOSNOV'] ?? ''));
+
+        return [
+            'active_bank_count' => count($valid),
+            'decision_number' => $first['decision_number'],
+            'block_date' => $first['block_date'],
+            'blocked_amount' => $this->parseAmount($first['row']['SALDOENS'] ?? null),
+            'reason' => $this->reasonText($kodOsnov),
+            'reason_category' => $this->reasonCategory($kodOsnov),
+            'source_reference' => sprintf(
+                'service.nalog.ru bi.do, решение №%s от %s, банков одновременно: %d',
+                $first['decision_number'],
+                (string) ($first['row']['DATA'] ?? '?'),
+                count($valid)
+            ),
+        ];
     }
 
     /**
@@ -205,42 +243,6 @@ final class FnsBlocksImporter
         }
 
         return $trimmed;
-    }
-
-    /** @param array<int, array{0: string, 1: string}> $seenKeys */
-    private function markMissingRowsUnblocked(int $issuerId, array $seenKeys): void
-    {
-        if ($seenKeys === []) {
-            $this->db->prepare(
-                'UPDATE fns_blocks SET unblock_date = CURDATE()
-                 WHERE issuer_id = :issuer_id AND unblock_date IS NULL'
-            )->execute(['issuer_id' => $issuerId]);
-            return;
-        }
-
-        $placeholders = implode(',', array_fill(0, count($seenKeys), '(?,?)'));
-        $params = [$issuerId];
-        foreach ($seenKeys as [$bik, $decisionNumber]) {
-            $params[] = $bik;
-            $params[] = $decisionNumber;
-        }
-
-        $this->db->prepare(
-            "UPDATE fns_blocks
-             SET unblock_date = CURDATE()
-             WHERE issuer_id = ? AND unblock_date IS NULL
-               AND (bank_bik, decision_number) NOT IN ({$placeholders})"
-        )->execute($params);
-    }
-
-    private function hasActiveBlocks(int $issuerId): bool
-    {
-        $stmt = $this->db->prepare(
-            'SELECT COUNT(*) FROM fns_blocks WHERE issuer_id = :issuer_id AND unblock_date IS NULL'
-        );
-        $stmt->execute(['issuer_id' => $issuerId]);
-
-        return (int) $stmt->fetchColumn() > 0;
     }
 
     private function parseDate(string $ddMmYyyy): ?string
