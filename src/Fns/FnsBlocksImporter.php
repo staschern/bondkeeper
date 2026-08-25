@@ -8,9 +8,9 @@ use BondKeeper\Support\Logger;
 use PDO;
 
 /**
- * Наполняет fns_blocks и issuers.is_fns_blocked/verification/
- * date_verification/last_success_verification через официальный сервис
- * ФНС service.nalog.ru/bi.do (см. NalogBiClient).
+ * Наполняет fns_blocks (одна строка на эмитента: блокировка + состояние
+ * проверки в одном месте) через официальный сервис ФНС
+ * service.nalog.ru/bi.do (см. NalogBiClient).
  *
  * Источник — "действующие приостановления" на сегодня, не история. Значит
  * при каждой проверке эмитента ответ — это полный СРЕЗ его активных
@@ -29,14 +29,18 @@ use PDO;
  * (см. consolidateRows). Строка не удаляется при снятии всех
  * блокировок — так же, как раньше, помечается `unblock_date = CURDATE()`.
  *
- * Пост-обработка (миграция 009): раньше неудачная попытка (капча, сетевая
- * ошибка) вообще не оставляла следа в БД — нельзя было отличить "ещё не
- * проверяли" от "проверяли, но не вышло". Теперь КАЖДАЯ попытка отмечается
- * в issuers: date_verification = когда была последняя попытка (успешная
- * или нет), verification = 'success'/'error'. is_fns_blocked и содержимое
- * fns_blocks меняются ТОЛЬКО при успешном разборе ответа (verification =
- * 'success') — капча/ошибка сети НЕ трактуются как "блокировок нет", это
- * именно "не удалось узнать".
+ * Пост-обработка (миграция 009, перенесено на fns_blocks миграцией 011):
+ * раньше неудачная попытка (капча, сетевая ошибка) вообще не оставляла
+ * следа в БД — нельзя было отличить "ещё не проверяли" от "проверяли, но
+ * не вышло". Теперь КАЖДАЯ попытка отмечается: date_verification = когда
+ * была последняя попытка (успешная или нет), verification =
+ * 'success'/'error'. is_fns_blocked и содержимое блокировки меняются
+ * ТОЛЬКО при успешном разборе ответа (verification = 'success') —
+ * капча/ошибка сети НЕ трактуются как "блокировок нет", это именно "не
+ * удалось узнать". Изначально эти четыре поля жили на issuers, миграция
+ * 011 перенесла их на fns_blocks — после миграции 010 это та же самая
+ * "одна строка на эмитента", логичнее держать состояние проверки рядом
+ * с её результатом, а не в отдельной таблице.
  *
  * Постановка задачи намеренно НЕ предполагает ежедневный прогон по всем
  * ~495 эмитентам сразу — вызывающий код (bin/check_fns_blocks.php)
@@ -96,14 +100,21 @@ final class FnsBlocksImporter
 
     /**
      * Неудачная попытка (капча или сетевая/парсинг-ошибка) — единственное,
-     * что меняется, это отметка "когда пытались и что вышло". is_fns_blocked,
-     * fns_blocks и last_success_verification НЕ трогаются — отсутствие
-     * ответа не должно интерпретироваться как "блокировок нет".
+     * что меняется, это отметка "когда пытались и что вышло". is_fns_blocked
+     * и остальное содержимое блокировки НЕ трогаются — отсутствие ответа не
+     * должно интерпретироваться как "блокировок нет". Если строки для
+     * эмитента в fns_blocks ещё нет вообще (ни разу не проверяли успешно) —
+     * создаём её с is_fns_blocked=FALSE по умолчанию схемы, только чтобы
+     * было куда записать verification/date_verification.
      */
     private function markVerificationError(int $issuerId): void
     {
         $this->db->prepare(
-            "UPDATE issuers SET verification = 'error', date_verification = NOW() WHERE id = :issuer_id"
+            "INSERT INTO fns_blocks (issuer_id, verification, date_verification)
+             VALUES (:issuer_id, 'error', NOW())
+             ON DUPLICATE KEY UPDATE
+                verification = 'error',
+                date_verification = NOW()"
         )->execute(['issuer_id' => $issuerId]);
     }
 
@@ -117,11 +128,17 @@ final class FnsBlocksImporter
 
             if ($summary !== null) {
                 $stmt = $this->db->prepare(
-                    'INSERT INTO fns_blocks
-                        (issuer_id, active_bank_count, decision_number, block_date, blocked_amount, reason, reason_category, source_reference)
+                    "INSERT INTO fns_blocks
+                        (issuer_id, is_fns_blocked, verification, date_verification, last_success_verification,
+                         active_bank_count, decision_number, block_date, blocked_amount, reason, reason_category, source_reference)
                      VALUES
-                        (:issuer_id, :active_bank_count, :decision_number, :block_date, :blocked_amount, :reason, :reason_category, :source_reference)
+                        (:issuer_id, 1, 'success', NOW(), NOW(),
+                         :active_bank_count, :decision_number, :block_date, :blocked_amount, :reason, :reason_category, :source_reference)
                      ON DUPLICATE KEY UPDATE
+                        is_fns_blocked = 1,
+                        verification = 'success',
+                        date_verification = NOW(),
+                        last_success_verification = NOW(),
                         active_bank_count = VALUES(active_bank_count),
                         decision_number = VALUES(decision_number),
                         block_date = VALUES(block_date),
@@ -130,7 +147,7 @@ final class FnsBlocksImporter
                         reason = VALUES(reason),
                         reason_category = VALUES(reason_category),
                         source_reference = VALUES(source_reference),
-                        updated_at = CURRENT_TIMESTAMP'
+                        updated_at = CURRENT_TIMESTAMP"
                 );
                 $stmt->execute([
                     'issuer_id' => $issuerId,
@@ -143,23 +160,30 @@ final class FnsBlocksImporter
                     'source_reference' => $summary['source_reference'],
                 ]);
             } else {
-                // Ни одной валидной строки в ответе — считаем блокировки
-                // снятыми. Строка не удаляется, только помечается датой —
-                // это та же логика "не потерять историю", что была раньше.
+                // Ни одной валидной строки в ответе — проверка прошла
+                // успешно, блокировок нет. unblock_date выставляется
+                // только если строка ДО этого была активно заблокирована
+                // (is_fns_blocked = 1 читается ДО этого же UPDATE — ссылка
+                // на колонку без VALUES() в ON DUPLICATE KEY UPDATE берёт
+                // текущее значение строки, не новое) — если эмитент и
+                // раньше был свободен, его старый unblock_date (если был)
+                // не трогаем, а не пробел/не блокировка вообще ещё не
+                // проверялась — тогда это просто первая вставка.
                 $this->db->prepare(
-                    'UPDATE fns_blocks SET unblock_date = CURDATE()
-                     WHERE issuer_id = :issuer_id AND unblock_date IS NULL'
+                    "INSERT INTO fns_blocks
+                        (issuer_id, is_fns_blocked, verification, date_verification, last_success_verification, active_bank_count)
+                     VALUES
+                        (:issuer_id, 0, 'success', NOW(), NOW(), 0)
+                     ON DUPLICATE KEY UPDATE
+                        unblock_date = IF(is_fns_blocked = 1, CURDATE(), unblock_date),
+                        is_fns_blocked = 0,
+                        verification = 'success',
+                        date_verification = NOW(),
+                        last_success_verification = NOW(),
+                        active_bank_count = 0,
+                        updated_at = CURRENT_TIMESTAMP"
                 )->execute(['issuer_id' => $issuerId]);
             }
-
-            $this->db->prepare(
-                "UPDATE issuers
-                 SET is_fns_blocked = :blocked,
-                     verification = 'success',
-                     date_verification = NOW(),
-                     last_success_verification = NOW()
-                 WHERE id = :issuer_id"
-            )->execute(['blocked' => (int) $isBlocked, 'issuer_id' => $issuerId]);
 
             if ($isBlocked) {
                 $this->blockedFound++;
