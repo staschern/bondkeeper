@@ -8,8 +8,9 @@ use BondKeeper\Support\Logger;
 use PDO;
 
 /**
- * Наполняет fns_blocks и issuers.is_fns_blocked/fns_last_checked_at через
- * официальный сервис ФНС service.nalog.ru/bi.do (см. NalogBiClient).
+ * Наполняет fns_blocks и issuers.is_fns_blocked/verification/
+ * date_verification/last_success_verification через официальный сервис
+ * ФНС service.nalog.ru/bi.do (см. NalogBiClient).
  *
  * Источник — "действующие приостановления" на сегодня, не история. Значит
  * при каждой проверке эмитента ответ — это полный СРЕЗ его активных
@@ -19,18 +20,20 @@ use PDO;
  *     пришли в этом ответе — считаются снятыми, unblock_date = CURDATE()
  *     (см. applyResult). Строки не удаляются — это история блокировок.
  *
- * Капча: если NalogBiClient вернул captchaRequired=true — эмитент
- * пропускается БЕЗ каких-либо изменений в БД (ни apply, ни "снятие"
- * блокировок по умолчанию) — отсутствие ответа не должно интерпретироваться
- * как "блокировок нет". См. docs/STAGE1_POSTPROCESSING.md про наблюдаемую
- * частоту капчи (примерно на 3-м запросе подряд в одной сессии — отсюда
- * решение делать по одной свежей HTTP-сессии на КАЖДУЮ проверку, см.
- * NalogBiClient).
+ * Пост-обработка (миграция 009): раньше неудачная попытка (капча, сетевая
+ * ошибка) вообще не оставляла следа в БД — нельзя было отличить "ещё не
+ * проверяли" от "проверяли, но не вышло". Теперь КАЖДАЯ попытка отмечается
+ * в issuers: date_verification = когда была последняя попытка (успешная
+ * или нет), verification = 'success'/'error'. is_fns_blocked и содержимое
+ * fns_blocks меняются ТОЛЬКО при успешном разборе ответа (verification =
+ * 'success') — капча/ошибка сети НЕ трактуются как "блокировок нет", это
+ * именно "не удалось узнать".
  *
  * Постановка задачи намеренно НЕ предполагает ежедневный прогон по всем
- * ~495 эмитентам сразу — vызывающий код (bin/check_fns_blocks.php)
- * передаёт заведомо небольшой список, чтобы вживую увидеть частоту капчи
- * прежде, чем масштабировать.
+ * ~495 эмитентам сразу — вызывающий код (bin/check_fns_blocks.php)
+ * передаёт заведомо небольшой список и работает МЕДЛЕННО и БЕЗ прокси —
+ * часть эмитентов будет пропущена капчей, это ожидаемо и честно
+ * отражается как verification='error', а не как повод её обходить.
  */
 final class FnsBlocksImporter
 {
@@ -68,16 +71,31 @@ final class FnsBlocksImporter
         } catch (\Throwable $e) {
             $this->failed++;
             Logger::warn("ФНС: ошибка проверки ИНН {$inn}: {$e->getMessage()}");
+            $this->markVerificationError($issuerId);
             return;
         }
 
         if ($result->captchaRequired) {
             $this->skippedCaptcha++;
-            Logger::warn("ФНС: капча для ИНН {$inn} — пропущен без записи в БД");
+            Logger::warn("ФНС: капча для ИНН {$inn} — статус блокировки не тронут, отмечена только попытка");
+            $this->markVerificationError($issuerId);
             return;
         }
 
         $this->applyResult($issuerId, $inn, $result->rows);
+    }
+
+    /**
+     * Неудачная попытка (капча или сетевая/парсинг-ошибка) — единственное,
+     * что меняется, это отметка "когда пытались и что вышло". is_fns_blocked,
+     * fns_blocks и last_success_verification НЕ трогаются — отсутствие
+     * ответа не должно интерпретироваться как "блокировок нет".
+     */
+    private function markVerificationError(int $issuerId): void
+    {
+        $this->db->prepare(
+            "UPDATE issuers SET verification = 'error', date_verification = NOW() WHERE id = :issuer_id"
+        )->execute(['issuer_id' => $issuerId]);
     }
 
     /** @param array<int, array<string, mixed>> $rows */
@@ -90,7 +108,12 @@ final class FnsBlocksImporter
 
             $isBlocked = $this->hasActiveBlocks($issuerId);
             $this->db->prepare(
-                'UPDATE issuers SET is_fns_blocked = :blocked, fns_last_checked_at = NOW() WHERE id = :issuer_id'
+                "UPDATE issuers
+                 SET is_fns_blocked = :blocked,
+                     verification = 'success',
+                     date_verification = NOW(),
+                     last_success_verification = NOW()
+                 WHERE id = :issuer_id"
             )->execute(['blocked' => (int) $isBlocked, 'issuer_id' => $issuerId]);
 
             if ($isBlocked) {
