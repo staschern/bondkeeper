@@ -136,12 +136,13 @@ final class FnsBlocksImporter
     {
         $stmt = $this->db->prepare(
             'INSERT INTO fns_blocks
-                (issuer_id, bank_bik, decision_number, block_date, reason, reason_category, source_reference)
+                (issuer_id, bank_bik, decision_number, block_date, blocked_amount, reason, reason_category, source_reference)
              VALUES
-                (:issuer_id, :bank_bik, :decision_number, :block_date, :reason, :reason_category, :source_reference)
+                (:issuer_id, :bank_bik, :decision_number, :block_date, :blocked_amount, :reason, :reason_category, :source_reference)
              ON DUPLICATE KEY UPDATE
                 block_date = VALUES(block_date),
                 unblock_date = NULL,
+                blocked_amount = VALUES(blocked_amount),
                 reason = VALUES(reason),
                 reason_category = VALUES(reason_category),
                 source_reference = VALUES(source_reference),
@@ -165,6 +166,7 @@ final class FnsBlocksImporter
                 'bank_bik' => $bik,
                 'decision_number' => $decisionNumber,
                 'block_date' => $blockDate,
+                'blocked_amount' => $this->parseAmount($row['SALDOENS'] ?? null),
                 'reason' => $this->reasonText($kodOsnov),
                 'reason_category' => $this->reasonCategory($kodOsnov),
                 'source_reference' => sprintf(
@@ -180,6 +182,29 @@ final class FnsBlocksImporter
         }
 
         return $seenKeys;
+    }
+
+    /**
+     * SALDOENS — "Размер отрицательного сальдо ЕНС" (подтверждено вживую
+     * пользователем через интерфейс сайта, сверено с колонкой в БД).
+     * Приходит только для кодов основания 01/03 (см. сноску "*" в
+     * справочнике на самой странице результата) — для остальных кодов
+     * поля в ответе нет вообще, blocked_amount останется NULL, и это
+     * ожидаемо, а не пробел. Значение приходит с ведущими пробелами
+     * (например "       302156193.95") — только тримить, разделитель
+     * дробной части уже точка, тысячи ничем не разделены.
+     */
+    private function parseAmount(mixed $rawSaldoEns): ?string
+    {
+        if ($rawSaldoEns === null) {
+            return null;
+        }
+        $trimmed = trim((string) $rawSaldoEns);
+        if ($trimmed === '' || !is_numeric($trimmed)) {
+            return null;
+        }
+
+        return $trimmed;
     }
 
     /** @param array<int, array{0: string, 1: string}> $seenKeys */
