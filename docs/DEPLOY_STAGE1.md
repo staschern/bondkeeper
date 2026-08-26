@@ -116,9 +116,10 @@ mysql -u <пользователь> -p www-root_bondkeeper < database/008_fns_bl
 mysql -u <пользователь> -p www-root_bondkeeper < database/009_fns_verification_tracking.sql
 mysql -u <пользователь> -p www-root_bondkeeper < database/010_fns_blocks_one_row_per_issuer.sql
 mysql -u <пользователь> -p www-root_bondkeeper < database/011_fns_verification_to_fns_blocks.sql
+mysql -u <пользователь> -p www-root_bondkeeper < database/012_offers_unknown_and_buyback_flag.sql
 ```
 
-Вариант Б — через phpMyAdmin (он уже установлен по конфигурации ПО): зайти в базу `www-root_bondkeeper` → вкладка **Импорт** → выбрать файл `database/001_schema.sql` → Выполнить → повторить по очереди для `002_issuer_moex_emitter_id.sql`, `003_widen_value_per_bond.sql`, `004_coupon_type_unknown.sql`, `005_is_mortgage_backed.sql`, `006_coupons_amortizations_upsert.sql`, `007_initial_nominal_value.sql`, `008_fns_blocks_upsert_keys.sql`, `009_fns_verification_tracking.sql`, `010_fns_blocks_one_row_per_issuer.sql`, `011_fns_verification_to_fns_blocks.sql`.
+Вариант Б — через phpMyAdmin (он уже установлен по конфигурации ПО): зайти в базу `www-root_bondkeeper` → вкладка **Импорт** → выбрать файл `database/001_schema.sql` → Выполнить → повторить по очереди для `002_issuer_moex_emitter_id.sql`, `003_widen_value_per_bond.sql`, `004_coupon_type_unknown.sql`, `005_is_mortgage_backed.sql`, `006_coupons_amortizations_upsert.sql`, `007_initial_nominal_value.sql`, `008_fns_blocks_upsert_keys.sql`, `009_fns_verification_tracking.sql`, `010_fns_blocks_one_row_per_issuer.sql`, `011_fns_verification_to_fns_blocks.sql`, `012_offers_unknown_and_buyback_flag.sql`.
 
 Миграция 011 не требует пересева — просто переносит колонки `is_fns_blocked`/`verification`/`date_verification`/`last_success_verification` с `issuers` на `fns_blocks`; данные заполняются на следующей проверке.
 

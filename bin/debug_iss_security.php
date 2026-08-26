@@ -18,6 +18,15 @@ declare(strict_types=1);
  *      эндпоинтов вида /iss/emitents/{id}.json и печатает, какой из них
  *      реально отвечает и что отдаёт.
  *
+ * Пост-обработка этапа 1 (offers): дополнительно проверяет гипотезу про
+ * OFFERDATE — поле, которое предположительно приходит не в description
+ * (который парсит SecuritiesImporter), а в отдельном доска-специфичном
+ * эндпоинте /engines/stock/markets/bonds/boards/{board}/securities/{secid}.json,
+ * который в проекте до сих пор нигде не запрашивался. Нужно вживую
+ * проверить его наличие и совпадает ли множество бумаг с OFFERDATE с
+ * множеством, где securities.has_offer=1 (BUYBACKDATE) — см.
+ * docs/STAGE1_POSTPROCESSING.md.
+ *
  * Запуск:
  *   php bin/debug_iss_security.php RU000A107QM0
  *   php bin/debug_iss_security.php RU000A107QM0 RU000A107R29
@@ -54,6 +63,7 @@ foreach ($isins as $isin) {
     $description = IssClient::block($fullResponse, 'description');
     echo "\n--- description как name => value ---\n";
     $emitterId = null;
+    $secid = null;
     foreach ($description as $row) {
         $name = $row['name'] ?? '?';
         $value = $row['value'] ?? '';
@@ -62,14 +72,45 @@ foreach ($isins as $isin) {
         if (strtoupper((string) $name) === 'EMITTER_ID') {
             $emitterId = (string) $value;
         }
+        if (strtoupper((string) $name) === 'SECID') {
+            $secid = (string) $value;
+        }
     }
 
     $boards = IssClient::block($fullResponse, 'boards');
     echo "\n--- boards (только is_primary=1) ---\n";
+    $primaryBoardId = null;
     foreach ($boards as $board) {
         if (($board['is_primary'] ?? 0) == 1) {
             echo '  ' . json_encode($board, JSON_UNESCAPED_UNICODE) . "\n";
+            $primaryBoardId = (string) ($board['boardid'] ?? $board['BOARDID'] ?? '');
         }
+    }
+
+    // Пост-обработка этапа 1: проверка OFFERDATE — по гипотезе, это
+    // отдельное поле в доска-специфичном эндпоинте (НЕ description выше),
+    // том же самом, что уже мог бы отдавать COUPONVALUE/NEXTCOUPON/
+    // ACCRUEDINT — этот эндпоинт до сих пор нигде не запрашивался, нужно
+    // подтвердить вживую, что OFFERDATE там реально есть, прежде чем
+    // строить полноценный импортёр offers.
+    if ($secid !== null && $primaryBoardId !== null && $primaryBoardId !== '') {
+        $boardDetailPath = "/engines/stock/markets/bonds/boards/{$primaryBoardId}/securities/{$secid}.json";
+        echo "\n--- проверка OFFERDATE: {$boardDetailPath} ---\n";
+        try {
+            $boardDetail = $iss->getJson($boardDetailPath, []);
+            echo '  Блоки в ответе: ' . implode(', ', array_keys($boardDetail)) . "\n";
+            $boardSecurities = IssClient::block($boardDetail, 'securities');
+            foreach ($boardSecurities as $row) {
+                foreach ($row as $field => $value) {
+                    $marker = preg_match('/OFFER|BUYBACK/i', (string) $field) ? '  <-- похоже на оферту' : '';
+                    printf("  %-25s = %s%s\n", $field, $value ?? 'NULL', $marker);
+                }
+            }
+        } catch (\Throwable $e) {
+            echo '  ошибка: ' . $e->getMessage() . "\n";
+        }
+    } else {
+        echo "\n(SECID или основная доска не найдены — проверку OFFERDATE пропускаю)\n";
     }
 
     if ($emitterId === null) {

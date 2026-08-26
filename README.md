@@ -25,6 +25,7 @@ database/008_fns_blocks_upsert_keys.sql       — миграция: ключ д�
 database/009_fns_verification_tracking.sql    — миграция: issuers.verification/date_verification/last_success_verification
 database/010_fns_blocks_one_row_per_issuer.sql — миграция: fns_blocks — одна строка на эмитента, не на банк
 database/011_fns_verification_to_fns_blocks.sql — миграция: verification/is_fns_blocked переехали с issuers на fns_blocks
+database/012_offers_unknown_and_buyback_flag.sql — миграция: offers — заготовка под первый сев (unknown-плейсхолдеры, has_buyback_date)
 src/Database.php                     — подключение к MySQL (PDO)
 src/Iss/IssClient.php                — HTTP-клиент ISS API Мосбиржи
 src/Iss/SecuritiesImporter.php       — issuers/securities/redemptions(scheduled_maturity)
@@ -54,6 +55,7 @@ mysql -u root -p bondkeeper < database/008_fns_blocks_upsert_keys.sql
 mysql -u root -p bondkeeper < database/009_fns_verification_tracking.sql
 mysql -u root -p bondkeeper < database/010_fns_blocks_one_row_per_issuer.sql
 mysql -u root -p bondkeeper < database/011_fns_verification_to_fns_blocks.sql
+mysql -u root -p bondkeeper < database/012_offers_unknown_and_buyback_flag.sql
 
 php bin/seed_market.php        # issuers, securities, redemptions(scheduled_maturity)
 php bin/seed_bondization.php   # coupons, amortizations
