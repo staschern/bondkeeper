@@ -33,7 +33,8 @@ src/Fns/NalogBiClient.php            — HTTP-клиент service.nalog.ru/bi.d
 src/Fns/FnsBlocksImporter.php        — fns_blocks, issuers.is_fns_blocked
 bin/seed_market.php                  — запуск сидирования справочника (шаг 1)
 bin/seed_bondization.php             — запуск сидирования графика выплат (шаг 2)
-bin/check_fns_blocks.php             — точечная проверка блокировок счетов (см. docs/STAGE1_POSTPROCESSING.md)
+bin/check_fns_blocks.php             — точечная/по расписанию проверка блокировок счетов (см. docs/STAGE1_POSTPROCESSING.md)
+config/fns_watchlist.txt             — список ИНН для ежедневного cron-прогона check_fns_blocks.php
 bin/debug_iss_security.php           — разовая диагностика сырого ответа ISS API по ISIN
 ```
 
