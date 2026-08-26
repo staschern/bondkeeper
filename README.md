@@ -32,8 +32,10 @@ src/Iss/SecuritiesImporter.php       — issuers/securities/redemptions(schedule
 src/Iss/BondizationImporter.php      — coupons/amortizations
 src/Fns/NalogBiClient.php            — HTTP-клиент service.nalog.ru/bi.do (блокировки счетов)
 src/Fns/FnsBlocksImporter.php        — fns_blocks, issuers.is_fns_blocked
+src/Iss/OffersImporter.php           — offers (дата, has_buyback_date, offer_type put/call/unknown)
 bin/seed_market.php                  — запуск сидирования справочника (шаг 1)
 bin/seed_bondization.php             — запуск сидирования графика выплат (шаг 2)
+bin/seed_offers.php                  — запуск сидирования оферт (шаг 3)
 bin/check_fns_blocks.php             — точечная/по расписанию проверка блокировок счетов (см. docs/STAGE1_POSTPROCESSING.md)
 config/fns_watchlist.txt             — список ИНН для ежедневного cron-прогона check_fns_blocks.php
 bin/debug_iss_security.php           — разовая диагностика сырого ответа ISS API по ISIN
@@ -59,6 +61,7 @@ mysql -u root -p bondkeeper < database/012_offers_unknown_and_buyback_flag.sql
 
 php bin/seed_market.php        # issuers, securities, redemptions(scheduled_maturity)
 php bin/seed_bondization.php   # coupons, amortizations
+php bin/seed_offers.php        # offers (дата, has_buyback_date, offer_type)
 ```
 
 По расписанию — раз в сутки (справочник меняется редко, см. `documents/2026.08.08_Seeding_And_Polling_Strategy_QA.docx` про частоту опроса): cron-примеры даны в шапке каждого `bin/*.php`.
@@ -91,8 +94,10 @@ php bin/seed_bondization.php   # coupons, amortizations
 
 Из этой же находки — **`is_structured` тоже читается напрямую из `BOND_TYPE`** (ключевое слово «структурн»), просто предыдущая эвристика искала там только признаки характера ставки и игнорировала эту метку. **`is_amortized` берётся не из текста, а из факта: есть ли у бумаги реально загруженные строки в `amortizations`** — это надёжнее, чем текстовое совпадение, и правится не в `SecuritiesImporter`, а в `BondizationImporter` (ставится по итогам импорта графика выплат). Раньше оба поля нигде не выставлялись и оставались `FALSE` для всех бумаг независимо от реальности.
 
+**Оферта (`offers`) — тоже нашлась бесплатно, но в другом эндпоинте.** Не в уже используемом `description` (`/iss/securities/{ISIN}.json`), а в отдельном, доска-специфичном `/iss/engines/stock/markets/bonds/boards/{board}/securities/{secid}.json`, до этой задачи в проекте нигде не запрашивавшемся. Оттуда же — `PUTOPTIONDATE`/`CALLOPTIONDATE`: ровно одно из двух заполнено у проверенных бумаг с офертой, что даёт `offer_type` (put/call) без похода на RusBonds; если оба поля пусты или оба заполнены — честно `unknown`. Подробности и результаты боевой проверки — `docs/STAGE1_POSTPROCESSING.md`.
+
 **Точно НЕДОСТУПНО бесплатно через ISS API** (не предположение — проверено):
-- Вид оферты (put/call), `is_instruction_based` — в проверенном ответе описания бумаги без активной оферты этих полей не было; требует проверки на бумаге, у которой оферта реально есть.
+- `is_instruction_based` — в проверенном ответе описания бумаги без активной оферты этих полей не было; требует проверки на бумаге, у которой оферта реально есть.
 - `is_subordinated` — подтверждённого поля под этот флаг в ответе не нашлось (в отличие от `is_structured`/`is_amortized`, для которых сигнал нашёлся); в коде остаётся значением по умолчанию из схемы.
 
 **Требует ручного расчёта поверх бесплатных данных (не отдельное поле):**

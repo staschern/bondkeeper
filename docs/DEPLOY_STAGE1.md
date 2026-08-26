@@ -174,6 +174,14 @@ php bin/seed_bondization.php 2>&1 | tee /tmp/seed_bondization_first_run.log
 
 Смотреть `Купонов импортировано` / `Амортизаций импортировано` — должны быть кратны числу успешно импортированных бумаг (у бумаги без амортизации — только купоны).
 
+Затем:
+
+```bash
+php bin/seed_offers.php 2>&1 | tee /tmp/seed_offers_first_run.log
+```
+
+Смотреть отчёт в конце: `Найдено оферт (объединение BUYBACKDATE/OFFERDATE)` и разбивку `оба сигнала совпадают` / `только BUYBACKDATE` / `только OFFERDATE` — это ответ на вопрос, действительно ли эти два сигнала одно и то же множество бумаг на всём рынке (на 3 проверенных вручную бумагах совпали полностью, см. `docs/STAGE1_POSTPROCESSING.md`). Также `Вид оферты определён` — сколько строк получили `offer_type` put/call бесплатно, без RusBonds.
+
 ---
 
 ## Шаг 6. Проверочный чек-лист после первого прогона
@@ -199,15 +207,27 @@ LIMIT 20;
 -- Эмитенты без ИНН — теперь должно быть близко к нулю (ИНН резолвится через
 -- /iss/securities.json?q=, см. README). Если тут много строк — см. шаг 5.
 SELECT COUNT(*) AS без_инн, (SELECT COUNT(*) FROM issuers) AS всего FROM issuers WHERE inn IS NULL;
+
+-- Оферты: has_buyback_date (securities.has_offer) и наличие execution_date_planned
+-- должны в основном совпадать (см. отчёт seed_offers.php) — если тут много
+-- расхождений, это первый реальный кейс расхождения BUYBACKDATE/OFFERDATE.
+SELECT COUNT(*) AS всего_оферт,
+       SUM(has_buyback_date = 1 AND execution_date_planned IS NOT NULL) AS оба_сигнала,
+       SUM(has_buyback_date = 1 AND execution_date_planned IS NULL) AS только_buyback,
+       SUM(has_buyback_date = 0 AND execution_date_planned IS NOT NULL) AS только_offerdate,
+       SUM(offer_type = 'unknown') AS вид_не_определён
+FROM offers;
 ```
 
-Проверка идемпотентности — запустить оба скрипта повторно и убедиться, что:
+Проверка идемпотентности — запустить все три скрипта повторно и убедиться, что:
 - `seed_market.php` не падает и не плодит дублей (`securities.isin` уникален, апсерт обновляет, а не вставляет заново);
-- `seed_bondization.php` во второй раз обрабатывает 0 бумаг (он выбирает только бумаги без единого купона — это ожидаемо, а не баг; полноценное обновление уже загруженного графика — задача события A1/A4 в событийном движке следующего этапа, не этапа 1).
+- `seed_bondization.php` во второй раз обрабатывает 0 бумаг (он выбирает только бумаги без единого купона — это ожидаемо, а не баг; полноценное обновление уже загруженного графика — задача события A1/A4 в событийном движке следующего этапа, не этапа 1);
+- `seed_offers.php` во второй раз находит то же количество оферт, что и в первый (`UNIQUE KEY (security_id)` — апсерт обновляет существующую строку, не создаёт дубликат; `SELECT COUNT(*) FROM offers` не должен вырасти).
 
 ```bash
 php bin/seed_market.php
 php bin/seed_bondization.php   # "Бумаг обработано: 0" — ожидаемо
+php bin/seed_offers.php        # то же количество найденных оферт, что и в первый раз
 ```
 
 ---
@@ -223,6 +243,7 @@ crontab -u www-root -e
 ```cron
 0 3  * * * /usr/bin/php /var/www/www-root/data/bondkeeper-app/bin/seed_market.php >> /var/www/www-root/data/bondkeeper-app/var/log/seed_market.log 2>&1
 30 3 * * * /usr/bin/php /var/www/www-root/data/bondkeeper-app/bin/seed_bondization.php >> /var/www/www-root/data/bondkeeper-app/var/log/seed_bondization.log 2>&1
+0 4  * * * /usr/bin/php /var/www/www-root/data/bondkeeper-app/bin/seed_offers.php >> /var/www/www-root/data/bondkeeper-app/var/log/seed_offers.log 2>&1
 ```
 
 (Раз в сутки — справочник и так меняется редко, см. `documents/2026.08.08_Seeding_And_Polling_Strategy_QA.docx`.)
