@@ -34,9 +34,16 @@ src/Iss/BondizationImporter.php      — coupons/amortizations
 src/Fns/NalogBiClient.php            — HTTP-клиент service.nalog.ru/bi.do (блокировки счетов)
 src/Fns/FnsBlocksImporter.php        — fns_blocks, issuers.is_fns_blocked
 src/Iss/OffersImporter.php           — offers (дата, has_buyback_date, offer_type put/call/unknown)
+src/Ratings/XlsxReader.php           — минимальный читатель .xlsx (ZIP+XML) без зависимостей
+src/Ratings/IssuerMatcher.php        — сопоставление эмитента агентства с issuers.id по ИНН
+src/Ratings/RatingsNormalizer.php    — общие преобразования (прогноз, дата) для рейтинговых выгрузок
+src/Ratings/RatingsHttp.php          — HTTP-загрузчик с ретраями для сайтов рейтинговых агентств
+src/Ratings/NkrImporter.php          — current_ratings из Excel-выгрузки НКР (ratings.ru)
+src/Ratings/NraImporter.php          — current_ratings из Excel-выгрузки НРА (ra-national.ru)
 bin/seed_market.php                  — запуск сидирования справочника (шаг 1)
 bin/seed_bondization.php             — запуск сидирования графика выплат (шаг 2)
 bin/seed_offers.php                  — запуск сидирования оферт (шаг 3)
+bin/seed_ratings.php                 — запуск сидирования current_ratings (--agency=nkr|nra, этап 3, см. docs/STAGE3_RATINGS.md)
 bin/check_fns_blocks.php             — точечная/по расписанию проверка блокировок счетов (см. docs/STAGE1_POSTPROCESSING.md)
 config/fns_watchlist.txt             — список ИНН для ежедневного cron-прогона check_fns_blocks.php
 bin/debug_iss_security.php           — разовая диагностика сырого ответа ISS API по ISIN
