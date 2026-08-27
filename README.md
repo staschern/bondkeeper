@@ -26,6 +26,7 @@ database/009_fns_verification_tracking.sql    — миграция: issuers.veri
 database/010_fns_blocks_one_row_per_issuer.sql — миграция: fns_blocks — одна строка на эмитента, не на банк
 database/011_fns_verification_to_fns_blocks.sql — миграция: verification/is_fns_blocked переехали с issuers на fns_blocks
 database/012_offers_unknown_and_buyback_flag.sql — миграция: offers — заготовка под первый сев (unknown-плейсхолдеры, has_buyback_date)
+database/013_rating_actions_outlook_split.sql    — миграция: rating_actions.outlook_from/outlook_to, review_type default, current_ratings.created_at
 src/Database.php                     — подключение к MySQL (PDO)
 src/Iss/IssClient.php                — HTTP-клиент ISS API Мосбиржи
 src/Iss/SecuritiesImporter.php       — issuers/securities/redemptions(scheduled_maturity)
@@ -39,6 +40,7 @@ bin/seed_offers.php                  — запуск сидирования о�
 bin/check_fns_blocks.php             — точечная/по расписанию проверка блокировок счетов (см. docs/STAGE1_POSTPROCESSING.md)
 config/fns_watchlist.txt             — список ИНН для ежедневного cron-прогона check_fns_blocks.php
 bin/debug_iss_security.php           — разовая диагностика сырого ответа ISS API по ISIN
+bin/debug_rating_page.php            — разовая диагностика структуры страницы рейтингового агентства (этап 3, см. docs/STAGE3_RATINGS.md)
 ```
 
 ## Запуск
@@ -58,6 +60,7 @@ mysql -u root -p bondkeeper < database/009_fns_verification_tracking.sql
 mysql -u root -p bondkeeper < database/010_fns_blocks_one_row_per_issuer.sql
 mysql -u root -p bondkeeper < database/011_fns_verification_to_fns_blocks.sql
 mysql -u root -p bondkeeper < database/012_offers_unknown_and_buyback_flag.sql
+mysql -u root -p bondkeeper < database/013_rating_actions_outlook_split.sql
 
 php bin/seed_market.php        # issuers, securities, redemptions(scheduled_maturity)
 php bin/seed_bondization.php   # coupons, amortizations
