@@ -72,7 +72,7 @@ function debugOneUrl(string $url): void
     echo "  HTTP {$httpCode}, Content-Type: {$contentType}\n";
 
     $body = substr($raw, $headerSize);
-    $isHtml = str_contains($contentType, 'html') || str_contains(ltrim($body), '<');
+    $isHtml = strpos($contentType, 'html') !== false || strpos(ltrim($body), '<') !== false;
 
     if (!$isHtml) {
         $path = sys_get_temp_dir() . '/bondkeeper_rating_' . md5($url) . guessExtension($contentType);
@@ -161,10 +161,15 @@ function debugOneUrl(string $url): void
 
 function guessExtension(string $contentType): string
 {
-    return match (true) {
-        str_contains($contentType, 'spreadsheetml') => '.xlsx',
-        str_contains($contentType, 'ms-excel') => '.xls',
-        str_contains($contentType, 'zip') => '.zip',
-        default => '.bin',
-    };
+    if (strpos($contentType, 'spreadsheetml') !== false) {
+        return '.xlsx';
+    }
+    if (strpos($contentType, 'ms-excel') !== false) {
+        return '.xls';
+    }
+    if (strpos($contentType, 'zip') !== false) {
+        return '.zip';
+    }
+
+    return '.bin';
 }
