@@ -137,6 +137,34 @@ function debugOneUrl(string $url): void
         echo "\n  (\"ИНН\" на странице не встретилось ни разу)\n";
     }
 
+    // 3.5) Если реальных данных на странице почти нет (мало таблиц, ИНН
+    // только в форме поиска/тексте валидации, а не в списке компаний) —
+    // вероятно, список подгружается JS-ом после загрузки страницы (SPA),
+    // а не отдаётся сразу в HTML. Ищем зацепки, откуда SPA берёт данные:
+    // подключаемые скрипты (framework виден по путям чанков) и типичные
+    // переменные, в которые фреймворки кладут начальное состояние.
+    echo "\n  --- <script src=...> на странице (для определения фреймворка/сборки) ---\n";
+    preg_match_all('/<script[^>]*\bsrc="([^"]*)"/', $body, $scriptMatches);
+    foreach (array_slice($scriptMatches[1], 0, 25) as $src) {
+        echo "    {$src}\n";
+    }
+
+    echo "\n  --- признаки SPA-состояния/API в HTML ---\n";
+    $spaMarkers = ['__NEXT_DATA__', '__NUXT__', '__INITIAL_STATE__', '__APOLLO_STATE__', 'window.__'];
+    foreach ($spaMarkers as $marker) {
+        if (strpos($body, $marker) !== false) {
+            echo "    найден маркер: {$marker}\n";
+        }
+    }
+    preg_match_all('/"(?:apiUrl|api_url|baseURL|baseUrl|endpoint)"\s*:\s*"([^"]*)"/', $body, $apiMatches);
+    foreach (array_unique($apiMatches[1]) as $apiUrl) {
+        echo "    похоже на API-адрес в коде страницы: {$apiUrl}\n";
+    }
+    preg_match_all('#"(/[a-zA-Z0-9_/-]*api[a-zA-Z0-9_/-]*)"#i', $body, $apiPathMatches);
+    foreach (array_slice(array_unique($apiPathMatches[1]), 0, 20) as $apiPath) {
+        echo "    похожий на API путь в коде страницы: {$apiPath}\n";
+    }
+
     // 4) Если явных таблиц нет — вероятно, карточки/список через div/li.
     // Печатаем самые часто повторяющиеся значения class у потомков <body>,
     // чтобы было видно, какой класс — вероятный контейнер одной строки списка.
