@@ -6,16 +6,22 @@ declare(strict_types=1);
  * Этап 3: наполнить current_ratings (и, для НРА, rating_actions) из
  * выгрузок/сайтов рейтинговых агентств. Один флаг --agency на запуск —
  * у каждого агентства свой источник и свой формат, общего импортёра на
- * все 4 нет. АКРА сознательно не реализована: у них WAF/анти-бот защита
- * (Yandex SmartCaptcha + блокировка по Transaction ID уже на 2-3
- * запросе подряд) — та же граница, что и с service.nalog.ru с самого
- * начала проекта: не обходим и не подстраиваем технику под защиту от
- * ботов, независимо от того, какой это сервис. См. docs/STAGE3_RATINGS.md.
+ * все 4 нет.
+ *
+ * АКРА — особый случай: www.acra-ratings.ru блокирует автоматические
+ * запросы через 2-3 попытки (WAF + Yandex SmartCaptcha) — та же граница,
+ * что действовала для service.nalog.ru с самого начала проекта: не
+ * обходим и не подстраиваем технику под защиту от ботов, независимо от
+ * того, какой это сервис. Поэтому seed_ratings.php сам НИКОГДА не
+ * обращается к acra-ratings.ru — --agency=acra читает уже готовый
+ * JSON-файл, который пользователь готовит сам (не автоматизированным
+ * опросом их сайта), см. docs/STAGE3_RATINGS.md.
  *
  * Запуск:
  *   php bin/seed_ratings.php --agency=nkr
  *   php bin/seed_ratings.php --agency=nra
  *   php bin/seed_ratings.php --agency=expert_ra [--delay-ms=400]
+ *   php bin/seed_ratings.php --agency=acra --file=/path/to/acra_issuers.json
  *
  * expert_ra — единственный источник без прямой Excel-выгрузки: обходит
  * боевой сайт агентства постранично (список рейтингов по каждой из ~10
@@ -41,6 +47,7 @@ declare(strict_types=1);
 require __DIR__ . '/bootstrap.php';
 
 use BondKeeper\Database;
+use BondKeeper\Ratings\AcraImporter;
 use BondKeeper\Ratings\ExpertRaClient;
 use BondKeeper\Ratings\ExpertRaImporter;
 use BondKeeper\Ratings\IssuerMatcher;
@@ -50,6 +57,7 @@ use BondKeeper\Support\Logger;
 
 $agency = null;
 $delayMs = 400;
+$file = null;
 foreach ($argv as $arg) {
     if (str_starts_with($arg, '--agency=')) {
         $agency = substr($arg, strlen('--agency='));
@@ -57,28 +65,41 @@ foreach ($argv as $arg) {
     if (str_starts_with($arg, '--delay-ms=')) {
         $delayMs = (int) substr($arg, strlen('--delay-ms='));
     }
+    if (str_starts_with($arg, '--file=')) {
+        $file = substr($arg, strlen('--file='));
+    }
 }
 
 if ($agency === null) {
-    fwrite(STDERR, "Использование: php bin/seed_ratings.php --agency=nkr|nra|expert_ra [--delay-ms=400]\n");
+    fwrite(STDERR, "Использование: php bin/seed_ratings.php --agency=nkr|nra|expert_ra|acra [--delay-ms=400] [--file=...]\n");
     exit(1);
 }
 
 $db = Database::connection();
 $matcher = new IssuerMatcher($db);
 
-$importer = match ($agency) {
-    'nkr' => new NkrImporter($db, $matcher),
-    'nra' => new NraImporter($db, $matcher),
-    'expert_ra' => new ExpertRaImporter($db, $matcher, new ExpertRaClient(), $delayMs * 1000),
-    default => null,
-};
+Logger::info("Старт: сидирование current_ratings ({$agency})");
 
-if ($importer === null) {
-    fwrite(STDERR, "Неизвестное агентство: {$agency}. Поддерживаются: nkr, nra, expert_ra.\n");
-    exit(1);
+switch ($agency) {
+    case 'nkr':
+        (new NkrImporter($db, $matcher))->import();
+        break;
+    case 'nra':
+        (new NraImporter($db, $matcher))->import();
+        break;
+    case 'expert_ra':
+        (new ExpertRaImporter($db, $matcher, new ExpertRaClient(), $delayMs * 1000))->import();
+        break;
+    case 'acra':
+        if ($file === null) {
+            fwrite(STDERR, "Для --agency=acra обязателен --file=/path/to/acra_issuers.json (см. docs/STAGE3_RATINGS.md — этот импортёр никогда не обращается к acra-ratings.ru сам)\n");
+            exit(1);
+        }
+        (new AcraImporter($db, $matcher))->importFromFile($file);
+        break;
+    default:
+        fwrite(STDERR, "Неизвестное агентство: {$agency}. Поддерживаются: nkr, nra, expert_ra, acra.\n");
+        exit(1);
 }
 
-Logger::info("Старт: сидирование current_ratings ({$agency})");
-$importer->import();
 Logger::info('Готово.');

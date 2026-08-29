@@ -26,6 +26,10 @@ final class RatingsNormalizer
             'позитивный' => 'positive',
             'негативный' => 'negative',
             'неопределенный', 'неопределённый' => 'developing',
+            // АКРА использует "развивающийся" там, где остальные говорят
+            // "неопределённый" — тот же смысл (S&P-style "developing"),
+            // другое слово (см. STAGE3_RATINGS.md, JSON-выгрузка АКРА).
+            'развивающийся' => 'developing',
             default => null,
         };
     }
@@ -49,5 +53,33 @@ final class RatingsNormalizer
         }
 
         return "{$year}-{$month}-{$day}";
+    }
+
+    /** @var array<string, int> сокращённое русское название месяца (нижний регистр) => номер */
+    private const RUSSIAN_MONTHS = [
+        'янв' => 1, 'фев' => 2, 'мар' => 3, 'апр' => 4,
+        'май' => 5, 'июн' => 6, 'июл' => 7, 'авг' => 8,
+        'сен' => 9, 'окт' => 10, 'ноя' => 11, 'дек' => 12,
+    ];
+
+    /**
+     * АКРА отдаёт дату как "28 авг 2026" (день, сокращённое русское
+     * название месяца, год) — не ДД.ММ.ГГГГ, как у НРА/НКР, отдельный
+     * формат под отдельный метод, а не подгонка под parseDate().
+     */
+    public static function parseRussianMonthDate(string $raw): ?string
+    {
+        $raw = mb_strtolower(trim($raw));
+        if (!preg_match('/^(\d{1,2})\s+([а-я]{3})[а-я]*\s+(\d{4})$/u', $raw, $m)) {
+            return null;
+        }
+
+        [, $day, $monthAbbr, $year] = $m;
+        $month = self::RUSSIAN_MONTHS[$monthAbbr] ?? null;
+        if ($month === null || !checkdate($month, (int) $day, (int) $year)) {
+            return null;
+        }
+
+        return sprintf('%04d-%02d-%02d', (int) $year, $month, (int) $day);
     }
 }
