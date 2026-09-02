@@ -22,6 +22,13 @@ declare(strict_types=1);
  *   php bin/seed_ratings.php --agency=nra
  *   php bin/seed_ratings.php --agency=expert_ra [--delay-ms=400]
  *   php bin/seed_ratings.php --agency=acra --file=/path/to/acra_issuers.json
+ *   php bin/seed_ratings.php --agency=manual --file=/path/to/ratings.xlsx
+ *
+ * manual — не настоящее агентство, а разовая ручная подгрузка: xlsx-файл
+ * (ИНН|issuer_id|Полное наименование|agency|rating|outlook|last_action_date)
+ * с рейтингами, которые не нашлись через автоматические источники —
+ * пользователь собирает их сам, файл может содержать записи сразу для
+ * нескольких агентств (столбец agency в самом файле). См. docs/STAGE3_RATINGS.md.
  *
  * expert_ra — единственный источник без прямой Excel-выгрузки: обходит
  * боевой сайт агентства постранично (список рейтингов по каждой из ~10
@@ -51,6 +58,7 @@ use BondKeeper\Ratings\AcraImporter;
 use BondKeeper\Ratings\ExpertRaClient;
 use BondKeeper\Ratings\ExpertRaImporter;
 use BondKeeper\Ratings\IssuerMatcher;
+use BondKeeper\Ratings\ManualRatingsImporter;
 use BondKeeper\Ratings\NkrImporter;
 use BondKeeper\Ratings\NraImporter;
 use BondKeeper\Support\Logger;
@@ -71,7 +79,7 @@ foreach ($argv as $arg) {
 }
 
 if ($agency === null) {
-    fwrite(STDERR, "Использование: php bin/seed_ratings.php --agency=nkr|nra|expert_ra|acra [--delay-ms=400] [--file=...]\n");
+    fwrite(STDERR, "Использование: php bin/seed_ratings.php --agency=nkr|nra|expert_ra|acra|manual [--delay-ms=400] [--file=...]\n");
     exit(1);
 }
 
@@ -97,8 +105,15 @@ switch ($agency) {
         }
         (new AcraImporter($db, $matcher))->importFromFile($file);
         break;
+    case 'manual':
+        if ($file === null) {
+            fwrite(STDERR, "Для --agency=manual обязателен --file=/path/to/ratings.xlsx\n");
+            exit(1);
+        }
+        (new ManualRatingsImporter($db, $matcher))->importFromFile($file);
+        break;
     default:
-        fwrite(STDERR, "Неизвестное агентство: {$agency}. Поддерживаются: nkr, nra, expert_ra, acra.\n");
+        fwrite(STDERR, "Неизвестное агентство: {$agency}. Поддерживаются: nkr, nra, expert_ra, acra, manual.\n");
         exit(1);
 }
 

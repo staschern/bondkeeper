@@ -43,10 +43,11 @@ src/Ratings/NraImporter.php          — current_ratings из Excel-выгруз
 src/Ratings/ExpertRaClient.php       — постраничный обход raexpert.ru (Эксперт РА) с cookie-сессией
 src/Ratings/ExpertRaImporter.php     — current_ratings из raexpert.ru (Эксперт РА)
 src/Ratings/AcraImporter.php         — current_ratings из JSON-файла АКРА, который готовит пользователь (см. docs/STAGE3_RATINGS.md)
+src/Ratings/ManualRatingsImporter.php — current_ratings из ручного xlsx (рейтинги, не найденные через автоматические источники)
 bin/seed_market.php                  — запуск сидирования справочника (шаг 1)
 bin/seed_bondization.php             — запуск сидирования графика выплат (шаг 2)
 bin/seed_offers.php                  — запуск сидирования оферт (шаг 3)
-bin/seed_ratings.php                 — запуск сидирования current_ratings (--agency=nkr|nra|expert_ra|acra, этап 3, см. docs/STAGE3_RATINGS.md)
+bin/seed_ratings.php                 — запуск сидирования current_ratings (--agency=nkr|nra|expert_ra|acra|manual, этап 3, см. docs/STAGE3_RATINGS.md)
 bin/check_fns_blocks.php             — точечная/по расписанию проверка блокировок счетов (см. docs/STAGE1_POSTPROCESSING.md)
 config/fns_watchlist.txt             — список ИНН для ежедневного cron-прогона check_fns_blocks.php
 bin/debug_iss_security.php           — разовая диагностика сырого ответа ISS API по ISIN

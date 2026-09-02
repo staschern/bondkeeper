@@ -82,4 +82,30 @@ final class RatingsNormalizer
 
         return sprintf('%04d-%02d-%02d', (int) $year, $month, (int) $day);
     }
+
+    /**
+     * xlsx хранит дату как порядковый номер дня (число дней с
+     * 1899-12-30 — да, именно 30-е, из-за исторической ошибки Excel с
+     * "1900 годом как високосным"; для дат после марта 1900 это не
+     * влияет на результат). XlsxReader сам не преобразует форматы ячеек
+     * (не разбирает styles.xml), поэтому для xlsx-источников, где дата
+     * приходит именно так (см. ручной файл в STAGE3_RATINGS.md), нужен
+     * отдельный разбор — не ДД.ММ.ГГГГ и не "28 авг 2026".
+     */
+    public static function parseExcelSerialDate(string $raw): ?string
+    {
+        $raw = trim($raw);
+        if (!preg_match('/^\d+$/', $raw)) {
+            return null;
+        }
+
+        $serial = (int) $raw;
+        if ($serial < 1 || $serial > 100000) {
+            return null;
+        }
+
+        $timestamp = ($serial - 25569) * 86400;
+
+        return gmdate('Y-m-d', $timestamp);
+    }
 }

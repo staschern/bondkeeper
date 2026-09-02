@@ -98,10 +98,19 @@ final class XlsxReader
                 $ref = (string) $cell['r'];
                 $col = preg_replace('/\d+/', '', $ref) ?? $ref;
                 $type = (string) $cell['t'];
-                $value = isset($cell->v) ? (string) $cell->v : '';
 
-                if ($type === 's' && $value !== '') {
-                    $value = $sharedStrings[(int) $value] ?? '';
+                if ($type === 'inlineStr') {
+                    // Строка хранится прямо в ячейке (<c t="inlineStr"><is><t>...</t></is></c>),
+                    // а не через ссылку на sharedStrings.xml — так пишут, например,
+                    // openpyxl и другие генераторы xlsx (не только Excel/LibreOffice).
+                    // Без этой ветки такие ячейки молча читались бы как пустая строка.
+                    $texts = $cell->xpath('.//*[local-name()="t"]');
+                    $value = implode('', array_map(static fn ($t) => (string) $t, $texts ?: []));
+                } else {
+                    $value = isset($cell->v) ? (string) $cell->v : '';
+                    if ($type === 's' && $value !== '') {
+                        $value = $sharedStrings[(int) $value] ?? '';
+                    }
                 }
 
                 $cells[$col] = $value;
