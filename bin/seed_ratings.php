@@ -17,12 +17,31 @@ declare(strict_types=1);
  * JSON-файл, который пользователь готовит сам (не автоматизированным
  * опросом их сайта), см. docs/STAGE3_RATINGS.md.
  *
- * Запуск:
+ * Запуск (current_ratings):
  *   php bin/seed_ratings.php --agency=nkr
  *   php bin/seed_ratings.php --agency=nra
  *   php bin/seed_ratings.php --agency=expert_ra [--delay-ms=400]
  *   php bin/seed_ratings.php --agency=acra --file=/path/to/acra_issuers.json
  *   php bin/seed_ratings.php --agency=manual --file=/path/to/ratings.xlsx
+ *
+ * Запуск (rating_actions — история рейтинговых действий из новостей):
+ *   php bin/seed_ratings.php --agency=nkr-news [--full]
+ *   php bin/seed_ratings.php --agency=expert_ra-news [--delay-ms=400] [--full]
+ *
+ * *-news — парсинг пресс-релизов, не текущих рейтингов. По умолчанию
+ * инкрементально (останавливается на уже известной дате — не перекачивает
+ * всю историю заново каждый день). --full игнорирует эту границу: нужно
+ * периодически (не каждый день), потому что граница основана на том, что
+ * реально ЗАПИСАНО, а не на том, что реально просмотрено — новость,
+ * пропущенная из-за несопоставленного на тот момент эмитента, сама не
+ * пересматривается, если эмитента потом добавили. См. docs/STAGE3_RATINGS.md.
+ * НКР даёт ИНН на странице каждого пресс-релиза (надёжно); Эксперт РА —
+ * только название в тексте, сопоставление по точному совпадению названия,
+ * не по ИНН (см. IssuerMatcher::findIssuerIdByName).
+ *
+ * АКРА и НРА для новостей пока не реализованы: у АКРА тот же WAF, что и
+ * для current_ratings (см. ниже); у НРА пользователь ведёт мониторинг
+ * новых действий через email-подписку отдельно от этого скрипта.
  *
  * manual — не настоящее агентство, а разовая ручная подгрузка: xlsx-файл
  * (ИНН|issuer_id|Полное наименование|agency|rating|outlook|last_action_date)
@@ -49,6 +68,8 @@ declare(strict_types=1);
  *   0 5 * * * /usr/bin/php /path/to/bondkeeper/bin/seed_ratings.php --agency=nkr >> /var/log/bondkeeper/seed_ratings_nkr.log 2>&1
  *   30 5 * * * /usr/bin/php /path/to/bondkeeper/bin/seed_ratings.php --agency=nra >> /var/log/bondkeeper/seed_ratings_nra.log 2>&1
  *   0 6 * * * /usr/bin/php /path/to/bondkeeper/bin/seed_ratings.php --agency=expert_ra >> /var/log/bondkeeper/seed_ratings_expert_ra.log 2>&1
+ *   45 6 * * * /usr/bin/php /path/to/bondkeeper/bin/seed_ratings.php --agency=nkr-news >> /var/log/bondkeeper/seed_ratings_nkr_news.log 2>&1
+ *   0 7 * * * /usr/bin/php /path/to/bondkeeper/bin/seed_ratings.php --agency=expert_ra-news >> /var/log/bondkeeper/seed_ratings_expert_ra_news.log 2>&1
  */
 
 require __DIR__ . '/bootstrap.php';
@@ -57,15 +78,19 @@ use BondKeeper\Database;
 use BondKeeper\Ratings\AcraImporter;
 use BondKeeper\Ratings\ExpertRaClient;
 use BondKeeper\Ratings\ExpertRaImporter;
+use BondKeeper\Ratings\ExpertRaNewsImporter;
 use BondKeeper\Ratings\IssuerMatcher;
 use BondKeeper\Ratings\ManualRatingsImporter;
 use BondKeeper\Ratings\NkrImporter;
+use BondKeeper\Ratings\NkrNewsImporter;
 use BondKeeper\Ratings\NraImporter;
+use BondKeeper\Ratings\RatingActionsWriter;
 use BondKeeper\Support\Logger;
 
 $agency = null;
 $delayMs = 400;
 $file = null;
+$full = false;
 foreach ($argv as $arg) {
     if (str_starts_with($arg, '--agency=')) {
         $agency = substr($arg, strlen('--agency='));
@@ -76,17 +101,20 @@ foreach ($argv as $arg) {
     if (str_starts_with($arg, '--file=')) {
         $file = substr($arg, strlen('--file='));
     }
+    if ($arg === '--full') {
+        $full = true;
+    }
 }
 
 if ($agency === null) {
-    fwrite(STDERR, "Использование: php bin/seed_ratings.php --agency=nkr|nra|expert_ra|acra|manual [--delay-ms=400] [--file=...]\n");
+    fwrite(STDERR, "Использование: php bin/seed_ratings.php --agency=nkr|nra|expert_ra|acra|manual|nkr-news|expert_ra-news [--delay-ms=400] [--file=...] [--full]\n");
     exit(1);
 }
 
 $db = Database::connection();
 $matcher = new IssuerMatcher($db);
 
-Logger::info("Старт: сидирование current_ratings ({$agency})");
+Logger::info("Старт: сидирование рейтингов ({$agency})");
 
 switch ($agency) {
     case 'nkr':
@@ -112,8 +140,14 @@ switch ($agency) {
         }
         (new ManualRatingsImporter($db, $matcher))->importFromFile($file);
         break;
+    case 'nkr-news':
+        (new NkrNewsImporter($db, $matcher, new RatingActionsWriter($db)))->import($full);
+        break;
+    case 'expert_ra-news':
+        (new ExpertRaNewsImporter($db, $matcher, new RatingActionsWriter($db), new ExpertRaClient(), $delayMs * 1000))->import($full);
+        break;
     default:
-        fwrite(STDERR, "Неизвестное агентство: {$agency}. Поддерживаются: nkr, nra, expert_ra, acra, manual.\n");
+        fwrite(STDERR, "Неизвестное агентство: {$agency}. Поддерживаются: nkr, nra, expert_ra, acra, manual, nkr-news, expert_ra-news.\n");
         exit(1);
 }
 

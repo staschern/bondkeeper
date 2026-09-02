@@ -121,6 +121,145 @@ final class ExpertRaClient
         return null;
     }
 
+    /**
+     * Лента пресс-релизов (/news/ — вкладка "Пресс-релизы", подтверждена
+     * вживую как содержащая рейтинговые действия, см. STAGE3_RATINGS.md).
+     * Подгружается через AJAX постранично (jscroll на сайте): GET
+     * /articles/news/ajax-get-news/?page=N&CSRFToken=... — токен читается
+     * с исходной страницы /news/ (та же cookie-сессия), пустой ответ
+     * означает "дальше страниц нет". В отличие от списка рейтингов, ИНН
+     * тут никогда не даётся — только название компании в тексте, поэтому
+     * сопоставление у вызывающего кода идёт по названию, не по ИНН.
+     *
+     * $stopBeforeDate (ISO-формат ГГГГ-ММ-ДД, не формат самой ленты) —
+     * если задан, обход останавливается, как только на очередной
+     * странице не осталось ни одной новости С ЭТОЙ ДАТОЙ ИЛИ ПОЗЖЕ (лента
+     * отсортирована по убыванию даты). Без этого инкрементальность на
+     * стороне вызывающего кода была бы бессмысленна: страницы всё равно
+     * приходилось бы скачивать ВСЕ при каждом прогоне, только чтобы потом
+     * отбросить бо́льшую часть.
+     *
+     * @return array<int, array{title: string, subtitle: string, url: string, date: string}>
+     */
+    public function fetchNewsItems(int $delayMicroseconds, ?string $stopBeforeDate = null, int $maxPages = 500): array
+    {
+        $cookieJar = tempnam(sys_get_temp_dir(), 'bondkeeper_re_news_cookies_');
+        if ($cookieJar === false) {
+            throw new RuntimeException('Не удалось создать временный файл для cookie jar');
+        }
+
+        try {
+            $html = $this->get(self::BASE_URL . '/news/', $cookieJar);
+            $csrf = $this->extractNewsCsrf($html);
+            if ($csrf === null) {
+                throw new RuntimeException('Эксперт РА: не нашёлся CSRFToken для ленты новостей — вёрстка страницы могла измениться');
+            }
+
+            $items = [];
+            for ($page = 1; $page <= $maxPages; $page++) {
+                usleep($delayMicroseconds);
+                $ajaxUrl = self::BASE_URL . "/articles/news/ajax-get-news/?page={$page}&CSRFToken={$csrf}";
+                $chunk = $this->get($ajaxUrl, $cookieJar);
+                if (trim($chunk) === '') {
+                    break;
+                }
+
+                $pageItems = $this->parseNewsChunk($chunk);
+                $items = array_merge($items, $pageItems);
+
+                if ($stopBeforeDate !== null && $this->allOlderThan($pageItems, $stopBeforeDate)) {
+                    break;
+                }
+            }
+
+            return $items;
+        } finally {
+            @unlink($cookieJar);
+        }
+    }
+
+    /**
+     * @param array<int, array{date: string}> $items
+     * @param string $stopBeforeDateIso дата в ISO-формате (ГГГГ-ММ-ДД) — строки этого формата сравнимы как обычный текст
+     */
+    private function allOlderThan(array $items, string $stopBeforeDateIso): bool
+    {
+        if ($items === []) {
+            return false;
+        }
+
+        foreach ($items as $item) {
+            $parsed = RatingsNormalizer::parseDate($item['date']);
+            if ($parsed !== null && $parsed >= $stopBeforeDateIso) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private function extractNewsCsrf(string $html): ?string
+    {
+        if (preg_match('/ajax-get-news\/\?page="\s*\+\s*page\s*\+\s*"&CSRFToken=([^"]+)"/', $html, $m)) {
+            return $m[1];
+        }
+
+        return null;
+    }
+
+    /**
+     * @return array<int, array{title: string, subtitle: string, url: string, date: string}>
+     */
+    private function parseNewsChunk(string $html): array
+    {
+        $doc = new DOMDocument();
+        libxml_use_internal_errors(true);
+        $doc->loadHTML('<?xml encoding="utf-8"?><div>' . $html . '</div>');
+        libxml_clear_errors();
+        $xpath = new DOMXPath($doc);
+
+        // contains(@class, "b-articles-list-item") ловит и сам контейнер
+        // одной новости, И его дочерний div class="b-articles-list-item__info"
+        // (это ПОДСТРОКА, не точное совпадение класса) — без явной проверки
+        // границ токена одна и та же новость попадала бы в список дважды
+        // (подтверждено вживую при первой проверке).
+        $itemClassExact = "contains(concat(' ', normalize-space(@class), ' '), ' b-articles-list-item ')";
+
+        $items = [];
+        foreach ($xpath->query("//*[{$itemClassExact}]") as $item) {
+            $titleLinks = $xpath->query('.//a[@href]', $item);
+            if ($titleLinks->length === 0) {
+                continue;
+            }
+            $titleLink = $titleLinks->item(0);
+            $title = trim(preg_replace('/\s+/u', ' ', $titleLink->textContent) ?? '');
+            $href = $titleLink->getAttribute('href');
+
+            $subtitleNodes = $xpath->query('.//*[contains(@class, "b-articles-list-item__subtitle")]', $item);
+            $subtitle = $subtitleNodes->length > 0
+                ? trim(preg_replace('/\s+/u', ' ', $subtitleNodes->item(0)->textContent) ?? '')
+                : '';
+
+            $timeNodes = $xpath->query('.//*[contains(@class, "b-articles-list-item__time")]', $item);
+            $date = $timeNodes->length > 0
+                ? trim(preg_replace('/\s+/u', ' ', $timeNodes->item(0)->textContent) ?? '')
+                : '';
+
+            if ($title === '' || $href === '' || $date === '') {
+                continue;
+            }
+
+            $items[] = [
+                'title' => $title,
+                'subtitle' => $subtitle,
+                'url' => self::BASE_URL . $href,
+                'date' => $date,
+            ];
+        }
+
+        return $items;
+    }
+
     private function get(string $url, string $cookieJar): string
     {
         $ch = curl_init($url);
@@ -132,6 +271,11 @@ final class ExpertRaClient
             CURLOPT_COOKIEJAR => $cookieJar,
             CURLOPT_COOKIEFILE => $cookieJar,
             CURLOPT_USERAGENT => self::USER_AGENT,
+            // Нужен для AJAX-эндпоинтов сайта (подтверждено вживую — без
+            // него /articles/news/ajax-get-news/ отдаёт пустой ответ);
+            // на обычных страницах безвреден, поэтому шлём его всегда,
+            // а не только на AJAX-запросах.
+            CURLOPT_HTTPHEADER => ['X-Requested-With: XMLHttpRequest'],
         ]);
         $body = curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
