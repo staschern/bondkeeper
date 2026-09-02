@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace BondKeeper\Ratings;
 
 use BondKeeper\Support\Logger;
-use PDO;
+use DateTimeImmutable;
 
 /**
  * rating_actions из ленты пресс-релизов Эксперт РА (raexpert.ru/news/,
@@ -20,9 +20,10 @@ use PDO;
  * серия облигаций, потом сама компания) — пробуем каждое по порядку
  * появления, первое совпадение побеждает.
  *
- * Инкрементальность — так же, как у НКР: граница по MAX(action_date)
- * уже записанных действий этого агентства; лента отсортирована по
- * убыванию даты, останавливаемся, как только дошли до уже известного.
+ * Скользящее окно, ключ записи по source_url, never-skip-запись с
+ * пометкой нераспознанных полей и обновление current_ratings —
+ * та же логика, что и у NkrNewsImporter (см. его докблок для деталей,
+ * не дублируем описание тут).
  */
 final class ExpertRaNewsImporter
 {
@@ -31,27 +32,31 @@ final class ExpertRaNewsImporter
 
     private int $totalItems = 0;
     private int $skippedNotRatingAction = 0;
-    private int $skippedNoRatingParsed = 0;
-    private int $skippedNoEntityFound = 0;
+    private int $written = 0;
     private int $matched = 0;
     /** @var array<int, string> */
-    private array $unmatchedTitles = [];
+    private array $unresolvedTitles = [];
 
     public function __construct(
-        private readonly PDO $db,
         private readonly IssuerMatcher $matcher,
         private readonly RatingActionsWriter $writer,
+        private readonly CurrentRatingsStore $currentRatings,
         private readonly ExpertRaClient $client,
         private readonly int $delayMicroseconds = 400_000,
     ) {
     }
 
-    public function import(bool $full = false): void
+    /**
+     * $windowHours — глубина скользящего окна. $full=true игнорирует
+     * окно совсем — разовый проход по всей доступной ленте
+     * (первоначальное наполнение таблицы).
+     */
+    public function import(int $windowHours = 6, bool $full = false): void
     {
-        $sinceDate = $full ? null : $this->lastKnownActionDate();
-        Logger::info('Эксперт РА (новости): уже известна история до ' . ($sinceDate ?? ($full ? '(--full: игнорируем границу)' : '(пусто, первый прогон)')));
+        $cutoffDate = $full ? null : (new DateTimeImmutable())->modify("-{$windowHours} hours")->format('Y-m-d');
+        Logger::info('Эксперт РА (новости): обрабатываем новости от ' . ($cutoffDate ?? '(--full: без ограничения по дате)') . ' и позже');
 
-        $items = $this->client->fetchNewsItems($this->delayMicroseconds, $sinceDate);
+        $items = $this->client->fetchNewsItems($this->delayMicroseconds, $cutoffDate);
         Logger::info('Эксперт РА (новости): строк в ленте (в пределах загруженных страниц): ' . count($items));
 
         foreach ($items as $item) {
@@ -59,7 +64,7 @@ final class ExpertRaNewsImporter
             if ($date === null) {
                 continue;
             }
-            if ($sinceDate !== null && $date < $sinceDate) {
+            if ($cutoffDate !== null && $date < $cutoffDate) {
                 break;
             }
 
@@ -80,19 +85,28 @@ final class ExpertRaNewsImporter
             return;
         }
 
-        [$ratingFrom, $ratingTo] = $this->extractRatingChange($combined, $verb);
-        if ($ratingTo === null) {
-            $this->skippedNoRatingParsed++;
-            return;
-        }
+        /** @var array<int, string> $unresolved */
+        $unresolved = [];
 
+        $ratingTo = $this->extractRatingTo($combined, $verb);
+        if ($ratingTo === null) {
+            $unresolved[] = 'rating_to';
+        }
         $outlookTo = $this->extractOutlookTo($combined);
 
         $issuerId = $this->resolveIssuer($item['title']);
         if ($issuerId === null) {
-            $this->skippedNoEntityFound++;
-            $this->unmatchedTitles[] = $item['title'];
-            return;
+            $unresolved[] = 'issuer_id';
+        }
+
+        $ratingFrom = null;
+        $outlookFrom = null;
+        if ($issuerId !== null) {
+            $prior = $this->currentRatings->find($issuerId, self::AGENCY);
+            if ($prior !== null) {
+                $ratingFrom = $prior['rating'];
+                $outlookFrom = $prior['outlook'];
+            }
         }
 
         $this->writer->upsert(
@@ -101,11 +115,19 @@ final class ExpertRaNewsImporter
             $date,
             $ratingFrom,
             $ratingTo,
-            null,
+            $outlookFrom,
             $outlookTo,
             $item['url'],
+            $unresolved,
         );
-        $this->matched++;
+        $this->written++;
+
+        if ($issuerId !== null && $ratingTo !== null) {
+            $this->currentRatings->upsert($issuerId, self::AGENCY, $ratingTo, $outlookTo, $date);
+            $this->matched++;
+        } else {
+            $this->unresolvedTitles[] = $item['title'] . ' (' . implode(',', $unresolved) . ')';
+        }
     }
 
     private function matchVerb(string $title): ?string
@@ -117,34 +139,33 @@ final class ExpertRaNewsImporter
         return $m[1];
     }
 
-    /** @return array{0: ?string, 1: ?string} [rating_from, rating_to] */
-    private function extractRatingChange(string $combined, string $verb): array
+    /**
+     * Возвращает НОВЫЙ уровень рейтинга (rating_to) из текста.
+     * "Старое" значение в текст больше не парсится — оно приходит из
+     * current_ratings (см. importItem()), поэтому конструкция
+     * "Ранее...уровне X", которая раньше использовалась именно за этим,
+     * тут больше не нужна вовсе.
+     */
+    private function extractRatingTo(string $combined, string $verb): ?string
     {
         if ($verb === 'отозвал') {
-            return [null, 'отозван'];
+            return 'отозван';
         }
 
         preg_match_all('/ru[A-Za-zА-Яа-яЁё]{1,4}[+\-]?(?:\(EXP\))?/u', $combined, $m);
         $grades = array_values(array_unique($m[0]));
         if ($grades === []) {
-            return [null, null];
+            return null;
         }
 
         if (count($grades) >= 2 && preg_match('/\sс\s.+?\sдо\s/u', $combined)) {
-            return [$grades[0], $grades[1]];
+            return $grades[1];
         }
 
-        // "Ранее у Компании действовал рейтинг на уровне X" — старый
-        // уровень часто даётся отдельным предложением в подзаголовке,
-        // а не через "с X до Y" в самом заголовке.
-        if (preg_match('/Ранее[^.]*?уровне\s+(ru[A-Za-zА-Яа-яЁё]{1,4}[+\-]?(?:\(EXP\))?)/u', $combined, $mm)) {
-            $from = $mm[1];
-            $to = $grades[0] !== $from ? $grades[0] : ($grades[1] ?? $grades[0]);
-
-            return [$from, $to];
-        }
-
-        return [null, $grades[0]];
+        // Без "с X до Y" первый встретившийся грейд — это всегда
+        // текущее (новое) значение: любое "Ранее действовал на уровне
+        // X" всегда идёт отдельным, более поздним по тексту предложением.
+        return $grades[0];
     }
 
     /**
@@ -192,25 +213,16 @@ final class ExpertRaNewsImporter
         return null;
     }
 
-    private function lastKnownActionDate(): ?string
-    {
-        $stmt = $this->db->prepare('SELECT MAX(action_date) FROM rating_actions WHERE agency = :agency');
-        $stmt->execute(['agency' => self::AGENCY]);
-        $value = $stmt->fetchColumn();
-
-        return $value !== false && $value !== null ? (string) $value : null;
-    }
-
     private function printReport(): void
     {
         Logger::info('=== Отчёт по импорту rating_actions (Эксперт РА, новости) ===');
-        Logger::info("Строк обработано (в пределах инкрементального окна): {$this->totalItems}");
+        Logger::info("Строк обработано (в пределах окна): {$this->totalItems}");
         Logger::info("Пропущено (не похоже на кредитное рейтинговое действие): {$this->skippedNotRatingAction}");
-        Logger::info("Сопоставлено с issuers и записано: {$this->matched}");
-        Logger::info("Не сопоставлено (ни одно название в кавычках не нашлось в issuers): {$this->skippedNoEntityFound}");
-        Logger::info("Пропущено (не удалось разобрать уровень рейтинга): {$this->skippedNoRatingParsed}");
-        if ($this->unmatchedTitles !== []) {
-            Logger::info('Не сопоставленные заголовки: ' . implode('; ', array_slice($this->unmatchedTitles, 0, 20)));
+        Logger::info("Записано в rating_actions: {$this->written}");
+        Logger::info("Из них полностью распознано (эмитент + новый рейтинг, current_ratings обновлён): {$this->matched}");
+        Logger::info('Из них с нераспознанными полями (нужен ручной просмотр): ' . count($this->unresolvedTitles));
+        if ($this->unresolvedTitles !== []) {
+            Logger::info('Нераспознанные: ' . implode('; ', array_slice($this->unresolvedTitles, 0, 20)));
         }
     }
 }

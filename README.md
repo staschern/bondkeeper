@@ -44,13 +44,14 @@ src/Ratings/ExpertRaClient.php       — постраничный обход rae
 src/Ratings/ExpertRaImporter.php     — current_ratings из raexpert.ru (Эксперт РА)
 src/Ratings/AcraImporter.php         — current_ratings из JSON-файла АКРА, который готовит пользователь (см. docs/STAGE3_RATINGS.md)
 src/Ratings/ManualRatingsImporter.php — current_ratings из ручного xlsx (рейтинги, не найденные через автоматические источники)
-src/Ratings/RatingActionsWriter.php  — общий апсерт в rating_actions
-src/Ratings/NkrNewsImporter.php      — rating_actions из истории пресс-релизов НКР
-src/Ratings/ExpertRaNewsImporter.php — rating_actions из ленты пресс-релизов Эксперт РА
+src/Ratings/RatingActionsWriter.php  — общий апсерт в rating_actions (ключ — source_url, never-skip запись с пометкой нераспознанных полей, см. docs/STAGE3_RATINGS.md)
+src/Ratings/CurrentRatingsStore.php  — чтение/запись current_ratings для новостных импортёров (источник rating_from/outlook_from и место обновления после разобранного действия)
+src/Ratings/NkrNewsImporter.php      — rating_actions из истории пресс-релизов НКР, скользящее окно
+src/Ratings/ExpertRaNewsImporter.php — rating_actions из ленты пресс-релизов Эксперт РА, скользящее окно
 bin/seed_market.php                  — запуск сидирования справочника (шаг 1)
 bin/seed_bondization.php             — запуск сидирования графика выплат (шаг 2)
 bin/seed_offers.php                  — запуск сидирования оферт (шаг 3)
-bin/seed_ratings.php                 — запуск сидирования рейтингов (--agency=nkr|nra|expert_ra|acra|manual|nkr-news|expert_ra-news, этап 3, см. docs/STAGE3_RATINGS.md)
+bin/seed_ratings.php                 — запуск сидирования рейтингов (--agency=nkr|nra|expert_ra|acra|manual|nkr-news|expert_ra-news [--window-hours=6] [--full], этап 3, см. docs/STAGE3_RATINGS.md)
 bin/check_fns_blocks.php             — точечная/по расписанию проверка блокировок счетов (см. docs/STAGE1_POSTPROCESSING.md)
 config/fns_watchlist.txt             — список ИНН для ежедневного cron-прогона check_fns_blocks.php
 bin/debug_iss_security.php           — разовая диагностика сырого ответа ISS API по ISIN

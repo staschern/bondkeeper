@@ -177,17 +177,39 @@ final class NraImporter
                 outlook_to = VALUES(outlook_to),
                 source_url = VALUES(source_url)'
         );
+        $sameDateSeq = 0;
         foreach ($history as $row) {
             if ($prevDate !== null && $row['_date'] === $prevDate) {
-                // Два действия одной датой для одного эмитента — при апсерте
-                // по (issuer_id, agency, action_date) второе тихо перезапишет
-                // первое (см. комментарий в миграции 014). Считаем, чтобы
-                // это было видно в отчёте, а не терялось молча.
+                $sameDateSeq++;
+                // Два действия одной датой для одного эмитента — раньше (до
+                // миграции 015) при апсерте по (issuer_id, agency, action_date)
+                // второе тихо перезаписывало первое (см. комментарий в
+                // миграции 014). Теперь ключ апсерта — source_url, и обе
+                // строки различаются синтетическим source_url ниже (см.
+                // $syntheticUrl), так что уже не теряются молча — считаем
+                // только для видимости в отчёте.
                 $this->actionsSameDayCollisions++;
+            } else {
+                $sameDateSeq = 0;
             }
 
             $ratingTo = mb_substr(trim($row['Рейтинг'] ?? ''), 0, 20);
             $outlookTo = RatingsNormalizer::mapOutlook($row['Прогноз'] ?? '');
+
+            $realUrl = mb_substr(trim($row['Ссылка на пресс релиз'] ?? ''), 0, 500);
+            // У немалой части исторических строк (935 строк с 2020 года, см.
+            // докблок класса) ссылки на пресс-релиз в файле нет вовсе. Ключ
+            // апсерта rating_actions — source_url (миграция 015); без
+            // синтетической подстановки такие строки писались бы каждый раз
+            // заново при повторном запуске (MySQL не считает NULL=NULL для
+            // UNIQUE), плодя дубликаты истории на каждом перезапуске
+            // импортёра. Синтетический URL детерминирован по
+            // эмитенту+агентству+дате(+порядковому номеру внутри одной даты)
+            // — при повторном импорте того же файла получается тот же самый
+            // текст, апсерт корректно обновляет ту же строку.
+            $sourceUrl = $realUrl !== ''
+                ? $realUrl
+                : "nra-manual:{$issuerId}:" . self::AGENCY . ":{$row['_date']}:{$sameDateSeq}";
 
             $actionStmt->execute([
                 'issuer_id' => $issuerId,
@@ -197,7 +219,7 @@ final class NraImporter
                 'rating_to' => $ratingTo,
                 'outlook_from' => $prevOutlook,
                 'outlook_to' => $outlookTo,
-                'source_url' => mb_substr(trim($row['Ссылка на пресс релиз'] ?? ''), 0, 500) ?: null,
+                'source_url' => $sourceUrl,
             ]);
             $this->actionsWritten++;
 
