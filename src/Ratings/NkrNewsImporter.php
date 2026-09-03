@@ -5,96 +5,169 @@ declare(strict_types=1);
 namespace BondKeeper\Ratings;
 
 use BondKeeper\Support\Logger;
-use DateTimeImmutable;
 use DOMDocument;
 use DOMXPath;
+use PDO;
 
 /**
  * rating_actions из истории пресс-релизов НКР
  * (https://ratings.ru/ratings/press-releases/) — обычная HTML-таблица,
  * вся история одним запросом (1040+ строк на момент проверки, назад до
- * конца 2019 года), см. STAGE3_RATINGS.md.
+ * конца 2019 года, без пагинации), см. docs/STAGE3_RATINGS.md.
+ *
+ * Разбор ТЕКСТА заголовка (глагол, грейды, прогноз, названия в кавычках,
+ * защита от нестандартных шкал) — в NkrTitleParser (чистые статические
+ * методы без БД/сети, юнит-тестируемые отдельно). Этот класс отвечает
+ * за то, что NkrTitleParser сознательно не делает: HTTP, сопоставление
+ * с issuers.id и запись в rating_actions/current_ratings.
+ *
+ * Чтение/обновление кэша current_ratings (CurrentRatingsSync) и журнал
+ * просмотренных пресс-релизов (RatingNewsLog) вынесены в отдельные общие
+ * классы — ровно та же логика 1:1 понадобилась NraImporter (сентябрь
+ * 2026), дублировать её приватными методами в каждом news-импортёре не
+ * стали.
  *
  * ИНН здесь НЕ берётся из заголовка (там только название, часто в
  * падеже — "Трансстройбанка", "Селигдара" — сопоставлять по такому
  * названию ненадёжно). Вместо этого — по одному запросу на страницу
  * конкретного пресс-релиза, где ИНН даётся прямым текстом в блоке
- * "Регуляторное раскрытие": "Идентификационный номер налогоплательщика
- * (ИНН) рейтингуемого лица <10-12 цифр>". Дороже по числу запросов, но
- * надёжно — не нужно бороться с русскими падежами.
+ * "Регуляторное раскрытие".
  *
- * Скользящее окно (по прямому указанию пользователя — скрипт на cron
- * каждые ~30 минут): обрабатываются только строки списка с датой не
- * старше (now() - $windowHours, по умолчанию 6 часов, с запасом на
- * случай пропущенного/опоздавшего прогона). Список отсортирован по
- * убыванию даты — как только дошли до более старой строки, обход
- * останавливается. Ключ записи в БД — ссылка на пресс-релиз
- * (source_url, см. RatingActionsWriter) — при повторном попадании той
- * же новости в окно (соседние прогоны перекрываются) запись
- * ОБНОВЛЯЕТСЯ, а не дублируется. $full=true отключает окно совсем —
- * разовый проход по всей истории (первоначальное наполнение).
+ * === Автоматическое расписание (решение пользователя, сентябрь 2026) ===
  *
- * Строка, прошедшая классификацию по заголовку (глагол действия +
- * "кредитный рейтинг"), ЗАПИСЫВАЕТСЯ ВСЕГДА, даже если не удалось
- * распознать эмитента или новый уровень рейтинга — с null в
- * нераспознанных полях и отметкой has_unresolved_fields/unresolved_fields
- * (см. RatingActionsWriter) для последующего ручного просмотра.
+ * Раньше инкрементальность держалась на MAX(action_date) уже записанных
+ * действий — годилось для редких ручных прогонов, но при переходе на
+ * автоматический прогон каждые 30 минут два новых требования:
+ *   1. Дедуп по URL пресс-релиза (не по action_date) — см. RatingNewsLog/
+ *      rating_news_log (миграция 016). MAX(action_date)-подход не мог
+ *      отличить "уже успешно записан" от "уже пытались, но эмитент не
+ *      сопоставился" — второе тихо пропускалось навсегда без ручного
+ *      --full. Теперь непойманные пресс-релизы (любой статус кроме
+ *      'matched' в rating_news_log) пробуются заново на каждом прогоне.
+ *   2. Окно по датам, а не "от начала времён": $days — сколько последних
+ *      календарных дней пресс-релизов рассматривать. По решению
+ *      пользователя — 2 дня для частого (каждые 30 минут) прогона и
+ *      14 дней для более редкого "глубокого" прогона (ловит эмитентов,
+ *      добавленных в issuers с опозданием). $full=true игнорирует окно
+ *      полностью — вся история, редкая ручная операция.
  *
- * "Старые" значения (rating_from/outlook_from) не парсятся из текста
- * новости — берутся из current_ratings ДО этого действия
- * (CurrentRatingsStore::find()); после успешного разбора действия
- * (эмитент и новый уровень оба распознаны) current_ratings
- * обновляется этим же новым значением (CurrentRatingsStore::upsert()).
+ * bin/daemon_nkr_news.php — самостоятельный процесс с циклом (на случай,
+ * если на сервере нет доступа к обычному OS cron): каждые 30 минут
+ * $days=2, раз в сутки $days=14.
  *
- * Кейс "ООО-пустышка для привлечения долга" (см. запрос пользователя):
+ * === current_ratings — обновляется здесь же (решение пользователя) ===
+ *
+ * По исходному замыслу схемы (см. комментарий в 001_schema.sql) —
+ * current_ratings обновляется ПРИ КАЖДОЙ новой записи в rating_actions,
+ * а не только отдельным ежедневным NkrImporter (полная выгрузка "текущих
+ * рейтингов"). Реализовано через CurrentRatingsSync — строки в пределах
+ * одного прогона обрабатываются в ХРОНОЛОГИЧЕСКОМ порядке (список с сайта
+ * отдаётся по убыванию даты, поэтому кандидаты собираются, а потом
+ * проходятся в обратном порядке), апсерт в кэш — только если действие не
+ * старше уже сохранённого там (защита при пакетной обработке смеси старых
+ * пропущенных и свежих действий).
+ *
+ * Это же упростило outlook_from/rating_from: раз current_ratings на
+ * момент обработки каждой строки гарантированно актуален, достаточно
+ * прочитать его ДО записи новой строки:
+ *   - outlook_from = current_ratings.outlook на тот момент.
+ *   - rating_from = то, что явно дано в заголовке ("с X до Y"), а если
+ *     не дано — тоже current_ratings.rating (честнее, чем просто NULL —
+ *     рейтинг подтверждён на том же уровне). Действует и для отзыва —
+ *     rating_from покажет последний реальный грейд перед отзывом.
+ *
+ * === Глагол "изменило" и статус "на пересмотре" (решение пользователя) ===
+ *
+ * "изменило" добавлен в NkrTitleParser::VERBS ради заголовков вида "НКР
+ * изменило прогноз по кредитному рейтингу ООО «Х» на «рейтинг на
+ * пересмотре с возможностью понижения»" — сам грейд там не называется
+ * вообще. Для этого глагола отсутствие грейда в заголовке — НЕ ошибка
+ * разбора (в отличие от остальных 5 глаголов): rating_to берётся из
+ * current_ratings.rating (уровень не меняется, меняется только статус).
+ * Если и в кэше пусто (первое вообще известное действие по эмитенту) —
+ * честно нечего писать в NOT NULL rating_to, такой issuer пропускается
+ * (см. importRow()).
+ *
+ * Статус "на пересмотре" (CreditWatch/Rating Watch, миграция 017) —
+ * RatingsNormalizer::extractReviewStatusFromProse() проверяется ПЕРЕД
+ * обычным mapOutlookFromProse() — своя, более специфичная категория
+ * outlook (under_review/under_review_negative/under_review_positive), не
+ * обычные 4 направления прогноза.
+ *
+ * === Составные действия (компания-поручитель + её SPV) ===
+ *
  * НКР в заголовке часто явно называет и операционную компанию, и её
  * SPV/облигации в одном действии ("НКР подтвердило кредитные рейтинги
- * ООО «ПК Борец» и облигаций ООО «Борец Капитал» на уровне A-.ru") —
- * для первого прохода берём ПЕРВОЕ (обычно главное, операционное) лицо
- * из заголовка; отдельная обработка второго лица — не в этом заходе.
+ * ООО «ПК Борец» и облигаций ООО «Борец Капитал» на уровне A-.ru») —
+ * первичное лицо сопоставляется по ИНН со страницы пресс-релиза
+ * (надёжно), остальные названия в кавычках заголовка — запасным путём,
+ * по точному совпадению имени (IssuerMatcher::findIssuerIdByName).
+ * Строка в rating_actions пишется на КАЖДЫЙ различный сопоставившийся
+ * issuer_id, для которого нашёлся rating_to (см. выше про "изменило") —
+ * оба есть в БД → 2 строки с одинаковым rating_to/outlook_to; только
+ * один (любой) → 1 строка; ни одного (или ни для одного не нашёлся
+ * rating_to) → в rating_news_log со статусом skipped_unmatched/
+ * skipped_no_grade (см. resolveIssuerIds()).
  */
 final class NkrNewsImporter
 {
     private const AGENCY = 'nkr';
     private const LIST_URL = 'https://ratings.ru/ratings/press-releases/';
-    private const VERBS = ['повысило', 'снизило', 'подтвердило', 'отозвало', 'присвоило'];
 
-    private int $totalRows = 0;
+    private int $totalCandidates = 0;
+    private int $skippedAlreadyLogged = 0;
     private int $skippedNotRatingAction = 0;
-    private int $written = 0;
-    private int $matched = 0;
+    private int $skippedNonStandardRating = 0;
+    private int $skippedNoRatingParsed = 0;
+    /** Штук пресс-релизов, по которым записана хотя бы одна строка rating_actions. */
+    private int $matchedActions = 0;
+    /** Штук строк rating_actions — больше matchedActions, если были составные действия. */
+    private int $matchedRows = 0;
+    /** Штук составных действий (2+ разных issuer_id сопоставилось на одно действие). */
+    private int $compositeActions = 0;
+    private int $skippedNoIssuerResolved = 0;
     /** @var array<int, string> */
-    private array $unresolvedTitles = [];
+    private array $unmatchedTitles = [];
+    /** @var array<int, string> */
+    private array $unparsedTitles = [];
+    /** @var array<int, string> */
+    private array $nonStandardTitles = [];
 
     public function __construct(
+        private readonly PDO $db,
         private readonly IssuerMatcher $matcher,
         private readonly RatingActionsWriter $writer,
-        private readonly CurrentRatingsStore $currentRatings,
     ) {
     }
 
     /**
-     * $windowHours — глубина скользящего окна (см. докблок класса).
-     * $full=true игнорирует окно совсем — разовый проход по всей
-     * доступной истории (первоначальное наполнение таблицы).
+     * $days — сколько последних календарных дней пресс-релизов (по дате
+     * из списка) рассматривать; $full=true игнорирует $days полностью и
+     * разбирает всю историю (редкая ручная операция, не для расписания).
      */
-    public function import(int $windowHours = 6, bool $full = false): void
+    public function import(bool $full = false, int $days = 2): void
     {
-        $cutoffDate = $full ? null : (new DateTimeImmutable())->modify("-{$windowHours} hours")->format('Y-m-d');
-        Logger::info('НКР (новости): обрабатываем новости от ' . ($cutoffDate ?? '(--full: без ограничения по дате)') . ' и позже');
+        $cutoffDate = $full ? null : date('Y-m-d', strtotime("-{$days} days"));
+        Logger::info('НКР (новости): окно — ' . ($full ? 'вся история (--full)' : "последние {$days} дн. (с {$cutoffDate})"));
 
         $html = RatingsHttp::get(self::LIST_URL, 60);
         $rows = $this->parseListRows($html);
         Logger::info('НКР (новости): строк в списке пресс-релизов: ' . count($rows));
 
+        // Список отсортирован по убыванию даты — собираем кандидатов в
+        // пределах окна, потом проходим их в обратном порядке
+        // (хронологически, от старых к новым), см. докблок класса про
+        // current_ratings.
+        $candidates = [];
         foreach ($rows as $row) {
             if ($cutoffDate !== null && $row['date'] < $cutoffDate) {
-                // Список отсортирован по убыванию даты — дальше только
-                // старее окна, можно остановиться.
                 break;
             }
+            $candidates[] = $row;
+        }
+        $this->totalCandidates = count($candidates);
 
-            $this->totalRows++;
+        foreach (array_reverse($candidates) as $row) {
             $this->importRow($row);
         }
 
@@ -143,153 +216,151 @@ final class NkrNewsImporter
     /** @param array{title: string, url: string, date: string} $row */
     private function importRow(array $row): void
     {
-        $verb = $this->matchVerb($row['title']);
-        if ($verb === null || !preg_match('/кредитн\w+\s+рейтинг/ui', $row['title'])) {
+        if (RatingNewsLog::isAlreadyMatched($this->db, self::AGENCY, $row['url'])) {
+            $this->skippedAlreadyLogged++;
+            return;
+        }
+
+        $verb = NkrTitleParser::matchVerb($row['title']);
+        if ($verb === null || !NkrTitleParser::isCreditRatingAction($row['title'])) {
+            RatingNewsLog::log($this->db, self::AGENCY, $row['url'], $row['date'], 'skipped_not_rating');
             $this->skippedNotRatingAction++;
             return;
         }
 
-        /** @var array<int, string> $unresolved */
-        $unresolved = [];
-
-        $ratingTo = $this->extractRatingTo($row['title'], $verb);
-        if ($ratingTo === null) {
-            $unresolved[] = 'rating_to';
+        if (RatingsNormalizer::isNonStandardRating($row['title'])) {
+            RatingNewsLog::log($this->db, self::AGENCY, $row['url'], $row['date'], 'skipped_non_standard');
+            $this->skippedNonStandardRating++;
+            $this->nonStandardTitles[] = $row['title'];
+            return;
         }
-        $outlookTo = $this->extractOutlookTo($row['title']);
+
+        [$ratingFromParsed, $ratingToParsed] = NkrTitleParser::extractRatingChange($row['title'], $verb);
+        if ($ratingToParsed === null && $verb !== 'изменило') {
+            // Для остальных 5 глаголов отсутствие грейда — реальная
+            // неудача разбора (см. NkrTitleParser::VERBS). Для "изменило"
+            // это ожидаемо (см. докблок класса) — не выходим отсюда,
+            // rating_to попробуем взять из current_ratings ниже, per issuer.
+            RatingNewsLog::log($this->db, self::AGENCY, $row['url'], $row['date'], 'skipped_no_grade');
+            $this->skippedNoRatingParsed++;
+            $this->unparsedTitles[] = $row['title'];
+            return;
+        }
+
+        $outlookTo = RatingsNormalizer::extractReviewStatusFromProse($row['title'])
+            ?? RatingsNormalizer::mapOutlookFromProse($row['title']);
 
         $inn = $this->fetchInnFromDetailPage($row['url']);
-        $issuerId = $inn !== null ? $this->matcher->findIssuerIdByInn($inn) : null;
-        if ($issuerId === null) {
-            $unresolved[] = 'issuer_id';
+        $issuerIds = $this->resolveIssuerIds($inn, $row['title']);
+
+        if ($issuerIds === []) {
+            RatingNewsLog::log($this->db, self::AGENCY, $row['url'], $row['date'], 'skipped_unmatched');
+            $this->skippedNoIssuerResolved++;
+            $suffix = $inn !== null ? " (ИНН={$inn}, не найден в issuers)" : ' (ИНН на странице не найден)';
+            $this->unmatchedTitles[] = $row['title'] . $suffix;
+            return;
         }
 
-        $ratingFrom = null;
-        $outlookFrom = null;
-        if ($issuerId !== null) {
-            $prior = $this->currentRatings->find($issuerId, self::AGENCY);
-            if ($prior !== null) {
-                $ratingFrom = $prior['rating'];
-                $outlookFrom = $prior['outlook'];
+        $writtenCount = 0;
+        foreach ($issuerIds as $issuerId) {
+            $cached = CurrentRatingsSync::fetch($this->db, $issuerId, self::AGENCY);
+            $ratingFrom = $ratingFromParsed ?? $cached['rating'];
+            $ratingTo = $ratingToParsed ?? $cached['rating'];
+            if ($ratingTo === null) {
+                // verb='изменило', заголовок не дал грейд, и в кэше пусто
+                // (первое вообще известное действие по этому эмитенту) —
+                // честно нечего писать в NOT NULL rating_to, пропускаем
+                // именно этого issuer'а (не всё действие целиком — при
+                // составном действии другое лицо могло сопоставиться успешно).
+                continue;
+            }
+
+            $this->writer->upsert(
+                $issuerId,
+                self::AGENCY,
+                $row['date'],
+                $ratingFrom,
+                $ratingTo,
+                $cached['outlook'],
+                $outlookTo,
+                $row['url'],
+                $row['title'],
+            );
+            CurrentRatingsSync::sync($this->db, $issuerId, self::AGENCY, $row['date'], $ratingTo, $outlookTo, $cached);
+            $writtenCount++;
+        }
+
+        if ($writtenCount === 0) {
+            RatingNewsLog::log($this->db, self::AGENCY, $row['url'], $row['date'], 'skipped_no_grade');
+            $this->skippedNoRatingParsed++;
+            $this->unparsedTitles[] = $row['title'] . ' (глагол "изменило" без грейда и без известного current_ratings)';
+            return;
+        }
+
+        $this->matchedRows += $writtenCount;
+        $this->matchedActions++;
+        if ($writtenCount > 1) {
+            $this->compositeActions++;
+        }
+        RatingNewsLog::log($this->db, self::AGENCY, $row['url'], $row['date'], 'matched');
+    }
+
+    /**
+     * Первичное лицо — по ИНН со страницы пресс-релиза (надёжно). Любые
+     * другие названия в кавычках заголовка — запасным путём, по точному
+     * совпадению имени (см. IssuerMatcher::findIssuerIdByName). Если
+     * название в кавычках резолвится в тот же issuer_id, что и первичное
+     * лицо — array_unique просто уберёт дубль, вторая строка на того же
+     * issuer_id не пишется.
+     *
+     * @return array<int, int> уникальные issuer_id, первичный (по ИНН) первым, если сопоставился
+     */
+    private function resolveIssuerIds(?string $inn, string $title): array
+    {
+        $issuerIds = [];
+
+        $primaryId = $inn !== null ? $this->matcher->findIssuerIdByInn($inn) : null;
+        if ($primaryId !== null) {
+            $issuerIds[] = $primaryId;
+        }
+
+        foreach (RatingsNormalizer::extractQuotedNames($title) as $candidate) {
+            $id = $this->matcher->findIssuerIdByName($candidate);
+            if ($id !== null) {
+                $issuerIds[] = $id;
             }
         }
 
-        $this->writer->upsert(
-            $issuerId,
-            self::AGENCY,
-            $row['date'],
-            $ratingFrom,
-            $ratingTo,
-            $outlookFrom,
-            $outlookTo,
-            $row['url'],
-            $unresolved,
-        );
-        $this->written++;
-
-        if ($issuerId !== null && $ratingTo !== null) {
-            $this->currentRatings->upsert($issuerId, self::AGENCY, $ratingTo, $outlookTo, $row['date']);
-            $this->matched++;
-        } else {
-            $this->unresolvedTitles[] = $row['title'] . ' (' . implode(',', $unresolved) . ')';
-        }
-    }
-
-    private function matchVerb(string $title): ?string
-    {
-        if (!preg_match('/^НКР\s+(' . implode('|', self::VERBS) . ')\s/u', $title, $m)) {
-            return null;
-        }
-
-        return $m[1];
-    }
-
-    /**
-     * Возвращает НОВЫЙ уровень рейтинга (rating_to) из заголовка.
-     * "Старое" значение (rating_from) в текст не парсится вовсе — оно
-     * приходит из current_ratings (см. importRow()).
-     */
-    private function extractRatingTo(string $title, string $verb): ?string
-    {
-        if ($verb === 'отозвало') {
-            // Отзыв — обычно без указания конкретного уровня в заголовке:
-            // пишем это как факт отзыва, тот же приём, что уже
-            // используется для current_ratings.rating='отозван' у
-            // Эксперт РА — честный текстовый статус, не выдуманный грейд.
-            return 'отозван';
-        }
-
-        preg_match_all('/([A-Za-zА-Яа-яЁё]{1,4}[+\-]?\.ru)/u', $title, $m);
-        $grades = $m[1];
-        if ($grades === []) {
-            return null;
-        }
-
-        if (count($grades) >= 2 && preg_match('/\sс\s.+?\sдо\s/u', $title)) {
-            return $grades[1];
-        }
-
-        // Несколько уровней без "с X до Y" — обычно относится к разным
-        // лицам в одном заголовке (компания + её облигации на другом
-        // уровне). Берём первый — как правило, это уровень главного,
-        // первым названного в заголовке лица.
-        return $grades[0];
-    }
-
-    /**
-     * НКР тоже может назвать и старый, и новый прогноз в ОДНОМ
-     * предложении — "...и изменило прогноз со стабильного на
-     * позитивный" (реальный заголовок, проверено вживую). Общий
-     * RatingsNormalizer::mapOutlookFromProse() по всему заголовку тут
-     * не подходит по той же причине, что и у Эксперт РА (см. докблок
-     * ExpertRaNewsImporter::extractOutlookTo()): он ищет первый
-     * попавшийся корень по фиксированному приоритету, а не по позиции
-     * относительно "на" — может выбрать СТАРОЕ значение, если у его
-     * корня приоритет выше. Сначала пробуем прицельный паттерн
-     * "прогноз ... на <слово>" (после "на" в такой конструкции — всегда
-     * НОВОЕ значение), и только если он не сработал (заголовки вида
-     * "прогноз — стабильный", "со стабильным прогнозом" — без "на") —
-     * общий разбор по всему заголовку.
-     */
-    private function extractOutlookTo(string $title): ?string
-    {
-        if (preg_match('/прогноз[^.]*?\sна\s+(позитивн\w*|негативн\w*|стабильн\w*|развивающ\w*|неопределенн\w*|неопределённ\w*)/ui', $title, $m)) {
-            return RatingsNormalizer::mapOutlookFromProse($m[1]);
-        }
-
-        return RatingsNormalizer::mapOutlookFromProse($title);
+        return array_values(array_unique($issuerIds));
     }
 
     private function fetchInnFromDetailPage(string $url): ?string
     {
         $html = RatingsHttp::get($url, 60);
-        $text = $this->toPlainText($html);
 
-        if (preg_match('/Идентификационный номер налогоплательщика\s*\(ИНН\)\s*рейтингуемого лица\s*(\d{10,12})/u', $text, $m)) {
-            return $m[1];
-        }
-
-        return null;
-    }
-
-    private function toPlainText(string $html): string
-    {
-        $html = preg_replace('/<script.*?<\/script>/su', ' ', $html) ?? $html;
-        $text = preg_replace('/<[^>]+>/', ' ', $html) ?? $html;
-
-        return trim(preg_replace('/\s+/u', ' ', $text) ?? $text);
+        return NkrTitleParser::extractInnFromDetailHtml($html);
     }
 
     private function printReport(): void
     {
         Logger::info('=== Отчёт по импорту rating_actions (НКР, новости) ===');
-        Logger::info("Строк обработано (в пределах окна): {$this->totalRows}");
+        Logger::info("Кандидатов в окне: {$this->totalCandidates}");
+        Logger::info("Уже были окончательно обработаны раньше (status=matched в rating_news_log): {$this->skippedAlreadyLogged}");
         Logger::info("Пропущено (не похоже на кредитное рейтинговое действие): {$this->skippedNotRatingAction}");
-        Logger::info("Записано в rating_actions: {$this->written}");
-        Logger::info("Из них полностью распознано (эмитент + новый рейтинг, current_ratings обновлён): {$this->matched}");
-        Logger::info('Из них с нераспознанными полями (нужен ручной просмотр): ' . count($this->unresolvedTitles));
-        if ($this->unresolvedTitles !== []) {
-            Logger::info('Нераспознанные: ' . implode('; ', array_slice($this->unresolvedTitles, 0, 20)));
+        Logger::info("Пропущено (нестандартная шкала, напр. 'sf'): {$this->skippedNonStandardRating}");
+        Logger::info("Пропущено (не удалось разобрать уровень рейтинга и нет данных в current_ratings): {$this->skippedNoRatingParsed}");
+        Logger::info("Действий записано (matchedActions): {$this->matchedActions}");
+        Logger::info("Строк rating_actions записано (matchedRows): {$this->matchedRows}");
+        Logger::info("Из них составных действий (2+ юрлица сопоставились): {$this->compositeActions}");
+        Logger::info("Не сопоставлено ни с одним issuer_id (попробуем снова на следующем прогоне): {$this->skippedNoIssuerResolved}");
+        if ($this->unmatchedTitles !== []) {
+            Logger::info('Не сопоставленные: ' . implode('; ', array_slice($this->unmatchedTitles, 0, 20)));
+        }
+        if ($this->unparsedTitles !== []) {
+            Logger::info('Не разобранные заголовки: ' . implode('; ', array_slice($this->unparsedTitles, 0, 20)));
+        }
+        if ($this->nonStandardTitles !== []) {
+            Logger::info('Нестандартная шкала (пропущены целиком): ' . implode('; ', array_slice($this->nonStandardTitles, 0, 20)));
         }
     }
 }

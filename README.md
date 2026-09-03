@@ -44,14 +44,20 @@ src/Ratings/ExpertRaClient.php       — постраничный обход rae
 src/Ratings/ExpertRaImporter.php     — current_ratings из raexpert.ru (Эксперт РА)
 src/Ratings/AcraImporter.php         — current_ratings из JSON-файла АКРА, который готовит пользователь (см. docs/STAGE3_RATINGS.md)
 src/Ratings/ManualRatingsImporter.php — current_ratings из ручного xlsx (рейтинги, не найденные через автоматические источники)
-src/Ratings/RatingActionsWriter.php  — общий апсерт в rating_actions (ключ — source_url, never-skip запись с пометкой нераспознанных полей, см. docs/STAGE3_RATINGS.md)
-src/Ratings/CurrentRatingsStore.php  — чтение/запись current_ratings для новостных импортёров (источник rating_from/outlook_from и место обновления после разобранного действия)
-src/Ratings/NkrNewsImporter.php      — rating_actions из истории пресс-релизов НКР, скользящее окно
-src/Ratings/ExpertRaNewsImporter.php — rating_actions из ленты пресс-релизов Эксперт РА, скользящее окно
+src/Ratings/RatingActionsWriter.php  — общий апсерт в rating_actions (ключ — UNIQUE(issuer_id, agency, action_date), полностью распознанные действия, см. docs/STAGE3_RATINGS.md)
+src/Ratings/CurrentRatingsSync.php   — чтение/запись current_ratings для новостных импортёров (источник rating_from/outlook_from; апсерт кэша только если действие не старше уже сохранённого)
+src/Ratings/RatingNewsLog.php        — журнал просмотренных пресс-релизов (rating_news_log) — дедуп/ретрай по (agency, source_url), независимо от rating_actions
+src/Ratings/NkrTitleParser.php       — чистый (без БД/сети) разбор заголовков пресс-релизов НКР
+src/Ratings/NkrNewsImporter.php      — rating_actions из истории пресс-релизов НКР, скользящее окно (--days)
+src/Ratings/ExpertRaNewsImporter.php — rating_actions из ленты пресс-релизов Эксперт РА, скользящее окно (--days), сопоставление по ИНН со страницы релиза + запасной путь по имени
+src/Ratings/AcraEmailParser.php      — ШАБЛОН: разбор текста писем АКРА "Новое рейтинговое действие" (чистая функция, IMAP-часть ещё не реализована — см. docs/STAGE3_RATINGS.md)
 bin/seed_market.php                  — запуск сидирования справочника (шаг 1)
 bin/seed_bondization.php             — запуск сидирования графика выплат (шаг 2)
 bin/seed_offers.php                  — запуск сидирования оферт (шаг 3)
-bin/seed_ratings.php                 — запуск сидирования рейтингов (--agency=nkr|nra|expert_ra|acra|manual|nkr-news|expert_ra-news [--window-hours=6] [--full], этап 3, см. docs/STAGE3_RATINGS.md)
+bin/seed_ratings.php                 — запуск сидирования рейтингов (--agency=nkr|nra|expert_ra|acra|manual|nkr-news|expert_ra-news [--days=2] [--full], этап 3, см. docs/STAGE3_RATINGS.md)
+bin/daemon_nkr_news.php              — автономный цикл nkr-news вместо OS cron (частый/глубокий проход), если на сервере нет доступа к обычному планировщику
+bin/daemon_expert_ra_news.php        — то же для expert_ra-news
+bin/daemon_nra.php                   — то же для nra (простой цикл, без деления на частый/глубокий)
 bin/check_fns_blocks.php             — точечная/по расписанию проверка блокировок счетов (см. docs/STAGE1_POSTPROCESSING.md)
 config/fns_watchlist.txt             — список ИНН для ежедневного cron-прогона check_fns_blocks.php
 bin/debug_iss_security.php           — разовая диагностика сырого ответа ISS API по ISIN

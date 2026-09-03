@@ -24,37 +24,52 @@ declare(strict_types=1);
  *   php bin/seed_ratings.php --agency=acra --file=/path/to/acra_issuers.json
  *   php bin/seed_ratings.php --agency=manual --file=/path/to/ratings.xlsx
  *
- * Запуск (rating_actions — история рейтинговых действий из новостей,
- * рассчитан на cron каждые ~30 минут):
- *   php bin/seed_ratings.php --agency=nkr-news [--window-hours=6] [--full]
- *   php bin/seed_ratings.php --agency=expert_ra-news [--delay-ms=400] [--window-hours=6] [--full]
+ * Запуск (rating_actions — история рейтинговых действий из новостей):
+ *   php bin/seed_ratings.php --agency=nkr-news [--days=2] [--full]
+ *   php bin/seed_ratings.php --agency=expert_ra-news [--delay-ms=400] [--full]
  *
- * *-news — парсинг пресс-релизов, не текущих рейтингов. По прямому
- * указанию пользователя — скользящее окно, а не "с последней известной
- * даты": каждый прогон обрабатывает только новости не старше
- * (сейчас − --window-hours, по умолчанию 6 часов — с запасом, чтобы
- * пропущенный/опоздавший прогон cron не потерял новость). Ключ записи —
- * ссылка на пресс-релиз (source_url) — при повторном попадании той же
- * новости в перекрывающееся окно соседних прогонов запись ОБНОВЛЯЕТСЯ,
- * а не дублируется. Строка, классифицированная по заголовку как
- * рейтинговое действие, пишется в БД ВСЕГДА — даже если не удалось
- * распознать эмитента или новый уровень рейтинга (тогда — null в этих
- * полях и пометка has_unresolved_fields/unresolved_fields для ручного
- * просмотра, см. RatingActionsWriter и docs/STAGE3_RATINGS.md).
- * --full игнорирует окно совсем и проходит всю доступную историю —
- * для первоначального наполнения таблицы, не для обычных прогонов по
- * расписанию (иначе на каждом прогоне будет перекачиваться вся лента).
- * НКР даёт ИНН на странице каждого пресс-релиза (надёжно); Эксперт РА —
- * только название в тексте, сопоставление по точному совпадению названия,
- * не по ИНН (см. IssuerMatcher::findIssuerIdByName).
- * "Старые" значения (rating_from/outlook_from) не парсятся из текста
- * новости — берутся из current_ratings ДО этого действия, а после
- * успешного разбора (эмитент и новый уровень оба распознаны)
- * current_ratings обновляется этим же новым значением.
+ * *-news — парсинг пресс-релизов, не текущих рейтингов. НКР (--agency=
+ * nkr-news) — по решению пользователя переведён на автоматическое
+ * расписание каждые 30 минут (см. bin/daemon_nkr_news.php, если на сервере
+ * нет доступа к обычному OS cron): --days=N — сколько последних
+ * календарных дней рассматривать (по умолчанию 2 — для частого прогона;
+ * 14 — для более редкого "глубокого", ловит эмитентов, добавленных в
+ * issuers с опозданием). Дедуп — не по дате, а по URL пресс-релиза
+ * (rating_news_log, миграция 016): пресс-релиз, успешно записанный,
+ * повторно не трогается никогда; пресс-релиз, который не удалось
+ * сопоставить с эмитентом, пробуется заново на каждом прогоне в пределах
+ * окна — сам подхватится, если эмитента потом добавили в issuers, без
+ * ручного --full. --full игнорирует окно полностью (вся история с 2019
+ * года) — теперь редкая ручная операция, не часть расписания.
+ * Подробности — в докблоке NkrNewsImporter и docs/STAGE3_RATINGS.md.
  *
- * АКРА и НРА для новостей пока не реализованы: у АКРА тот же WAF, что и
- * для current_ratings (см. ниже); у НРА пользователь ведёт мониторинг
- * новых действий через email-подписку отдельно от этого скрипта.
+ * Эксперт РА (--agency=expert_ra-news [--days=2] [--delay-ms=400] [--full])
+ * — по решению пользователя (сентябрь 2026) ТОЖЕ переведён на общую
+ * механику: дедуп по URL пресс-релиза (rating_news_log), current_ratings
+ * через CurrentRatingsSync, статус "под наблюдением" (своя терминология,
+ * не "на пересмотре" у НКР — см. докблок ExpertRaNewsImporter), защита от
+ * нестандартных шкал (".sf" — реально встречается, в отличие от НКР).
+ * Сопоставление — ПЕРВИЧНО по ИНН со страницы пресс-релиза (нашлось
+ * вживую в сентябре 2026 — оказалось, что оно там всё-таки есть, просто
+ * не в самой ленте новостей; см. ExpertRaClient::fetchReleaseInn()),
+ * запасным путём — по названию в кавычках, как раньше. Из-за этого
+ * доп. запроса на КАЖДУЮ строку (как у НКР) — то же деление на частый/
+ * глубокий проход: по умолчанию --days=2 (частый), --days=14 для более
+ * редкого "глубокого".
+ *
+ * НРА (--agency=nra) — по решению пользователя (сентябрь 2026) ТОЖЕ можно
+ * гонять каждые 30 минут: у агентства нет отдельной ленты пресс-релизов
+ * (/news/ — общая PR-лента, не рейтинговые действия, проверено вживую),
+ * зато Excel-выгрузка (та же, что и раньше) отдаёт всю историю целиком
+ * при каждом запросе — свежие действия попадают в неё практически сразу
+ * (проверено: в момент разведки самая свежая строка была от сегодняшнего
+ * дня). Дедуп — тот же RatingNewsLog/rating_news_log, что и у НКР, ключ —
+ * "Ссылка на пресс релиз" — уже обработанные строки не трогают БД
+ * повторно, только разбираются в памяти PHP (дёшево). Подробности — в
+ * докблоке NraImporter.
+ *
+ * АКРА для новостей не реализовано: тот же WAF, что и для current_ratings
+ * (см. ниже).
  *
  * manual — не настоящее агентство, а разовая ручная подгрузка: xlsx-файл
  * (ИНН|issuer_id|Полное наименование|agency|rating|outlook|last_action_date)
@@ -74,27 +89,34 @@ declare(strict_types=1);
  * секунды). Это норма для этого источника, не зависание — см.
  * docs/STAGE3_RATINGS.md.
  *
- * По расписанию — current_ratings (nkr/nra/expert_ra) раз в сутки, не
- * одновременно друг с другом (вежливость к чужим серверам, та же логика,
- * что и у check_fns_blocks.php); *-news — раз в ~30 минут (окно по
- * умолчанию 6 часов с запасом с лихвой перекрывает такой интервал):
- *   0 5 * * * /usr/bin/php /path/to/bondkeeper/bin/seed_ratings.php --agency=nkr >> /var/log/bondkeeper/seed_ratings_nkr.log 2>&1
- *   30 5 * * * /usr/bin/php /path/to/bondkeeper/bin/seed_ratings.php --agency=nra >> /var/log/bondkeeper/seed_ratings_nra.log 2>&1
+ * По расписанию — по одному агентству за раз, не одновременно
+ * (вежливость к чужим серверам, та же логика, что и у check_fns_blocks.php).
+ * expert_ra (текущие рейтинги, ПОЛНЫЙ обход сайта — не путать с
+ * expert_ra-news) поставлен пораньше и с запасом (около часа на сам
+ * прогон), чтобы не пересекаться с check_fns_blocks.php в 8:00:
  *   0 6 * * * /usr/bin/php /path/to/bondkeeper/bin/seed_ratings.php --agency=expert_ra >> /var/log/bondkeeper/seed_ratings_expert_ra.log 2>&1
- *   0,30 * * * * /usr/bin/php /path/to/bondkeeper/bin/seed_ratings.php --agency=nkr-news >> /var/log/bondkeeper/seed_ratings_nkr_news.log 2>&1
- *   3,33 * * * * /usr/bin/php /path/to/bondkeeper/bin/seed_ratings.php --agency=expert_ra-news >> /var/log/bondkeeper/seed_ratings_expert_ra_news.log 2>&1
  *
- * (expert_ra-news сдвинут на 3 минуты от круглой границы получаса, чтобы
- * не стартовать одновременно с nkr-news — оба ходят в сеть, но к разным
- * сайтам, так что реальной необходимости строго разносить нет, разве что
- * ради чуть более читаемых логов.)
+ * nkr-news, nra, expert_ra-news — ЕСЛИ на сервере есть обычный OS cron:
+ *   * /30 * * * *  /usr/bin/php /path/to/bondkeeper/bin/seed_ratings.php --agency=nkr-news --days=2       >> /var/log/bondkeeper/seed_ratings_nkr_news.log 2>&1
+ *   50 6 * * *     /usr/bin/php /path/to/bondkeeper/bin/seed_ratings.php --agency=nkr-news --days=14      >> /var/log/bondkeeper/seed_ratings_nkr_news_deep.log 2>&1
+ *   * /30 * * * *  /usr/bin/php /path/to/bondkeeper/bin/seed_ratings.php --agency=nra                     >> /var/log/bondkeeper/seed_ratings_nra.log 2>&1
+ *   * /30 * * * *  /usr/bin/php /path/to/bondkeeper/bin/seed_ratings.php --agency=expert_ra-news --days=2  >> /var/log/bondkeeper/seed_ratings_expert_ra_news.log 2>&1
+ *   55 6 * * *     /usr/bin/php /path/to/bondkeeper/bin/seed_ratings.php --agency=expert_ra-news --days=14 >> /var/log/bondkeeper/seed_ratings_expert_ra_news_deep.log 2>&1
+ * (у nra нет отдельного "глубокого" прогона — она не делает запрос на
+ * КАЖДУЮ строку, дедуп по rating_news_log сам решает, что уже обработано,
+ * узкое "частое" окно тут не даёт экономии. У expert_ra-news такой запрос
+ * теперь есть — тот же случай, что и у nkr-news).
+ *
+ * ЕСЛИ доступа к OS cron нет (или он не гарантирован) — вместо этих
+ * crontab-строк самостоятельные процессы с циклом: bin/daemon_nkr_news.php
+ * и bin/daemon_expert_ra_news.php (оба чередуют частый/глубокий проход),
+ * bin/daemon_nra.php (простой цикл каждые 30 минут, без деления).
  */
 
 require __DIR__ . '/bootstrap.php';
 
 use BondKeeper\Database;
 use BondKeeper\Ratings\AcraImporter;
-use BondKeeper\Ratings\CurrentRatingsStore;
 use BondKeeper\Ratings\ExpertRaClient;
 use BondKeeper\Ratings\ExpertRaImporter;
 use BondKeeper\Ratings\ExpertRaNewsImporter;
@@ -110,7 +132,7 @@ $agency = null;
 $delayMs = 400;
 $file = null;
 $full = false;
-$windowHours = 6;
+$days = null; // null => используем дефолт конкретного импортёра (разный для nkr-news/expert_ra-news)
 foreach ($argv as $arg) {
     if (str_starts_with($arg, '--agency=')) {
         $agency = substr($arg, strlen('--agency='));
@@ -121,8 +143,8 @@ foreach ($argv as $arg) {
     if (str_starts_with($arg, '--file=')) {
         $file = substr($arg, strlen('--file='));
     }
-    if (str_starts_with($arg, '--window-hours=')) {
-        $windowHours = (int) substr($arg, strlen('--window-hours='));
+    if (str_starts_with($arg, '--days=')) {
+        $days = (int) substr($arg, strlen('--days='));
     }
     if ($arg === '--full') {
         $full = true;
@@ -130,7 +152,7 @@ foreach ($argv as $arg) {
 }
 
 if ($agency === null) {
-    fwrite(STDERR, "Использование: php bin/seed_ratings.php --agency=nkr|nra|expert_ra|acra|manual|nkr-news|expert_ra-news [--delay-ms=400] [--file=...] [--window-hours=6] [--full]\n");
+    fwrite(STDERR, "Использование: php bin/seed_ratings.php --agency=nkr|nra|expert_ra|acra|manual|nkr-news|expert_ra-news [--delay-ms=400] [--file=...] [--full] [--days=2]\n");
     exit(1);
 }
 
@@ -164,10 +186,10 @@ switch ($agency) {
         (new ManualRatingsImporter($db, $matcher))->importFromFile($file);
         break;
     case 'nkr-news':
-        (new NkrNewsImporter($matcher, new RatingActionsWriter($db), new CurrentRatingsStore($db)))->import($windowHours, $full);
+        (new NkrNewsImporter($db, $matcher, new RatingActionsWriter($db)))->import($full, $days ?? 2);
         break;
     case 'expert_ra-news':
-        (new ExpertRaNewsImporter($matcher, new RatingActionsWriter($db), new CurrentRatingsStore($db), new ExpertRaClient(), $delayMs * 1000))->import($windowHours, $full);
+        (new ExpertRaNewsImporter($db, $matcher, new RatingActionsWriter($db), new ExpertRaClient(), $delayMs * 1000))->import($full, $days ?? 2);
         break;
     default:
         fwrite(STDERR, "Неизвестное агентство: {$agency}. Поддерживаются: nkr, nra, expert_ra, acra, manual, nkr-news, expert_ra-news.\n");
