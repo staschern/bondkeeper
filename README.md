@@ -65,6 +65,7 @@ config/fns_watchlist.txt             — список ИНН для ежедне
 bin/debug_iss_security.php           — разовая диагностика сырого ответа ISS API по ISIN
 bin/debug_rating_page.php            — разовая диагностика структуры страницы рейтингового агентства (этап 3, см. docs/STAGE3_RATINGS.md)
 bin/debug_acra_news.php              — разведка/сухой прогон парсинга новостей АКРА с сайта (без БД, без записи — см. docs/STAGE3_RATINGS.md)
+bin/debug_acra_ratings.php           — разведка списка/карточки эмитента и пагинации АКРА current_ratings (без БД, без записи — см. docs/STAGE3_RATINGS.md)
 ```
 
 ## Запуск
