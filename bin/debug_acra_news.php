@@ -44,7 +44,8 @@ use BondKeeper\Ratings\AcraNewsTitleParser;
 use BondKeeper\Ratings\RatingsHttp;
 use BondKeeper\Ratings\RatingsNormalizer;
 
-const LIST_URL = 'https://www.acra-ratings.ru/press-releases/';
+const BASE_URL = 'https://www.acra-ratings.ru';
+const LIST_URL = BASE_URL . '/press-releases/';
 const DELAY_SECONDS = 2;
 
 $explicitDetailUrl = $argv[1] ?? null;
@@ -143,6 +144,15 @@ function parseListPage(string $html): array
         $link = $links->item(0);
         $title = trim(preg_replace('/\s+/u', ' ', $link->textContent) ?? '');
         $href = $link->getAttribute('href');
+        // Живой сайт отдаёт ОТНОСИТЕЛЬНЫЕ ссылки ("/press-releases/7242/")
+        // — в отличие от сохранённых браузером страниц, где браузер сам
+        // подставляет полный адрес при сохранении. Достраиваем домен,
+        // если его нет (найдено вживую при первом прогоне на сервере
+        // пользователя — без этой правки RatingsHttp::get() падал с
+        // "No host part in the URL").
+        if ($href !== '' && !str_starts_with($href, 'http')) {
+            $href = BASE_URL . $href;
+        }
 
         $dateNodes = $xpath->query('.//div[@data-type="date"]', $row);
         $dateRaw = $dateNodes->length > 0 ? trim(preg_replace('/\s+/u', ' ', $dateNodes->item(0)->textContent) ?? '') : '';
