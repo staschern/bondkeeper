@@ -51,6 +51,7 @@ src/Ratings/NkrTitleParser.php       — чистый (без БД/сети) р�
 src/Ratings/NkrNewsImporter.php      — rating_actions из истории пресс-релизов НКР, скользящее окно (--days)
 src/Ratings/ExpertRaNewsImporter.php — rating_actions из ленты пресс-релизов Эксперт РА, скользящее окно (--days), сопоставление по ИНН со страницы релиза + запасной путь по имени
 src/Ratings/AcraEmailParser.php      — ШАБЛОН: разбор текста писем АКРА "Новое рейтинговое действие" (чистая функция, IMAP-часть ещё не реализована — см. docs/STAGE3_RATINGS.md)
+src/Ratings/AcraNewsTitleParser.php  — РАЗВЕДКА: разбор заголовков пресс-релизов АКРА с сайта (чистая функция, проверена на 10 реальных заголовках; не подключена к БД — см. bin/debug_acra_news.php и docs/STAGE3_RATINGS.md)
 bin/seed_market.php                  — запуск сидирования справочника (шаг 1)
 bin/seed_bondization.php             — запуск сидирования графика выплат (шаг 2)
 bin/seed_offers.php                  — запуск сидирования оферт (шаг 3)
@@ -62,6 +63,7 @@ bin/check_fns_blocks.php             — точечная/по расписан�
 config/fns_watchlist.txt             — список ИНН для ежедневного cron-прогона check_fns_blocks.php
 bin/debug_iss_security.php           — разовая диагностика сырого ответа ISS API по ISIN
 bin/debug_rating_page.php            — разовая диагностика структуры страницы рейтингового агентства (этап 3, см. docs/STAGE3_RATINGS.md)
+bin/debug_acra_news.php              — разведка/сухой прогон парсинга новостей АКРА с сайта (без БД, без записи — см. docs/STAGE3_RATINGS.md)
 ```
 
 ## Запуск
