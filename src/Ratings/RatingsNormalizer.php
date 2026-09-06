@@ -297,6 +297,44 @@ final class RatingsNormalizer
     }
 
     /**
+     * АКРА на странице списка рейтингуемых лиц (acra-ratings.ru/ratings/
+     * issuers/, источник current_ratings для AcraImporter) иногда даёт
+     * статус "под наблюдением" НЕ отдельной колонкой (как НРА) и не
+     * глагольной прозой пресс-релиза/письма (как в AcraEmailParser), а
+     * СЛИТНО, через запятую, прямо в значении прогноза: "Позитивный, под
+     * наблюдением" / "Развивающийся, под наблюдением" — проверено вживую
+     * на реальных примерах (сентябрь 2026: ООО «АЛЬФА-ЛИЗИНГ» и другие
+     * строки того же списка). Без суффикса — поведение как у обычного
+     * mapOutlook() (полностью обратная совместимость).
+     *
+     * "..., снято с наблюдения" в этом же слитном формате живьём НЕ
+     * встретилось — обработано по аналогии с тем же правилом, что уже
+     * есть у НРА (combineWithWatchStatus()): база есть → сама база,
+     * базы нет → review_concluded. Непроверено вживую, помечено в докблоке
+     * AcraImporter.
+     */
+    public static function combineOutlookWithAcraWatchSuffix(string $raw): ?string
+    {
+        $raw = trim($raw);
+
+        if (preg_match('/^(.*?),\s*под\s+наблюдением\s*$/ui', $raw, $m)) {
+            return match (self::mapOutlook(trim($m[1]))) {
+                'negative' => 'under_review_negative',
+                'positive' => 'under_review_positive',
+                'stable' => 'under_review_stable',
+                'developing' => 'under_review_developing',
+                default => 'under_review',
+            };
+        }
+
+        if (preg_match('/^(.*?),\s*снято\s+с\s+наблюдения\s*$/ui', $raw, $m)) {
+            return self::mapOutlook(trim($m[1])) ?? 'review_concluded';
+        }
+
+        return self::mapOutlook($raw);
+    }
+
+    /**
      * Заголовки/подзаголовки новостей — не отдельное поле с одним словом
      * (как у mapOutlook()), а свободный текст с русскими падежными
      * окончаниями: "прогноз изменён на стабильный", "со стабильным
@@ -320,5 +358,32 @@ final class RatingsNormalizer
             (bool) preg_match('/развивающ|неопределенн|неопределённ/u', $text) => 'developing',
             default => null,
         };
+    }
+
+    /**
+     * У НКР одно и то же "текущий рейтинг отозван" пишется в
+     * current_ratings.rating ДВУМЯ разными импортёрами по-разному:
+     * NkrNewsImporter (через NkrTitleParser::extractRatingChange()) для
+     * глагола "отозвало" пишет наш собственный литерал 'отозван', а
+     * NkrImporter (полная Excel-выгрузка ratings.ru/issuers.php) раньше
+     * копировал колонку "Rating" дословно как есть — если сам НКР пишет
+     * там "Рейтинг отозван" (а не просто "отозван"), то у одного и того
+     * же эмитента текст в current_ratings.rating зависел от того, какой
+     * из двух импортёров прогонялся последним (оба пишут в один
+     * ON DUPLICATE KEY UPDATE) — архитектурная нестыковка, найденная
+     * пользователем, не разовый баг. Нормализуем текст отзыва здесь, в
+     * ОДНОМ месте: любое написание со словом "отозван" (падеж/порядок
+     * слов не важны) сводится к тому же самому литералу 'отозван', что
+     * уже год пишет NkrNewsImporter — оба импортёра теперь дают
+     * одинаковое значение независимо от порядка прогонов.
+     */
+    public static function normalizeWithdrawnRatingText(string $raw): string
+    {
+        $trimmed = trim($raw);
+        if (preg_match('/отозван/ui', $trimmed)) {
+            return 'отозван';
+        }
+
+        return mb_substr($trimmed, 0, 20);
     }
 }

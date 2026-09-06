@@ -26,6 +26,16 @@ use RuntimeException;
  * "inn" может быть null (пример: "город Томск" — у муниципалитета нет
  * ИНН юрлица в привычном смысле) — такие строки честно пропускаются,
  * без попытки сопоставить по названию.
+ *
+ * === Статус "под наблюдением" (адаптация под общую ENUM-логику, сентябрь 2026) ===
+ *
+ * "forecast" из выгрузки иногда содержит статус наблюдения СЛИТНО с
+ * направлением прогноза через запятую — "Позитивный, под наблюдением"
+ * (проверено вживую на acra-ratings.ru/ratings/issuers/: ООО
+ * «АЛЬФА-ЛИЗИНГ» и другие строки того же списка). RatingsNormalizer::
+ * combineOutlookWithAcraWatchSuffix() распознаёт этот формат (подробности
+ * и оговорка про непроверенный "снято с наблюдения" — в её докблоке);
+ * без суффикса ведёт себя как прежний mapOutlook().
  */
 final class AcraImporter
 {
@@ -105,7 +115,7 @@ final class AcraImporter
             'issuer_id' => $issuerId,
             'agency' => self::AGENCY,
             'rating' => mb_substr(trim((string) ($row['rating'] ?? '')), 0, 20),
-            'outlook' => RatingsNormalizer::mapOutlook((string) ($row['forecast'] ?? '')),
+            'outlook' => RatingsNormalizer::combineOutlookWithAcraWatchSuffix((string) ($row['forecast'] ?? '')),
             'last_action_date' => $date,
         ]);
 

@@ -17,8 +17,14 @@ use RuntimeException;
  *
  * Особенности этого формата (в отличие от остальных источников):
  * - `outlook` уже приходит в словаре схемы (stable/positive/negative/
- *   developing), а не на русском — не пропускаем через
- *   RatingsNormalizer::mapOutlook(), а просто проверяем на допустимость.
+ *   developing/under_review[_negative|_positive|_stable|_developing]/
+ *   review_concluded — полный ENUM current_ratings.outlook, миграция 017),
+ *   а не на русском — не пропускаем через RatingsNormalizer::mapOutlook(),
+ *   а просто проверяем на допустимость (VALID_OUTLOOKS). До сентября
+ *   2026 список допустимых значений включал только 4 базовых направления
+ *   — без под_review-вариантов ручной файл не мог занести статус "на
+ *   пересмотре"/"под наблюдением" (строка тихо отклонялась как
+ *   "недопустимый outlook"), хотя сама БД такие значения уже принимала.
  * - `last_action_date` — не ДД.ММ.ГГГГ и не "28 авг 2026", а порядковый
  *   номер дня Excel (xlsx хранит дату как число, XlsxReader формат
  *   ячейки не разбирает) — RatingsNormalizer::parseExcelSerialDate().
@@ -33,7 +39,11 @@ use RuntimeException;
 final class ManualRatingsImporter
 {
     private const VALID_AGENCIES = ['nra', 'acra', 'expert_ra', 'nkr'];
-    private const VALID_OUTLOOKS = ['positive', 'stable', 'negative', 'developing'];
+    private const VALID_OUTLOOKS = [
+        'positive', 'stable', 'negative', 'developing',
+        'under_review', 'under_review_negative', 'under_review_positive',
+        'under_review_stable', 'under_review_developing', 'review_concluded',
+    ];
 
     private int $totalRows = 0;
     private int $skippedNoInn = 0;
