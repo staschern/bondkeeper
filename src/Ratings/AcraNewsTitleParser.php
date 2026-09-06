@@ -209,6 +209,27 @@ final class AcraNewsTitleParser
         ));
     }
 
+    /**
+     * ISIN конкретного выпуска облигаций прямо в скобках в заголовке —
+     * реальные примеры: "...ВЫПУСКА ОБЛИГАЦИЙ АО «РОССЕЛЬХОЗБАНК»
+     * (RU000A103N84) В СВЯЗИ С ПОГАШЕНИЕМ...", "...ОБЛИГАЦИЙ РОСТОВСКОЙ
+     * ОБЛАСТИ (RU000A10FZZ1) КРЕДИТНЫЙ РЕЙТИНГ...". Второй пример —
+     * именно тот случай, ради которого это нужно: у региона нет ни ИНН
+     * (см. AcraNewsImporter — на детальной странице поле "Идентификационный
+     * номер..." для муниципальных облигаций пусто), ни названия в
+     * кавычках (RatingsNormalizer::extractQuotedNames() тут вернёт []) —
+     * ISIN остаётся ЕДИНСТВЕННЫМ способом сопоставить такую строку с
+     * securities.isin (см. IssuerMatcher::findIssuerIdByIsin()).
+     */
+    public static function extractIsin(string $title): ?string
+    {
+        if (preg_match('/\(([A-Z]{2}[A-Z0-9]{9}\d)\)/', $title, $m)) {
+            return $m[1];
+        }
+
+        return null;
+    }
+
     private static function isValidGradeShape(string $normalized): bool
     {
         return (bool) preg_match('/^e?(?:' . implode('|', self::GRADE_WORDS) . ')[+\-]?(?:\(RU\))?$/', $normalized);
