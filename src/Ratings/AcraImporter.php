@@ -8,25 +8,6 @@ use BondKeeper\Support\Logger;
 use PDO;
 use RuntimeException;
 
-/**
- * current_ratings из JSON-файла, который пользователь готовит САМ, не
- * автоматизированным опросом сайта АКРА — см. docs/STAGE3_RATINGS.md:
- * www.acra-ratings.ru блокирует автоматические запросы через 2-3
- * попытки (WAF + Yandex SmartCaptcha), и этот проект принципиально не
- * обходит защиту от ботов ни для какого источника (та же граница, что
- * действовала для service.nalog.ru с самого начала). Этот импортёр
- * никогда не обращается к acra-ratings.ru сам — только читает уже
- * готовый локальный файл.
- *
- * Формат файла — массив объектов, подтверждён на реальном примере
- * (acra_issuers_smoketest.json, август 2026):
- *   [{"id":46608,"company":"ПАО \"БАНК ПСБ\"","inn":"7744000912",
- *     "rating":"AAA(RU)","forecast":"Стабильный","date":"28 авг 2026",
- *     "url":"https://www.acra-ratings.ru/ratings/issuers/24/"}, ...]
- * "inn" может быть null (пример: "город Томск" — у муниципалитета нет
- * ИНН юрлица в привычном смысле) — такие строки честно пропускаются,
- * без попытки сопоставить по названию.
- */
 final class AcraImporter
 {
     private const AGENCY = 'acra';
@@ -36,7 +17,6 @@ final class AcraImporter
     private int $skippedNoDate = 0;
     private int $matched = 0;
     private int $unmatchedNoIssuer = 0;
-    /** @var array<int, string> */
     private array $unmatchedNames = [];
 
     public function __construct(
@@ -66,7 +46,6 @@ final class AcraImporter
         $this->printReport();
     }
 
-    /** @param mixed $row */
     private function importRow($row): void
     {
         if (!is_array($row)) {
