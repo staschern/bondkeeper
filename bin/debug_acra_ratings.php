@@ -85,40 +85,53 @@ if ($rows === []) {
 $pagesFound = countPaginationPages($html);
 echo "\nСтраниц пагинации найдено в HTML (кнопки 1,2,3...): {$pagesFound}\n";
 
-if ($rows !== []) {
-    $detailUrl = $rows[0]['url'];
-    echo "\n========== Карточка эмитента (первая из списка): {$detailUrl} ==========\n";
-    sleep(DELAY_SECONDS);
-    $detailHtml = httpGet($detailUrl, $cookieJar);
-    if ($detailHtml === null) {
-        echo "ОШИБКА при получении карточки.\n";
-    } else {
-        echo 'HTTP OK, размер ответа: ' . strlen($detailHtml) . " байт\n";
-        $info = parseInfoBlocks($detailHtml);
-        foreach ($info as $label => $value) {
-            echo "  {$label}: {$value}\n";
-        }
-        echo '  ИНН, извлечённый явно: ' . ($info['ИНН'] ?? '(не найден)') . "\n";
+// Известный реальный URL карточки эмитента (ООО «МПК», из присланного
+// архива) — используем как запасной вариант, если список страницы 1
+// пуст (SPA-заглушка), чтобы всё равно проверить, отдаётся ли карточка
+// эмитента обычным GET-ом без JS.
+$detailUrl = $rows !== [] ? $rows[0]['url'] : 'https://acra-ratings.ru/ratings/issuers/803/';
+echo "\n========== Карточка эмитента (" . ($rows !== [] ? 'первая из списка' : 'известный ID из архива, т.к. список пуст') . "): {$detailUrl} ==========\n";
+sleep(DELAY_SECONDS);
+$detailHtml = httpGet($detailUrl, $cookieJar);
+if ($detailHtml === null) {
+    echo "ОШИБКА при получении карточки.\n";
+} else {
+    echo 'HTTP OK, размер ответа: ' . strlen($detailHtml) . " байт\n";
+    $info = parseInfoBlocks($detailHtml);
+    echo 'Найдено блоков info-bottom: ' . count($info) . "\n";
+    foreach ($info as $label => $value) {
+        echo "  {$label}: {$value}\n";
+    }
+    echo '  ИНН, извлечённый явно: ' . ($info['ИНН'] ?? '(не найден)') . "\n";
+    if ($info === []) {
+        printSpaDiagnostics($detailHtml);
     }
 }
 
-if ($pagesFound > 1) {
-    echo "\n========== Попытка страницы 2 через AJAX (POST " . AJAX_URL . ') ==========' . "\n";
+// Пробуем AJAX-пагинацию НЕЗАВИСИМО от того, что нашлось в статичном
+// HTML: раз список — SPA-заглушка, вполне может быть, что ДАЖЕ страница
+// 1 реально приходит только через этот эндпоинт (а не через
+// server-side рендер, как у новостей). Поэтому пробуем page=1, а затем,
+// если через AJAX что-то похожее на данные пришло, ещё и page=2.
+foreach ([1, 2] as $ajaxPage) {
+    echo "\n========== Попытка страницы {$ajaxPage} через AJAX (POST " . AJAX_URL . ') ==========' . "\n";
     sleep(DELAY_SECONDS);
-    $ajaxBody = http_build_query(['text' => '', 'page' => 2, 'sort' => '', 'count' => 10]);
+    $ajaxBody = http_build_query(['text' => '', 'page' => $ajaxPage, 'sort' => '', 'count' => 10]);
     $ajaxResponse = httpPost(AJAX_URL, $ajaxBody, $cookieJar);
     if ($ajaxResponse === null) {
         echo "ОШИБКА при AJAX-запросе (см. предупреждения выше, если были).\n";
+        continue;
+    }
+    echo 'HTTP-ответ получен, размер: ' . strlen($ajaxResponse) . " байт\n";
+    echo "Первые 2000 символов сырого ответа (для диагностики формата):\n";
+    echo substr($ajaxResponse, 0, 2000) . "\n";
+    $decoded = json_decode($ajaxResponse, true);
+    if (json_last_error() === JSON_ERROR_NONE) {
+        echo "\n--- Это валидный JSON. Верхнеуровневые ключи: " . implode(', ', array_keys((array) $decoded)) . " ---\n";
     } else {
-        echo 'HTTP-ответ получен, размер: ' . strlen($ajaxResponse) . " байт\n";
-        echo "Первые 2000 символов сырого ответа (для диагностики формата):\n";
-        echo substr($ajaxResponse, 0, 2000) . "\n";
-        $decoded = json_decode($ajaxResponse, true);
-        if (json_last_error() === JSON_ERROR_NONE) {
-            echo "\n--- Это валидный JSON. Верхнеуровневые ключи: " . implode(', ', array_keys((array) $decoded)) . " ---\n";
-        } else {
-            echo "\n--- Это НЕ валидный JSON (json_decode: " . json_last_error_msg() . ") — либо HTML-фрагмент, либо ошибка/капча. ---\n";
-        }
+        echo "\n--- Это НЕ валидный JSON (json_decode: " . json_last_error_msg() . ") — либо HTML-фрагмент, либо ошибка/капча. ---\n";
+        $ajaxRows = parseListPage($ajaxResponse);
+        echo 'Если это HTML-фрагмент со строками списка (та же разметка, что и на странице 1): найдено карточек = ' . count($ajaxRows) . "\n";
     }
 }
 
