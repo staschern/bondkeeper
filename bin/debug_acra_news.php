@@ -7,25 +7,25 @@ declare(strict_types=1);
  * без записи куда-либо) парсинга новостей АКРА, по образцу
  * bin/debug_rating_page.php и bin/simulate_nkr_news.php.
  *
- * Зачем отдельный скрипт, а не сразу импортёр: ключевой открытый вопрос —
- * отдаёт ли acra-ratings.ru реальный контент (список пресс-релизов,
- * текст детальной страницы) на ОБЫЧНЫЙ HTTP-запрос (как делают все
- * остальные импортёры этого проекта — RatingsHttp::get(), без cookie-
- * сессии/JS/капчи), или это по-прежнему SPA-заглушка, требующая браузера
+ * Первый прогон на сервере пользователя (сентябрь 2026) уже подтвердил:
+ * список пресс-релизов И одна детальная страница отдают РЕАЛЬНЫЙ
+ * контент на обычный HTTP-запрос (RatingsHttp::get(), без cookie-
+ * сессии/JS/капчи) — тот же вопрос, что был открытым для current_ratings
  * (см. docs/STAGE3_RATINGS.md, разделы «АКРА — закрыта»/«АКРА —
- * переоткрыта» — там curl с моей стороны получал 0 таблиц и общие
- * Bitrix-классы без данных). Разбор ЗАГОЛОВКОВ (AcraNewsTitleParser)
- * уже проверен на 10 реальных примерах, присланных пользователем как
- * сохранённые вживую страницы браузера — но это не то же самое, что
- * ответ на автоматический запрос без браузера/сессии/капчи.
+ * переоткрыта», там curl получал 0 таблиц и SPA-заглушку), для этого
+ * раздела сайта, похоже, не встаёт так же остро. Разбор ЗАГОЛОВКОВ
+ * (AcraNewsTitleParser) подтверждён на 10 реальных примерах архива +
+ * 2 живых детальных страницах.
  *
- * Скрипт делает МИНИМУМ запросов (1 список + 1 деталь, с паузой между
- * ними — не имитация браузера и не попытка обойти защиту, а просто
- * вежливая пауза, как и у всех остальных источников этого проекта) и
- * печатает всё, что нужно для диагностики: HTTP-код, размер ответа,
- * найдены ли реальные карточки списка или SPA-заглушка (та же проверка,
- * что в debug_rating_page.php — тройка/topClasses), и, если данные
- * нашлись, — что распарсил AcraNewsTitleParser на них.
+ * Оставшийся открытый вопрос — НЕ "отдаёт ли сайт данные вообще" (уже
+ * подтверждено), а "не заблокирует ли сайт после НЕСКОЛЬКИХ запросов
+ * подряд" (WAF документирован как блокирующий именно ПОСЛЕ 2-3 попыток
+ * для других разделов сайта — 1-2 запроса это ещё не проверяет). Полный
+ * AcraNewsImporter на каждый прогон будет делать 1 запрос к списку + до
+ * 10 запросов к деталям (по числу новых карточек в окне) — это и есть
+ * $argv[1] === '--all-details': прогоняет ВСЕ карточки списка с паузой
+ * между каждой, а не только первую, воспроизводя более тяжёлый реальный
+ * сценарий одним запуском.
  *
  * НИЧЕГО не пишет в БД — только читает bin/bootstrap.php ради автозагрузки
  * классов (RatingsHttp/RatingsNormalizer/AcraNewsTitleParser/Logger), к
@@ -34,8 +34,9 @@ declare(strict_types=1);
  * файла нет.
  *
  * Запуск:
- *   php bin/debug_acra_news.php
- *   php bin/debug_acra_news.php https://www.acra-ratings.ru/press-releases/7241/   (только одна конкретная деталь)
+ *   php bin/debug_acra_news.php                     (список + первая деталь, подробно)
+ *   php bin/debug_acra_news.php URL                  (список + конкретная деталь, подробно)
+ *   php bin/debug_acra_news.php --all-details        (список + ВСЕ детали из списка, кратко на каждую)
  */
 
 require __DIR__ . '/bootstrap.php';
@@ -48,7 +49,8 @@ const BASE_URL = 'https://www.acra-ratings.ru';
 const LIST_URL = BASE_URL . '/press-releases/';
 const DELAY_SECONDS = 2;
 
-$explicitDetailUrl = $argv[1] ?? null;
+$allDetails = in_array('--all-details', $argv, true);
+$explicitDetailUrl = ($argv[1] ?? null) !== '--all-details' ? ($argv[1] ?? null) : null;
 
 echo "========== Список: " . LIST_URL . " ==========\n";
 $listCandidates = [];
@@ -71,6 +73,45 @@ try {
     echo 'ОШИБКА при получении списка: ' . $e->getMessage() . "\n";
 }
 
+if ($allDetails) {
+    if ($listCandidates === []) {
+        echo "\nСписок пуст — нечего прогонять через --all-details.\n";
+        exit(0);
+    }
+
+    echo "\n========== --all-details: " . count($listCandidates) . " детальных страниц подряд (пауза " . DELAY_SECONDS . " сек между запросами) ==========\n";
+    $okCount = 0;
+    $failCount = 0;
+    foreach ($listCandidates as $i => $c) {
+        sleep(DELAY_SECONDS);
+        $n = $i + 1;
+        try {
+            $html = RatingsHttp::get($c['url'], 30);
+            $parsed = parseDetailPage($html);
+            $verb = $parsed['title'] !== null ? AcraNewsTitleParser::matchVerb($parsed['title']) : null;
+            $grade = $verb !== null ? AcraNewsTitleParser::extractGrade($parsed['title'], $verb) : null;
+            $outlook = $parsed['title'] !== null ? AcraNewsTitleParser::extractOutlook($parsed['title']) : null;
+            echo sprintf(
+                "  #%d OK  размер=%d байт  дата=%s  ИНН=%s  глагол=%s  грейд=%s  прогноз=%s\n",
+                $n,
+                strlen($html),
+                $parsed['date'] ?? '?',
+                $parsed['inn'] ?? '(нет)',
+                $verb ?? '?',
+                $grade ?? '?',
+                $outlook ?? '(нет)',
+            );
+            $okCount++;
+        } catch (\Throwable $e) {
+            echo "  #{$n} ОШИБКА: {$c['url']} — {$e->getMessage()}\n";
+            $failCount++;
+        }
+    }
+    echo "\nИтого: {$okCount} успешно, {$failCount} с ошибкой из " . count($listCandidates) . ".\n";
+    echo "Если хотя бы одна из последних (более поздних по порядку запроса) страниц провалилась с признаками капчи/403/пустого ответа, а первые прошли нормально — это и есть WAF, включившийся после нескольких запросов подряд.\n";
+    exit(0);
+}
+
 $detailUrl = $explicitDetailUrl ?? ($listCandidates[0]['url'] ?? null);
 if ($detailUrl === null) {
     echo "\nНет URL детальной страницы для проверки (ни явно передан, ни найден в списке) — на этом всё.\n";
@@ -83,28 +124,16 @@ try {
     $html = RatingsHttp::get($detailUrl, 30);
     echo 'HTTP OK, размер ответа: ' . strlen($html) . " байт\n";
 
-    $doc = new DOMDocument();
-    libxml_use_internal_errors(true);
-    $doc->loadHTML('<?xml encoding="utf-8"?>' . $html);
-    libxml_clear_errors();
-    $xpath = new DOMXPath($doc);
-
-    $titleNode = $xpath->query('//h1')->item(0) ?? $xpath->query('//title')->item(0);
-    $title = $titleNode !== null ? trim(preg_replace('/\s+/u', ' ', $titleNode->textContent) ?? '') : null;
-    echo 'Заголовок (h1 или <title>): ' . ($title ?? '(не найден)') . "\n";
-
-    $timeNodes = $xpath->query('//time[contains(@class,"publication_date")]');
-    $rawDate = $timeNodes->length > 0 ? $timeNodes->item(0)->getAttribute('datetime') : null;
-    echo 'Дата публикации (time.publication_date[datetime]): ' . ($rawDate ?? '(не найдена)') . "\n";
-    if ($rawDate !== null) {
-        $parsedDate = RatingsNormalizer::parseDate(substr($rawDate, 0, 10));
-        echo '  => разобрано как: ' . ($parsedDate ?? '(не удалось разобрать формат даты)') . "\n";
+    $parsed = parseDetailPage($html);
+    echo 'Заголовок (h1 или <title>): ' . ($parsed['title'] ?? '(не найден)') . "\n";
+    echo 'Дата публикации (time.publication_date[datetime]): ' . ($parsed['rawDate'] ?? '(не найдена)') . "\n";
+    if ($parsed['date'] !== null) {
+        echo '  => разобрано как: ' . $parsed['date'] . "\n";
     }
+    echo 'ИНН (таблица "Регуляторное раскрытие"): ' . ($parsed['inn'] ?? '(не найден)') . "\n";
 
-    $inn = extractInnFromDisclosureTable($xpath);
-    echo 'ИНН (таблица "Регуляторное раскрытие"): ' . ($inn ?? '(не найден)') . "\n";
-
-    if ($title !== null) {
+    if ($parsed['title'] !== null) {
+        $title = $parsed['title'];
         echo "\n--- разбор заголовка через AcraNewsTitleParser ---\n";
         $verb = AcraNewsTitleParser::matchVerb($title);
         echo '  глагол: ' . ($verb ?? '(не распознан — заголовок не начинается с "АКРА <глагол>")') . "\n";
@@ -166,6 +195,27 @@ function parseListPage(string $html): array
     }
 
     return $rows;
+}
+
+/** @return array{title: ?string, rawDate: ?string, date: ?string, inn: ?string} */
+function parseDetailPage(string $html): array
+{
+    $doc = new DOMDocument();
+    libxml_use_internal_errors(true);
+    $doc->loadHTML('<?xml encoding="utf-8"?>' . $html);
+    libxml_clear_errors();
+    $xpath = new DOMXPath($doc);
+
+    $titleNode = $xpath->query('//h1')->item(0) ?? $xpath->query('//title')->item(0);
+    $title = $titleNode !== null ? trim(preg_replace('/\s+/u', ' ', $titleNode->textContent) ?? '') : null;
+
+    $timeNodes = $xpath->query('//time[contains(@class,"publication_date")]');
+    $rawDate = $timeNodes->length > 0 ? $timeNodes->item(0)->getAttribute('datetime') : null;
+    $date = $rawDate !== null ? RatingsNormalizer::parseDate(substr($rawDate, 0, 10)) : null;
+
+    $inn = extractInnFromDisclosureTable($xpath);
+
+    return ['title' => $title, 'rawDate' => $rawDate, 'date' => $date, 'inn' => $inn];
 }
 
 function extractInnFromDisclosureTable(DOMXPath $xpath): ?string
