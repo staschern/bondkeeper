@@ -105,10 +105,26 @@ declare(strict_types=1);
  *
  * По расписанию — по одному агентству за раз, не одновременно
  * (вежливость к чужим серверам, та же логика, что и у check_fns_blocks.php).
- * expert_ra (текущие рейтинги, ПОЛНЫЙ обход сайта — не путать с
- * expert_ra-news) поставлен пораньше и с запасом (около часа на сам
- * прогон), чтобы не пересекаться с check_fns_blocks.php в 8:00:
- *   0 6 * * * /usr/bin/php /path/to/bondkeeper/bin/seed_ratings.php --agency=expert_ra >> /var/log/bondkeeper/seed_ratings_expert_ra.log 2>&1
+ *
+ * Ежемесячный ПОЛНЫЙ пересбор current_ratings (по решению пользователя,
+ * сентябрь 2026) — не путать с частыми *-news/nra прогонами ниже: это
+ * разовая полная переустановка снимка с нуля, а не инкремент.
+ * --agency=nkr (читает единый Excel-экспорт целиком, вживую занимает
+ * несколько секунд) и --agency=expert_ra (ПОЛНЫЙ обход сайта по всем
+ * категориям + по карточке на каждую компанию — не путать с
+ * expert_ra-news; вживую ~30-50 минут, см. выше). --agency=nra здесь
+ * НЕ нужна: она уже гоняется каждые 30 минут (см. ниже) и сама
+ * инкрементально ловит все изменения — отдельный ежемесячный прогон
+ * был бы просто дублирующим повтором той же самой команды. Время —
+ * ночью, вне окна 5:00-17:00 (когда крутятся *-news/nra), чтобы
+ * гарантированно не пересекаться с ними независимо от того, на какой
+ * день недели попадёт 1-е число, и с разносом между собой (та же
+ * вежливость "по одному агентству за раз"):
+ *   0 1 1 * *  /usr/bin/php /path/to/bondkeeper/bin/seed_ratings.php --agency=nkr        >> /var/log/bondkeeper/seed_ratings_nkr.log 2>&1
+ *   15 1 1 * * /usr/bin/php /path/to/bondkeeper/bin/seed_ratings.php --agency=expert_ra  >> /var/log/bondkeeper/seed_ratings_expert_ra.log 2>&1
+ * (день месяца = 1, день недели = '*' — обычная ежемесячная семантика;
+ * если бы оба поля были ограничены одновременно, cron трактовал бы их
+ * через "ИЛИ", а не "И" — здесь этой ловушки нет).
  *
  * nkr-news, nra, expert_ra-news, acra-news — ЕСЛИ на сервере есть обычный OS cron:
  *   * /30 * * * *  /usr/bin/php /path/to/bondkeeper/bin/seed_ratings.php --agency=nkr-news --days=2       >> /var/log/bondkeeper/seed_ratings_nkr_news.log 2>&1
