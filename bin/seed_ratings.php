@@ -191,6 +191,25 @@ if ($agency === null) {
     exit(1);
 }
 
+// Блокировка от параллельного запуска ОДНОГО И ТОГО ЖЕ агентства — на
+// случай, если прогон когда-нибудь не уложится в интервал между двумя
+// срабатываниями крона (см. обсуждение в docs/STAGE3_RATINGS.md про
+// переход *-news на ежеминутный запуск: сейчас не переходим, но на
+// всякий случай подстраховываемся). Ключ — по имени агентства, не
+// глобальный: разные агентства и сегодня штатно бегают одновременно
+// (см. crontab-строки выше), это не то, от чего защищаемся. Второй
+// запуск того же агентства просто тихо завершается (exit 0, не ошибка).
+$lockDir = __DIR__ . '/../var/lock';
+if (!is_dir($lockDir)) {
+    @mkdir($lockDir, 0775, true);
+}
+$lockFile = $lockDir . '/seed_ratings_' . preg_replace('/[^a-zA-Z0-9_-]/', '_', $agency) . '.lock';
+$lockHandle = fopen($lockFile, 'c');
+if ($lockHandle === false || !flock($lockHandle, LOCK_EX | LOCK_NB)) {
+    Logger::info("Пропуск: другой прогон --agency={$agency} ещё не завершился.");
+    exit(0);
+}
+
 $db = Database::connection();
 $matcher = new IssuerMatcher($db);
 
