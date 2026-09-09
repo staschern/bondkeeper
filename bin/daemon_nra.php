@@ -17,8 +17,10 @@ declare(strict_types=1);
 require __DIR__ . '/bootstrap.php';
 
 use BondKeeper\Database;
+use BondKeeper\Events\EventPublisher;
 use BondKeeper\Ratings\IssuerMatcher;
 use BondKeeper\Ratings\NraImporter;
+use BondKeeper\Ratings\RatingActionsWriter;
 use BondKeeper\Support\Logger;
 
 const INTERVAL_SECONDS = 1800; // 30 минут
@@ -30,7 +32,7 @@ while (true) {
     try {
         $db = Database::connection();
         $matcher = new IssuerMatcher($db);
-        (new NraImporter($db, $matcher))->import();
+        (new NraImporter($db, $matcher, new RatingActionsWriter($db, new EventPublisher($db))))->import();
     } catch (\Throwable $e) {
         // Одна неудачная попытка не должна убивать весь процесс —
         // следующий прогон через обычный интервал попробует снова.

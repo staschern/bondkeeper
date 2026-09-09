@@ -145,11 +145,24 @@ declare(strict_types=1);
  * crontab-строк самостоятельные процессы с циклом: bin/daemon_nkr_news.php
  * и bin/daemon_expert_ra_news.php (оба чередуют частый/глубокий проход),
  * bin/daemon_nra.php (простой цикл каждые 30 минут, без деления).
+ *
+ * === Событийный движок (Этап 4, Фаза 1, сентябрь 2026) ===
+ *
+ * nkr-news/expert_ra-news/acra-news/nra — все четыре теперь проводят
+ * запись rating_actions через RatingActionsWriter, который после каждого
+ * апсерта публикует событие C5 (см. EventPublisher) БЕЗ фильтра
+ * существенности — даже "подтверждено без изменений" создаёт событие,
+ * это решение пользователя, не пробел. --agency=nkr/expert_ra/acra/manual
+ * (полные периодические выгрузки current_ratings, не из новостей) —
+ * событий НЕ создают и не должны: иначе один и тот же реальный релиз
+ * задвоился бы событием от новостного импортёра и ещё раз от следующего
+ * планового полного прогона. Подробности — docs/STAGE4_EVENT_ENGINE.md.
  */
 
 require __DIR__ . '/bootstrap.php';
 
 use BondKeeper\Database;
+use BondKeeper\Events\EventPublisher;
 use BondKeeper\Ratings\AcraImporter;
 use BondKeeper\Ratings\AcraNewsImporter;
 use BondKeeper\Ratings\ExpertRaClient;
@@ -220,7 +233,7 @@ switch ($agency) {
         (new NkrImporter($db, $matcher))->import();
         break;
     case 'nra':
-        (new NraImporter($db, $matcher))->import();
+        (new NraImporter($db, $matcher, new RatingActionsWriter($db, new EventPublisher($db))))->import();
         break;
     case 'expert_ra':
         (new ExpertRaImporter($db, $matcher, new ExpertRaClient(), $delayMs * 1000))->import();
@@ -240,13 +253,13 @@ switch ($agency) {
         (new ManualRatingsImporter($db, $matcher))->importFromFile($file);
         break;
     case 'nkr-news':
-        (new NkrNewsImporter($db, $matcher, new RatingActionsWriter($db)))->import($full, $days ?? 2);
+        (new NkrNewsImporter($db, $matcher, new RatingActionsWriter($db, new EventPublisher($db))))->import($full, $days ?? 2);
         break;
     case 'expert_ra-news':
-        (new ExpertRaNewsImporter($db, $matcher, new RatingActionsWriter($db), new ExpertRaClient(), $delayMs * 1000))->import($full, $days ?? 2);
+        (new ExpertRaNewsImporter($db, $matcher, new RatingActionsWriter($db, new EventPublisher($db)), new ExpertRaClient(), $delayMs * 1000))->import($full, $days ?? 2);
         break;
     case 'acra-news':
-        (new AcraNewsImporter($db, $matcher, new RatingActionsWriter($db)))->import($full, $days ?? 2);
+        (new AcraNewsImporter($db, $matcher, new RatingActionsWriter($db, new EventPublisher($db))))->import($full, $days ?? 2);
         break;
     default:
         fwrite(STDERR, "Неизвестное агентство: {$agency}. Поддерживаются: nkr, nra, expert_ra, acra, manual, nkr-news, expert_ra-news, acra-news.\n");

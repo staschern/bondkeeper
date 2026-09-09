@@ -66,6 +66,8 @@ bin/debug_iss_security.php           — разовая диагностика �
 bin/debug_rating_page.php            — разовая диагностика структуры страницы рейтингового агентства (этап 3, см. docs/STAGE3_RATINGS.md)
 bin/debug_acra_news.php              — разведка/сухой прогон парсинга новостей АКРА с сайта (без БД, без записи — см. docs/STAGE3_RATINGS.md)
 bin/debug_acra_ratings.php           — разведка списка/карточки эмитента и пагинации АКРА current_ratings (без БД, без записи — см. docs/STAGE3_RATINGS.md)
+src/Events/EventPublisher.php        — единственная точка создания events/raw_messages (C5 рейтинговые действия, E1 блокировки ФНС), этап 4, см. docs/STAGE4_EVENT_ENGINE.md
+tests/test_event_engine.php          — офлайн-проверка EventPublisher на SQLite (запуск: php -d extension=pdo_sqlite -d extension=mbstring tests/test_event_engine.php)
 ```
 
 ## Запуск

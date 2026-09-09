@@ -36,6 +36,7 @@ declare(strict_types=1);
 require __DIR__ . '/bootstrap.php';
 
 use BondKeeper\Database;
+use BondKeeper\Events\EventPublisher;
 use BondKeeper\Ratings\IssuerMatcher;
 use BondKeeper\Ratings\NkrNewsImporter;
 use BondKeeper\Ratings\RatingActionsWriter;
@@ -58,7 +59,7 @@ while (true) {
     try {
         $db = Database::connection();
         $matcher = new IssuerMatcher($db);
-        (new NkrNewsImporter($db, $matcher, new RatingActionsWriter($db)))->import(false, $days);
+        (new NkrNewsImporter($db, $matcher, new RatingActionsWriter($db, new EventPublisher($db))))->import(false, $days);
     } catch (\Throwable $e) {
         // Одна неудачная попытка (сеть, временная ошибка сайта агентства)
         // не должна убивать весь процесс — тот же принцип, что и у

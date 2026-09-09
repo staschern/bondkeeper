@@ -22,6 +22,7 @@ declare(strict_types=1);
 require __DIR__ . '/bootstrap.php';
 
 use BondKeeper\Database;
+use BondKeeper\Events\EventPublisher;
 use BondKeeper\Ratings\ExpertRaClient;
 use BondKeeper\Ratings\ExpertRaNewsImporter;
 use BondKeeper\Ratings\IssuerMatcher;
@@ -46,7 +47,7 @@ while (true) {
     try {
         $db = Database::connection();
         $matcher = new IssuerMatcher($db);
-        (new ExpertRaNewsImporter($db, $matcher, new RatingActionsWriter($db), new ExpertRaClient(), DELAY_MICROSECONDS))->import(false, $days);
+        (new ExpertRaNewsImporter($db, $matcher, new RatingActionsWriter($db, new EventPublisher($db)), new ExpertRaClient(), DELAY_MICROSECONDS))->import(false, $days);
     } catch (\Throwable $e) {
         // Одна неудачная попытка не должна убивать весь процесс —
         // следующий прогон через обычный интервал попробует снова.

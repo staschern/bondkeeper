@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace BondKeeper\Fns;
 
+use BondKeeper\Events\EventPublisher;
 use BondKeeper\Support\Logger;
 use PDO;
 
@@ -47,6 +48,26 @@ use PDO;
  * передаёт заведомо небольшой список и работает МЕДЛЕННО и БЕЗ прокси —
  * часть эмитентов будет пропущена капчей, это ожидаемо и честно
  * отражается как verification='error', а не как повод её обходить.
+ *
+ * === Событийный движок (Этап 4, сентябрь 2026) ===
+ *
+ * Перед апсертом читаем ТЕКУЩЕЕ состояние строки (fetchCurrentState()) —
+ * это и есть "было" для EventPublisher::publishFnsBlockChange(),
+ * вызываемого после успешной записи. Ровно 3 триггера события E1
+ * (решение пользователя, не любое изменение вообще): начало блокировки,
+ * изменение СУММЫ при уже активной блокировке, полное снятие. Смена
+ * ТОЛЬКО active_bank_count (число банков) без изменения суммы —
+ * пользователь явно решил, что это неважно для клиента, событие не
+ * создаётся. Неуспешная проверка (капча/сеть, markVerificationError())
+ * событие не создаёт вообще — мы не узнали ничего нового.
+ *
+ * fns_blocks.event_id проставляется отдельным UPDATE ПОСЛЕ публикации —
+ * той же строки, что только что апсертили (issuer_id тут первичный
+ * ключ, апсерт не создаёт вторую строку). Событие могло не создаться
+ * (ни один из 3 триггеров не сработал) — тогда UPDATE вообще не
+ * выполняется, старое значение event_id (если было — от предыдущего
+ * реального триггера) не трогается, а не затирается NULL'ом. Подробности
+ * — docs/STAGE4_EVENT_ENGINE.md.
  */
 final class FnsBlocksImporter
 {
@@ -58,6 +79,7 @@ final class FnsBlocksImporter
     public function __construct(
         private readonly NalogBiClientInterface $client,
         private readonly PDO $db,
+        private readonly EventPublisher $events,
         private readonly int $delaySeconds = 5,
     ) {
     }
@@ -121,6 +143,8 @@ final class FnsBlocksImporter
     /** @param array<int, array<string, mixed>> $rows */
     private function applyResult(int $issuerId, string $inn, array $rows): void
     {
+        $old = $this->fetchCurrentState($issuerId);
+
         $this->db->beginTransaction();
         try {
             $summary = $this->consolidateRows($rows);
@@ -195,6 +219,58 @@ final class FnsBlocksImporter
             $this->db->rollBack();
             throw $e;
         }
+
+        // Событие — уже ПОСЛЕ commit(): публикуем только то, что реально
+        // сохранилось, а не то, что могло откатиться при ошибке записи.
+        $eventId = $this->events->publishFnsBlockChange(
+            $issuerId,
+            $old['is_fns_blocked'],
+            $old['blocked_amount'],
+            $isBlocked,
+            $summary['blocked_amount'] ?? null,
+            $summary['active_bank_count'] ?? 0,
+            $summary['block_date'] ?? date('Y-m-d'),
+            $summary['reason'] ?? null,
+            $summary['source_reference'] ?? null,
+        );
+
+        // fns_blocks.event_id — только если событие реально создалось
+        // (один из 3 триггеров сработал). publishFnsBlockChange() уже
+        // содержит проверку фильтра существенности — здесь просто не
+        // трогаем строку, если он вернул null, а не затираем прежний
+        // event_id NULL'ом.
+        if ($eventId !== null) {
+            $this->db->prepare(
+                'UPDATE fns_blocks SET event_id = :event_id WHERE issuer_id = :issuer_id'
+            )->execute([
+                'event_id' => $eventId,
+                'issuer_id' => $issuerId,
+            ]);
+        }
+    }
+
+    /**
+     * "Было" для EventPublisher::publishFnsBlockChange() — читается ДО
+     * апсерта этой же строки fns_blocks (см. вызов в applyResult()).
+     * Строки ещё нет вообще (эмитент проверяется впервые) — трактуем как
+     * "не заблокирован", это и есть нейтральное начальное состояние.
+     *
+     * @return array{is_fns_blocked: bool, blocked_amount: ?string}
+     */
+    private function fetchCurrentState(int $issuerId): array
+    {
+        $stmt = $this->db->prepare('SELECT is_fns_blocked, blocked_amount FROM fns_blocks WHERE issuer_id = :issuer_id');
+        $stmt->execute(['issuer_id' => $issuerId]);
+        $row = $stmt->fetch();
+
+        if ($row === false) {
+            return ['is_fns_blocked' => false, 'blocked_amount' => null];
+        }
+
+        return [
+            'is_fns_blocked' => (bool) $row['is_fns_blocked'],
+            'blocked_amount' => $row['blocked_amount'],
+        ];
     }
 
     /**

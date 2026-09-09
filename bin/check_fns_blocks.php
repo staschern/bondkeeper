@@ -36,6 +36,7 @@ declare(strict_types=1);
 require __DIR__ . '/bootstrap.php';
 
 use BondKeeper\Database;
+use BondKeeper\Events\EventPublisher;
 use BondKeeper\Fns\FnsBlocksImporter;
 use BondKeeper\Fns\NalogBiClient;
 use BondKeeper\Support\Logger;
@@ -87,7 +88,7 @@ $issuers = $stmt->fetchAll();
 Logger::info('Старт: проверка блокировок счетов ФНС для ' . count($issuers) . ' эмитентов'
     . " (пауза между проверками: {$delaySeconds} с)");
 
-$importer = new FnsBlocksImporter(new NalogBiClient(), $db, $delaySeconds);
+$importer = new FnsBlocksImporter(new NalogBiClient(), $db, new EventPublisher($db), $delaySeconds);
 $importer->checkIssuers($issuers);
 
 Logger::info('Готово.');

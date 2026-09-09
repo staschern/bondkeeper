@@ -4,23 +4,39 @@ declare(strict_types=1);
 
 namespace BondKeeper\Ratings;
 
+use BondKeeper\Events\EventPublisher;
 use PDO;
 
 /**
  * Общий апсерт в rating_actions — вынесено, чтобы НРА (история из Excel)
- * и новостные парсеры (НКР/Эксперт РА) не дублировали один и тот же SQL.
- * Ключ апсерта — UNIQUE (issuer_id, agency, action_date), см. миграцию 014.
+ * и новостные парсеры (НКР/Эксперт РА/АКРА) не дублировали один и тот же
+ * SQL. Ключ апсерта — UNIQUE (issuer_id, agency, action_date), см.
+ * миграцию 014.
  *
  * $sourceTitle — заголовок пресс-релиза ДОСЛОВНО, как есть, без разбора
  * (см. миграцию 015). НЕ участвует в вычислении rating_from/rating_to/
  * outlook_from/outlook_to — это отдельное, «сырое» поле для provenance/
  * аудита. NULL допустим (опциональный параметр) — источник, у которого
  * гипотетически нет текстового заголовка, не должен из-за этого падать.
+ *
+ * === Событийный движок (Этап 4, сентябрь 2026) ===
+ *
+ * Сразу после апсерта — EventPublisher::publishRatingAction() (событие
+ * C5 "Рейтинговое действие"). Без фильтра существенности (решение
+ * пользователя) — событие создаётся ВСЕГДА, даже на "подтверждено без
+ * изменений". Именно поэтому событие рождается ЗДЕСЬ, а не в отдельном
+ * опросе-диффе: upsert() и так уже знает всё нужное (rating_from/
+ * rating_to/outlook_from/outlook_to), выдумывать второй источник правды
+ * незачем. Это единственная точка апсерта rating_actions в проекте —
+ * НРА (NraImporter) тоже проведена через этот класс, а не через свой SQL,
+ * иначе НРА тихо осталась бы без событий. Подробности —
+ * docs/STAGE4_EVENT_ENGINE.md.
  */
 final class RatingActionsWriter
 {
     public function __construct(
         private readonly PDO $db,
+        private readonly EventPublisher $events,
     ) {
     }
 
@@ -58,6 +74,33 @@ final class RatingActionsWriter
             'outlook_to' => $outlookTo,
             'source_url' => $sourceUrl !== null ? mb_substr($sourceUrl, 0, 500) : null,
             'source_title' => $sourceTitle !== null ? mb_substr($sourceTitle, 0, 500) : null,
+        ]);
+
+        $eventId = $this->events->publishRatingAction(
+            $issuerId,
+            $agency,
+            $actionDate,
+            $ratingFrom,
+            $ratingTo,
+            $outlookFrom,
+            $outlookTo,
+            $sourceUrl,
+            $sourceTitle,
+        );
+
+        // rating_actions.event_id — та же строка, что мы только что
+        // апсертили (ключ (issuer_id, agency, action_date) её однозначно
+        // определяет), просто ссылку на событие проставляем отдельным
+        // UPDATE — event_id не входит в основной INSERT, потому что на
+        // момент его подготовки события ещё не существовало.
+        $this->db->prepare(
+            'UPDATE rating_actions SET event_id = :event_id
+             WHERE issuer_id = :issuer_id AND agency = :agency AND action_date = :action_date'
+        )->execute([
+            'event_id' => $eventId,
+            'issuer_id' => $issuerId,
+            'agency' => $agency,
+            'action_date' => $actionDate,
         ]);
     }
 }

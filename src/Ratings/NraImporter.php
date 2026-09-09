@@ -83,6 +83,18 @@ use RuntimeException;
  * under_review_negative/under_review_positive именно через эту колонку,
  * при том что в тексте "Прогноз" словосочетание "Негативный - под
  * наблюдением"/"Позитивный - под наблюдением" ни разу не встретилось).
+ *
+ * === Событийный движок (Этап 4, сентябрь 2026) ===
+ *
+ * Запись в rating_actions переведена с собственного SQL на
+ * RatingActionsWriter::upsert() — раньше НРА единственная из трёх
+ * дублировала тот же INSERT ... ON DUPLICATE KEY UPDATE, что уже был в
+ * RatingActionsWriter (историческая случайность, не намеренное решение).
+ * Событие C5 "Рейтинговое действие" рождается ВНУТРИ upsert() — если бы
+ * НРА осталась на своём SQL, она тихо осталась бы без событий вообще,
+ * при том что C5 для НРА явно входит в MVP (см. docs/STAGE4_EVENT_ENGINE.md).
+ * current_ratings (через CurrentRatingsSync) upsert() не трогает — это
+ * по-прежнему обязанность НРА-специфичного кода здесь же.
  */
 final class NraImporter
 {
@@ -123,6 +135,7 @@ final class NraImporter
     public function __construct(
         private readonly PDO $db,
         private readonly IssuerMatcher $matcher,
+        private readonly RatingActionsWriter $writer,
     ) {
     }
 
@@ -222,30 +235,17 @@ final class NraImporter
         $sourceTitle = mb_substr(trim($row['Название пресс-релиза'] ?? ''), 0, 500) ?: null;
         $sourceUrl = mb_substr($url, 0, 500) ?: null;
 
-        $stmt = $this->db->prepare(
-            'INSERT INTO rating_actions
-                (issuer_id, agency, action_date, rating_from, rating_to, outlook_from, outlook_to, source_url, source_title)
-             VALUES
-                (:issuer_id, :agency, :action_date, :rating_from, :rating_to, :outlook_from, :outlook_to, :source_url, :source_title)
-             ON DUPLICATE KEY UPDATE
-                rating_from = VALUES(rating_from),
-                rating_to = VALUES(rating_to),
-                outlook_from = VALUES(outlook_from),
-                outlook_to = VALUES(outlook_to),
-                source_url = VALUES(source_url),
-                source_title = VALUES(source_title)'
+        $this->writer->upsert(
+            $issuerId,
+            self::AGENCY,
+            $row['_date'],
+            $ratingFrom,
+            $ratingTo,
+            $outlookFrom,
+            $outlookTo,
+            $sourceUrl,
+            $sourceTitle,
         );
-        $stmt->execute([
-            'issuer_id' => $issuerId,
-            'agency' => self::AGENCY,
-            'action_date' => $row['_date'],
-            'rating_from' => $ratingFrom,
-            'rating_to' => $ratingTo,
-            'outlook_from' => $outlookFrom,
-            'outlook_to' => $outlookTo,
-            'source_url' => $sourceUrl,
-            'source_title' => $sourceTitle,
-        ]);
         $this->actionsWritten++;
 
         CurrentRatingsSync::sync($this->db, $issuerId, self::AGENCY, $row['_date'], $ratingTo, $outlookTo, $cached);
