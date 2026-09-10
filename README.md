@@ -79,6 +79,7 @@ bin/daemon_telegram_bot.php          — цикл бота: long-polling ком�
 config/telegram_bot.example.php      — шаблон конфига токена бота (скопировать в telegram_bot.php, не коммитить)
 tests/test_bot_ux_screens.php        — офлайн-проверка экранов/разделов бота на SQLite (73 проверки)
 tests/test_notification_dispatcher.php — офлайн-проверка рассылки на SQLite (27 проверок, покрыта целиком — без MySQL-диалекта)
+tests/test_no_duplicate_named_params.php — статическая проверка ->prepare(): нет повторов :имени плейсхолдера в одном запросе (PDO::ATTR_EMULATE_PREPARES=false — MySQL это не прощает, в отличие от SQLite)
 ```
 
 ## Запуск

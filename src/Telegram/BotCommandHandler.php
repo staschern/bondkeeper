@@ -555,10 +555,20 @@ final class BotCommandHandler
             return [['id' => (int) $secidRow['id'], 'short_name' => (string) $secidRow['short_name']]];
         }
 
+        // Два РАЗНЫХ именованных плейсхолдера с одним и тем же значением —
+        // не :fragment дважды. Database::connection() держит
+        // PDO::ATTR_EMULATE_PREPARES=false (настоящие подготовленные
+        // запросы MySQL), а в этом режиме повтор одного :имени в тексте
+        // запроса требует значение на КАЖДОЕ вхождение — execute() с
+        // одним ключом 'fragment' на оба вхождения падает с "SQLSTATE[HY093]:
+        // Invalid parameter number" (под SQLite-эмуляцией в офлайн-тестах
+        // такого ограничения нет, поэтому баг не был пойман офлайн —
+        // нашёлся только вживую на реальной MySQL).
         $likeStmt = $this->db->prepare(
-            'SELECT id, short_name FROM issuers WHERE short_name LIKE :fragment OR full_name LIKE :fragment ORDER BY short_name LIMIT 8'
+            'SELECT id, short_name FROM issuers WHERE short_name LIKE :fragment1 OR full_name LIKE :fragment2 ORDER BY short_name LIMIT 8'
         );
-        $likeStmt->execute(['fragment' => '%' . $query . '%']);
+        $likeFragment = '%' . $query . '%';
+        $likeStmt->execute(['fragment1' => $likeFragment, 'fragment2' => $likeFragment]);
 
         return array_map(
             static fn (array $r): array => ['id' => (int) $r['id'], 'short_name' => (string) $r['short_name']],
