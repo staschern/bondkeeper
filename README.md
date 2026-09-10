@@ -68,6 +68,17 @@ bin/debug_acra_news.php              — разведка/сухой прого�
 bin/debug_acra_ratings.php           — разведка списка/карточки эмитента и пагинации АКРА current_ratings (без БД, без записи — см. docs/STAGE3_RATINGS.md)
 src/Events/EventPublisher.php        — единственная точка создания events/raw_messages (C5 рейтинговые действия, E1 блокировки ФНС), этап 4, см. docs/STAGE4_EVENT_ENGINE.md
 tests/test_event_engine.php          — офлайн-проверка EventPublisher на SQLite (запуск: php -d extension=pdo_sqlite -d extension=mbstring tests/test_event_engine.php)
+database/019_bot_ux_tariff_and_dialog_state.sql — миграция: тариф free (10 эмитентов/14 дней), таблицы bot_dialog_state/support_thread_map
+src/Telegram/TelegramClientInterface.php — интерфейс Bot API (sendMessage/answerCallbackQuery/editMessageText) для подмены фейком в офлайн-тестах
+src/Telegram/TelegramClient.php      — HTTP-клиент Telegram Bot API (long polling, sendMessage/editMessageText/answerCallbackQuery)
+src/Telegram/TelegramBotConfig.php   — токен бота + admin_telegram_id из config/telegram_bot.php (не коммитится, см. .example рядом)
+src/Telegram/BotFormatting.php       — общие форматтеры (agencyDisplayName/formatDate) для BotCommandHandler и NotificationDispatcher
+src/Telegram/BotCommandHandler.php   — разбор команд/кнопок бота: меню, «Выбор эмитентов» (умный поиск + листалка), «Статус», «Подписка», «О сервисе», чат-релей «Помощь» — см. docs/BOT_UX_SPEC.md
+src/Telegram/NotificationDispatcher.php — рассылка событий (events) подписчикам из watchlist в Telegram, этап 4 Фаза 3, см. docs/STAGE4_EVENT_ENGINE.md
+bin/daemon_telegram_bot.php          — цикл бота: long-polling команд + рассылка раз в 60 с, один процесс
+config/telegram_bot.example.php      — шаблон конфига токена бота (скопировать в telegram_bot.php, не коммитить)
+tests/test_bot_ux_screens.php        — офлайн-проверка экранов/разделов бота на SQLite (73 проверки)
+tests/test_notification_dispatcher.php — офлайн-проверка рассылки на SQLite (27 проверок, покрыта целиком — без MySQL-диалекта)
 ```
 
 ## Запуск

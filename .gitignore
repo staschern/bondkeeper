@@ -1,3 +1,4 @@
 .env
 *.log
 *.lock
+config/telegram_bot.php
