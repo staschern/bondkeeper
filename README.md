@@ -30,6 +30,7 @@ database/013_rating_actions_outlook_split.sql    — миграция: rating_ac
 src/Database.php                     — подключение к MySQL (PDO)
 src/Iss/IssClient.php                — HTTP-клиент ISS API Мосбиржи
 src/Iss/SecuritiesImporter.php       — issuers/securities/redemptions(scheduled_maturity)
+src/Iss/IssuerNameShortener.php      — issuers.short_name из full_name (эвристика: сокращение ОПФ — ПАО/ООО/АО/... — по словарю, оба формата ИСС: ОПФ префиксом и хвостом в скобках)
 src/Iss/BondizationImporter.php      — coupons/amortizations
 src/Fns/NalogBiClient.php            — HTTP-клиент service.nalog.ru/bi.do (блокировки счетов)
 src/Fns/FnsBlocksImporter.php        — fns_blocks, issuers.is_fns_blocked
@@ -80,6 +81,8 @@ config/telegram_bot.example.php      — шаблон конфига токен�
 tests/test_bot_ux_screens.php        — офлайн-проверка экранов/разделов бота на SQLite (73 проверки)
 tests/test_notification_dispatcher.php — офлайн-проверка рассылки на SQLite (27 проверок, покрыта целиком — без MySQL-диалекта)
 tests/test_no_duplicate_named_params.php — статическая проверка ->prepare(): нет повторов :имени плейсхолдера в одном запросе (PDO::ATTR_EMULATE_PREPARES=false — MySQL это не прощает, в отличие от SQLite)
+tests/test_issuer_name_shortener.php — офлайн-проверка IssuerNameShortener (24 проверки, чистая текстовая логика, БД не нужна)
+bin/backfill_issuer_short_names.php  — разовая пересборка issuers.short_name из full_name для строк, накопленных до появления IssuerNameShortener (идемпотентно, безопасно перезапускать)
 ```
 
 ## Запуск

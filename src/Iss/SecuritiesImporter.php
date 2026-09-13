@@ -245,7 +245,12 @@ final class SecuritiesImporter
             'emitter_id' => $emitterId !== null ? (int) $emitterId : null,
             'inn' => $inn,
             'full_name' => $title,
-            'short_name' => $title,
+            // IssuerNameShortener сокращает ОПФ ("Публичное акционерное
+            // общество" -> "ПАО" и т.п.) — см. класс-докблок и
+            // documents/2026.08.10_BondKeeper_issuers_securities_QA.md
+            // про то, почему full_name/short_name раньше совпадали
+            // один-в-один (ISS отдаёт только emitent_title, одно поле).
+            'short_name' => IssuerNameShortener::shorten($title),
         ]);
 
         if ($emitterId !== null) {
