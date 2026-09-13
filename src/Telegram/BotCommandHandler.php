@@ -171,7 +171,7 @@ final class BotCommandHandler
             '/help' => ['text' => $this->helpText()],
             self::BTN_ISSUERS => $this->handleIssuerMenuEntry(),
             self::BTN_STATUS => $this->handleStatus($userId),
-            self::BTN_SUBSCRIPTION => ['text' => $this->handleSubscription($userId)],
+            self::BTN_SUBSCRIPTION => ['text' => $this->handleSubscription($userId), 'parseMode' => 'HTML'],
             self::BTN_ABOUT => ['text' => $this->aboutServiceText()],
             self::BTN_HELP => ['text' => $this->startSupportFlow($userId)],
             default => $this->matchSlashCommandWithArgument($userId, $text),
@@ -260,35 +260,72 @@ final class BotCommandHandler
 
     /**
      * Новому пользователю — сразу подписка на 'free' (нет ни одной строки
-     * в subscriptions вообще, не только на 'free'), чтобы currentLimit()
-     * ниже всегда находил хоть какую-то активную подписку и не считал
-     * лимит равным 0 по ошибке.
+     * в subscriptions вообще), чтобы currentTariffLimit() ниже всегда
+     * находил хоть какую-то активную подписку и не считал лимит равным 0
+     * по ошибке. current_period_end = дата регистрации +
+     * tariffs.duration_days (фиксируется РОВНО ОДИН РАЗ, при регистрации)
+     * — это и есть "начало пробного периода", от которого дальше считаем
+     * оставшиеся дни (см. handleSubscription()).
      *
-     * current_period_end = дата регистрации + tariffs.duration_days —
-     * НЕ бессрочный sentinel (было так до ТЗ от 7 сентября 2026, миграция
-     * 018_bot_ux_tariff_and_dialog_state.sql поменяла free на 14
-     * календарных дней с автопродлением до запуска платной
-     * тарификации — сам механизм автопродления вне этого метода, см.
-     * docs/BOT_UX_SPEC.md, раздел 5, отдельный фоновый скрипт, ещё не
-     * реализован). duration_days читаем из БД, а не хардкодим 14 —
-     * тариф меняется миграцией, код не должен её дублировать.
+     * === Автопродление Free (решение пользователя, 13 сентября 2026) ===
+     *
+     * Пока нет платных тарифов, Free должен продлеваться сам ещё на
+     * duration_days при каждом истечении — молча, без действий
+     * пользователя. Раньше (7-8 сентября) было решено, что раз
+     * current_period_end технически ни на что не влияет (лимит проверяет
+     * только max_tracked_issuers), можно просто НЕ показывать дату вообще
+     * ("действует, пока не запущены платные тарифы") — пользователь
+     * уточнил, что это не то, что он имел в виду: нужна настоящая,
+     * реально считающаяся от даты регистрации дата, и настоящее
+     * автопродление, а не текстовая заглушка. Проверяется здесь же, при
+     * КАЖДОМ входящем сообщении (ensureUser() вызывает этот метод всегда)
+     * — если free-подписка нашлась, но current_period_end уже в прошлом,
+     * продлеваем на duration_days от текущего момента.
+     *
+     * Даты считаются в PHP (не DATE_ADD(NOW(), ...) — MySQL-диалект,
+     * недоступный офлайн-тесту на SQLite, см. tests/test_bot_ux_screens.php),
+     * duration_days читаем из БД, а не хардкодим 14 — тариф меняется
+     * миграцией, код не должен её дублировать.
      */
     private function ensureFreeSubscription(int $userId): void
     {
-        $stmt = $this->db->prepare('SELECT id FROM subscriptions WHERE user_id = :user_id LIMIT 1');
+        $stmt = $this->db->prepare(
+            'SELECT id, tariff_code, current_period_end FROM subscriptions WHERE user_id = :user_id ORDER BY id DESC LIMIT 1'
+        );
         $stmt->execute(['user_id' => $userId]);
-        if ($stmt->fetchColumn() !== false) {
+        $existing = $stmt->fetch();
+
+        if ($existing === false) {
+            $periodEnd = $this->addDays(date('Y-m-d H:i:s'), $this->tariffDurationDays('free'));
+            $this->db->prepare(
+                "INSERT INTO subscriptions (user_id, tariff_code, status, current_period_end)
+                 VALUES (:user_id, 'free', 'active', :period_end)"
+            )->execute(['user_id' => $userId, 'period_end' => $periodEnd]);
+
             return;
         }
 
-        $durationStmt = $this->db->prepare("SELECT duration_days FROM tariffs WHERE code = 'free'");
-        $durationStmt->execute();
-        $durationDays = (int) ($durationStmt->fetchColumn() ?: 14);
+        $isExpiredFree = $existing['tariff_code'] === 'free'
+            && $existing['current_period_end'] !== null
+            && (string) $existing['current_period_end'] < date('Y-m-d H:i:s');
+        if ($isExpiredFree) {
+            $periodEnd = $this->addDays(date('Y-m-d H:i:s'), $this->tariffDurationDays('free'));
+            $this->db->prepare('UPDATE subscriptions SET current_period_end = :period_end WHERE id = :id')
+                ->execute(['period_end' => $periodEnd, 'id' => $existing['id']]);
+        }
+    }
 
-        $this->db->prepare(
-            "INSERT INTO subscriptions (user_id, tariff_code, status, current_period_end)
-             VALUES (:user_id, 'free', 'active', DATE_ADD(NOW(), INTERVAL :duration_days DAY))"
-        )->execute(['user_id' => $userId, 'duration_days' => $durationDays]);
+    private function tariffDurationDays(string $tariffCode): int
+    {
+        $stmt = $this->db->prepare('SELECT duration_days FROM tariffs WHERE code = :code');
+        $stmt->execute(['code' => $tariffCode]);
+
+        return (int) ($stmt->fetchColumn() ?: 14);
+    }
+
+    private function addDays(string $dateTime, int $days): string
+    {
+        return date('Y-m-d H:i:s', strtotime($dateTime) + $days * 86400);
     }
 
     /** Текст дословно из ТЗ (docs/BOT_UX_SPEC.md, раздел 1.2) — не перефразировать без запроса пользователя. */
@@ -680,15 +717,18 @@ final class BotCommandHandler
 
 
     /**
-     * docs/BOT_UX_SPEC.md, раздел 5 — текст адаптирован под решение
-     * пользователя (8 сентября 2026): у тарифа 'free' `current_period_end`
-     * технически ни на что не влияет (лимит проверяется только по
-     * `max_tracked_issuers`, не по дате) — значит показывать реальную
-     * дату пользователю бессмысленно и даже вводит в заблуждение (через
-     * 14 дней выглядела бы "просроченной", хотя ничего не меняется).
-     * Вместо даты — честная формулировка "действует, пока...". Для
-     * БУДУЩИХ платных тарифов (когда появятся) — обычная дата, там она
-     * уже будет что-то реально значить.
+     * docs/BOT_UX_SPEC.md, раздел 5 — уточнено пользователем (13 сентября
+     * 2026), отменяет более раннее решение от 8 сентября: тариф 'free' —
+     * настоящий пробный период на `tariffs.duration_days` дней, дата
+     * начала фиксируется РОВНО ОДИН РАЗ при регистрации
+     * (ensureFreeSubscription()) и молча продлевается ещё на
+     * duration_days при каждом истечении, пока нет платных тарифов —
+     * пользователю показываем не саму (постоянно уезжающую вперёд) дату,
+     * а количество оставшихся дней ДО следующего продления, честно
+     * посчитанное от текущего `current_period_end`. Для будущих платных
+     * тарифов (когда появятся, продление не автоматическое) — обычная
+     * дата остаётся как есть, она там будет что-то реально значить.
+     * Разметка `<b>...</b>` — parse_mode=HTML, см. matchKnownCommand().
      */
     private function handleSubscription(int $userId): string
     {
@@ -708,17 +748,38 @@ final class BotCommandHandler
 
         $tariffName = $row !== false ? (string) $row['name'] : 'Free';
         $limit = $row !== false && $row['max_tracked_issuers'] !== null ? (string) (int) $row['max_tracked_issuers'] : 'без ограничения';
-        $periodEnd = ($row !== false && $row['tariff_code'] === 'free')
-            ? 'действует, пока не запущены платные тарифы'
-            : ($row !== false ? BotFormatting::formatDate((string) $row['current_period_end']) : '—');
 
-        return "Ваша текущая подписка: {$tariffName}\n"
-            . "Количество эмитентов доступных для отслеживания: {$limit}\n"
-            . "Количество эмитентов в списке на отслеживание: {$current}\n"
-            . "Окончание действия подписки: {$periodEnd}\n\n"
+        $isFree = $row !== false && $row['tariff_code'] === 'free';
+        $periodLabel = $isFree ? 'Дней до окончания пробного периода' : 'Окончание действия подписки';
+        $periodValue = match (true) {
+            $row === false => '—',
+            $isFree => (string) $this->daysUntil((string) $row['current_period_end']),
+            default => BotFormatting::formatDate((string) $row['current_period_end']),
+        };
+
+        return "Ваша текущая подписка: <b>{$tariffName}</b>\n\n"
+            . "Количество эмитентов доступных для отслеживания: <b>{$limit}</b>\n"
+            . "Количество эмитентов в списке на отслеживание: <b>{$current}</b>\n"
+            . "{$periodLabel}: <b>{$periodValue}</b>\n\n"
             . "Благодарим за интерес к нашему проекту! 🙏\n"
             . "Ещё больше возможностей уже скоро откроется на платном тарифе 😉\n"
             . "Следите за новостями: t.me/Bond_Keeper";
+    }
+
+    /**
+     * Целое число дней до $isoDateTime, округление вверх (11 часов до
+     * истечения — это ещё "1 день", а не "0" — ноль читался бы как "уже
+     * истекло", хотя автопродление (ensureFreeSubscription()) в этот
+     * момент ещё не сработало). Не может быть отрицательным на практике —
+     * ensureFreeSubscription() продлевает раньше, чем этот метод вообще
+     * вызовется, но floor на 0 — дешёвая страховка от показа "-1 дней"
+     * при любом непредвиденном рассинхроне.
+     */
+    private function daysUntil(string $isoDateTime): int
+    {
+        $secondsLeft = strtotime($isoDateTime) - time();
+
+        return max(0, (int) ceil($secondsLeft / 86400));
     }
 
     /** docs/BOT_UX_SPEC.md, раздел 6 — текст дословно из ТЗ. Кнопка "Читать статью" не добавлена — URL ещё не прислан заказчиком. */

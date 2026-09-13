@@ -85,12 +85,12 @@ $db->exec('CREATE TABLE watchlist (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id
 $db->exec('CREATE TABLE fns_blocks (issuer_id INTEGER PRIMARY KEY, is_fns_blocked INTEGER, block_date TEXT, active_bank_count INTEGER, blocked_amount TEXT)');
 $db->exec('CREATE TABLE current_ratings (issuer_id INTEGER, agency TEXT, rating TEXT, outlook TEXT, last_action_date TEXT)');
 $db->exec('CREATE TABLE subscriptions (id INTEGER PRIMARY KEY, user_id INTEGER, tariff_code TEXT, status TEXT, current_period_end TEXT)');
-$db->exec('CREATE TABLE tariffs (code TEXT PRIMARY KEY, name TEXT, max_tracked_issuers INTEGER)');
+$db->exec('CREATE TABLE tariffs (code TEXT PRIMARY KEY, name TEXT, max_tracked_issuers INTEGER, duration_days INTEGER)');
 $db->exec('CREATE TABLE users (id INTEGER PRIMARY KEY, telegram_id INTEGER)');
 $db->exec('CREATE TABLE support_thread_map (admin_chat_id INTEGER, admin_message_id INTEGER, user_id INTEGER, PRIMARY KEY (admin_chat_id, admin_message_id))');
 $db->exec('CREATE TABLE securities (id INTEGER PRIMARY KEY AUTOINCREMENT, isin TEXT, secid TEXT, issuer_id INTEGER)');
 
-$db->exec("INSERT INTO tariffs (code, name, max_tracked_issuers) VALUES ('free', 'Free', 10)");
+$db->exec("INSERT INTO tariffs (code, name, max_tracked_issuers, duration_days) VALUES ('free', 'Free', 10, 14)");
 
 // Эмитент 1: заблокирован ФНС, два рейтинга (НКР + АКРА).
 $db->exec("INSERT INTO issuers (id, inn, full_name, short_name) VALUES (1, '7706107510', 'ПАО Роснефть', 'Роснефть')");
@@ -151,21 +151,70 @@ check('handleStatus(): пустой список даёт кнопку "Выбо
 
 // --- Подписка ---
 $subscription = callPrivate($ref, $handler, 'handleSubscription', [1]);
-check('Подписка: лимит тарифа (10)', str_contains($subscription, 'Количество эмитентов доступных для отслеживания: 10'));
-check('Подписка: текущее число в списке (2)', str_contains($subscription, 'Количество эмитентов в списке на отслеживание: 2'));
-check('Подписка (тариф free): вместо даты — "действует, пока..." (решение от 8 сентября)', str_contains($subscription, 'Окончание действия подписки: действует, пока не запущены платные тарифы'));
-check('Подписка: название тарифа из tariffs.name, не хардкод', str_contains($subscription, 'Ваша текущая подписка: Free'));
+check('Подписка: первая строка жирная, дальше пустая строка (не всё сплошняком)', str_contains($subscription, "Ваша текущая подписка: <b>Free</b>\n\n"));
+check('Подписка: лимит тарифа жирным (10)', str_contains($subscription, 'Количество эмитентов доступных для отслеживания: <b>10</b>'));
+check('Подписка: текущее число в списке жирным (2)', str_contains($subscription, 'Количество эмитентов в списке на отслеживание: <b>2</b>'));
+// current_period_end фикстуры — '2026-09-21'; считаем ожидаемое число дней
+// той же формулой, что и сам daysUntil() — иначе тест зависит от того, в
+// какой день его реально запускают, и рано или поздно "протухнет".
+$expectedDaysLeft = max(0, (int) ceil((strtotime('2026-09-21') - time()) / 86400));
+check(
+    'Подписка (тариф free, решение от 13 сентября): дней до окончания пробного периода, посчитано от current_period_end',
+    str_contains($subscription, "Дней до окончания пробного периода: <b>{$expectedDaysLeft}</b>")
+);
+check('Подписка: название тарифа из tariffs.name, не хардкод', str_contains($subscription, 'Ваша текущая подписка: <b>Free</b>'));
 check('Подписка: ссылка на канал из ТЗ', str_contains($subscription, 't.me/Bond_Keeper'));
 
 // Будущий платный тариф (ещё не существует продуктово, но код должен
-// быть готов) — для НЕ-free тарифа дата должна остаться настоящей датой,
-// а не подменяться текстом "действует, пока...".
-$db->exec("INSERT INTO tariffs (code, name, max_tracked_issuers) VALUES ('basic', 'Basic', 20)");
+// быть готов) — для НЕ-free тарифа остаётся настоящая дата, а не счётчик
+// дней (автопродление касается только Free, пока нет платной тарификации).
+$db->exec("INSERT INTO tariffs (code, name, max_tracked_issuers, duration_days) VALUES ('basic', 'Basic', 20, 30)");
 $db->exec("INSERT INTO users (id, telegram_id) VALUES (99, 999999999)");
 $db->exec("INSERT INTO subscriptions (user_id, tariff_code, status, current_period_end) VALUES (99, 'basic', 'active', '2026-10-05')");
 $paidSubscription = callPrivate($ref, $handler, 'handleSubscription', [99]);
-check('Подписка (платный тариф): показывает настоящую дату, не заглушку', str_contains($paidSubscription, 'Окончание действия подписки: 05.10.26'));
-check('Подписка (платный тариф): название тарифа "Basic"', str_contains($paidSubscription, 'Ваша текущая подписка: Basic'));
+check('Подписка (платный тариф): показывает настоящую дату жирным, не счётчик дней', str_contains($paidSubscription, 'Окончание действия подписки: <b>05.10.26</b>'));
+check('Подписка (платный тариф): название тарифа "Basic" жирным', str_contains($paidSubscription, 'Ваша текущая подписка: <b>Basic</b>'));
+
+// --- ensureFreeSubscription(): автопродление Free (решение от 13 сентября 2026) ---
+$daysUntil = $ref->getMethod('daysUntil');
+$daysUntil->setAccessible(true);
+$ensureFreeSubscription = $ref->getMethod('ensureFreeSubscription');
+$ensureFreeSubscription->setAccessible(true);
+
+// Новый пользователь — подписка создаётся с нуля, current_period_end ~ +14 дней.
+$db->exec("INSERT INTO users (id, telegram_id) VALUES (201, 201201201)");
+$ensureFreeSubscription->invokeArgs($handler, [201]);
+$newSub = $db->query('SELECT tariff_code, current_period_end FROM subscriptions WHERE user_id = 201')->fetch(PDO::FETCH_ASSOC);
+check('ensureFreeSubscription(): новому пользователю создаёт free-подписку', $newSub !== false && $newSub['tariff_code'] === 'free');
+check(
+    'ensureFreeSubscription(): current_period_end нового пользователя ~14 дней вперёд',
+    $newSub !== false && abs($daysUntil->invokeArgs($handler, [$newSub['current_period_end']]) - 14) <= 1
+);
+
+// Истёкшая free-подписка — молча продлевается ещё на duration_days.
+$db->exec("INSERT INTO users (id, telegram_id) VALUES (202, 202202202)");
+$db->exec("INSERT INTO subscriptions (user_id, tariff_code, status, current_period_end) VALUES (202, 'free', 'active', '2020-01-01 00:00:00')");
+$ensureFreeSubscription->invokeArgs($handler, [202]);
+$renewedSub = $db->query('SELECT current_period_end FROM subscriptions WHERE user_id = 202')->fetch(PDO::FETCH_ASSOC);
+check(
+    'ensureFreeSubscription(): истёкшая free-подписка продлена ещё на ~14 дней (не осталась в прошлом)',
+    $renewedSub !== false && abs($daysUntil->invokeArgs($handler, [$renewedSub['current_period_end']]) - 14) <= 1
+);
+
+// Ещё НЕ истёкшая free-подписка — не трогаем раньше срока.
+$db->exec("INSERT INTO users (id, telegram_id) VALUES (203, 203203203)");
+$futureEnd = date('Y-m-d H:i:s', time() + 5 * 86400);
+$db->exec("INSERT INTO subscriptions (user_id, tariff_code, status, current_period_end) VALUES (203, 'free', 'active', '{$futureEnd}')");
+$ensureFreeSubscription->invokeArgs($handler, [203]);
+$untouchedSub = $db->query('SELECT current_period_end FROM subscriptions WHERE user_id = 203')->fetch(PDO::FETCH_ASSOC);
+check('ensureFreeSubscription(): ещё не истёкшая free-подписка не продлевается раньше срока', $untouchedSub !== false && $untouchedSub['current_period_end'] === $futureEnd);
+
+// Платная (не free) подписка — этот метод её вообще не трогает, даже истёкшую.
+$db->exec("INSERT INTO users (id, telegram_id) VALUES (204, 204204204)");
+$db->exec("INSERT INTO subscriptions (user_id, tariff_code, status, current_period_end) VALUES (204, 'basic', 'active', '2020-01-01 00:00:00')");
+$ensureFreeSubscription->invokeArgs($handler, [204]);
+$paidUntouched = $db->query('SELECT current_period_end FROM subscriptions WHERE user_id = 204')->fetch(PDO::FETCH_ASSOC);
+check('ensureFreeSubscription(): платную подписку не трогает, даже истёкшую', $paidUntouched !== false && $paidUntouched['current_period_end'] === '2020-01-01 00:00:00');
 
 // --- О сервисе — просто не падает и содержит ключевые фразы ---
 $about = callPrivate($ref, $handler, 'aboutServiceText', []);
