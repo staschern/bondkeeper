@@ -218,7 +218,8 @@ check('ensureFreeSubscription(): платную подписку не трога
 
 // --- О сервисе — просто не падает и содержит ключевые фразы ---
 $about = callPrivate($ref, $handler, 'aboutServiceText', []);
-check('О сервисе: содержит "BondKeeper"', str_contains($about, 'BondKeeper'));
+check('О сервисе: "BondKeeper" жирным', str_contains($about, '<b>BondKeeper</b>'));
+check('О сервисе: пустая строка после первой строки (решение от 13 сентября)', str_contains($about, "Благодарим за интерес к нашему проекту! 🙏\n\n"));
 check('О сервисе: содержит блок преимуществ', str_contains($about, 'Главные преимущества проекта'));
 
 // --- BotFormatting::formatDate() edge cases (вынесено из BotCommandHandler в общий класс) ---
