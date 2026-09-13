@@ -24,11 +24,33 @@ declare(strict_types=1);
  * Предварительное условие: реальный токен в config/telegram_bot.php (см.
  * config/telegram_bot.example.php — как получить у @BotFather).
  *
- * Запуск:
- *   nohup php bin/daemon_telegram_bot.php >> /var/log/bondkeeper/daemon_telegram_bot.log 2>&1 &
- * Остановка — обычный kill процесса (PID выводится в лог при старте) или
- * Ctrl+C на переднем плане. Тот же принцип "не демонизируется средствами
- * PHP", что и у остальных bin/daemon_*.php.
+ * === Переподключение к MySQL (найдено вживую, 13 сентября 2026) ===
+ *
+ * В отличие от bin/seed_*.php/bin/check_fns_blocks.php (короткоживущие
+ * cron-процессы — подключение открывается и умирает вместе с ними), этот
+ * демон живёт часами/сутками одним процессом. MySQL сама закрывает
+ * простаивающее соединение по wait_timeout — PDO-синглтон
+ * (BondKeeper\Database) об этом заранее не знает, следующий же запрос
+ * падает с "MySQL server has gone away". Без переподключения ЛЮБОЙ такой
+ * разрыв означал бы, что рассылка (и приём команд) молча умирают навсегда
+ * до ручного перезапуска процесса — что и произошло на бою (несколько
+ * часов подряд одна и та же ошибка на каждом проходе рассылки). См.
+ * reconnectDependents() ниже и BondKeeper\Database::isConnectionLost()/
+ * reconnect().
+ *
+ * Запуск в бою — через systemd (переживает падение процесса и
+ * перезагрузку сервера, чего `nohup ... &` не даёт сам по себе — найдено
+ * вживую 13 сентября 2026, юнит `bondkeeper-telegram-bot.service`,
+ * `ExecStart=/usr/bin/php bin/daemon_telegram_bot.php`,
+ * `WorkingDirectory` — корень репозитория, `Restart=always`, лог — в
+ * `var/log/daemon_telegram_bot.log` внутри репозитория, тот же каталог,
+ * что уже используют cron-задачи `seed_ratings.php`). Ручной разовый
+ * запуск для отладки — как у остальных bin/daemon_*.php:
+ *   nohup php bin/daemon_telegram_bot.php >> var/log/daemon_telegram_bot.log 2>&1 &
+ * Остановка — `systemctl stop bondkeeper-telegram-bot` (или обычный kill
+ * процесса при ручном запуске). Само по себе не демонизируется средствами
+ * PHP — это делает systemd/nohup, тот же принцип, что и у остальных
+ * bin/daemon_*.php.
  */
 
 require __DIR__ . '/bootstrap.php';
@@ -58,6 +80,26 @@ $db = Database::connection();
 $handler = new BotCommandHandler($db, $telegram, new IssuerMatcher($db), $config->adminTelegramId);
 $dispatcher = new NotificationDispatcher($db, $telegram);
 
+/**
+ * $db передан в $handler/$dispatcher конструктором как readonly-свойство
+ * — простая замена Database::$connection (через Database::reconnect())
+ * на них саму по себе не подействует, оба объекта нужно пересоздать
+ * заново поверх свежего PDO. Вызывается ТОЛЬКО когда
+ * Database::isConnectionLost() подтвердил, что это именно "соединение
+ * умерло само" — не на каждую ошибку подряд.
+ */
+function reconnectDependents(TelegramClient $telegram, TelegramBotConfig $config): array
+{
+    Logger::warn('Telegram-бот: MySQL-соединение протухло (server has gone away) — переподключаюсь');
+    $db = Database::reconnect();
+
+    return [
+        $db,
+        new BotCommandHandler($db, $telegram, new IssuerMatcher($db), $config->adminTelegramId),
+        new NotificationDispatcher($db, $telegram),
+    ];
+}
+
 Logger::info('Telegram-бот запущен, PID=' . getmypid() . ' (long polling команд + рассылка раз в ' . DISPATCH_INTERVAL_SECONDS . ' с)');
 
 $offset = 0;
@@ -83,6 +125,9 @@ while (true) {
             // повторными попытками, просто будет потерян с явной записью
             // в лог.
             Logger::warn('Telegram-бот: ошибка обработки апдейта #' . ($update['update_id'] ?? '?') . ': ' . $e->getMessage());
+            if (Database::isConnectionLost($e)) {
+                [$db, $handler, $dispatcher] = reconnectDependents($telegram, $config);
+            }
         }
     }
 
@@ -97,6 +142,9 @@ while (true) {
             // следующий проход (через DISPATCH_INTERVAL_SECONDS) попробует
             // снова, ничего вручную перезапускать не нужно.
             Logger::warn('Telegram-бот: ошибка рассылки уведомлений: ' . $e->getMessage());
+            if (Database::isConnectionLost($e)) {
+                [$db, $handler, $dispatcher] = reconnectDependents($telegram, $config);
+            }
         }
         $lastDispatchAt = time();
     }
