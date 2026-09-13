@@ -65,8 +65,10 @@ final class TelegramClient implements TelegramClientInterface
      *   null — сообщение без клавиатуры (клиент оставит ту, что уже была
      *   у пользователя открыта, если это reply-клавиатура — Telegram сам
      *   так себя ведёт, это не наша логика).
+     * @param string|null $parseMode 'HTML' — включить разбор <b>/<i>/... в
+     *   $text (Bot API parse_mode); null — как есть, без разметки.
      */
-    public function sendMessage(int $chatId, string $text, ?array $replyMarkup = null): bool
+    public function sendMessage(int $chatId, string $text, ?array $replyMarkup = null, ?string $parseMode = null): bool
     {
         $this->lastSendWasBlockedByUser = false;
 
@@ -76,6 +78,9 @@ final class TelegramClient implements TelegramClientInterface
             // JSON-СТРОКУ, а не вложенный массив — http_build_query() сам
             // это не сериализует, значение нужно закодировать заранее.
             $params['reply_markup'] = json_encode($replyMarkup, JSON_UNESCAPED_UNICODE);
+        }
+        if ($parseMode !== null) {
+            $params['parse_mode'] = $parseMode;
         }
 
         $response = $this->request($this->apiUrl('sendMessage'), $params);

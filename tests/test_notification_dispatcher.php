@@ -28,7 +28,7 @@ final class FakeTelegramClient implements TelegramClientInterface
     public bool $nextFailureIsBlock = false;
     private bool $lastBlocked = false;
 
-    public function sendMessage(int $chatId, string $text, ?array $replyMarkup = null): bool
+    public function sendMessage(int $chatId, string $text, ?array $replyMarkup = null, ?string $parseMode = null): bool
     {
         $this->lastBlocked = false;
         if ($this->nextSendShouldFail) {

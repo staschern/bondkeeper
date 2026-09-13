@@ -10,13 +10,15 @@ use PDOException;
 
 /**
  * Разбор входящих Update от TelegramClient::getUpdates() — команды из
- * ТЗ `docs/BOT_UX_SPEC.md`: reply-клавиатура «Выбор эмитентов 📝 /
- * Статус 📍 / Подписка 🎁 / О сервисе 🌐 / Помощь 🛠», плюс старые
- * слэш-команды `/watch`/`/unwatch`/`/list`/`/help` (оставлены как есть,
- * для тех, кто ими уже пользуется). Платежи/апгрейд тарифа — вне этого
- * MVP, только соблюдение лимита `tariffs.max_tracked_issuers`.
+ * ТЗ `docs/BOT_UX_SPEC.md`: reply-клавиатура «Выбор компаний 📝 /
+ * Статус 📍 / Подписка 🎁 / О сервисе 🌐 / Помощь 🛠» (кнопка называлась
+ * «Выбор эмитентов» до 13 сентября 2026 — переименована по прямому
+ * запросу пользователя, сам раздел и callback_data (`iss:...`) остались
+ * прежними), плюс старые слэш-команды `/watch`/`/unwatch`/`/list`/`/help`
+ * (оставлены как есть, для тех, кто ими уже пользуется). Платежи/апгрейд
+ * тарифа — вне этого MVP, только соблюдение лимита `tariffs.max_tracked_issuers`.
  *
- * === Раздел «Выбор эмитентов» — инлайн-кнопки (`callback_query`) ===
+ * === Раздел «Выбор компаний» — инлайн-кнопки (`callback_query`) ===
  * "Добавить новых эмитентов" → поиск свободным текстом (по ИНН/ISIN/
  * тикеру-SECID точно, по фрагменту названия — LIKE) с кнопками-
  * вариантами, либо листалка по алфавиту с переключателями ➕/✅
@@ -57,7 +59,7 @@ use PDOException;
  */
 final class BotCommandHandler
 {
-    private const BTN_ISSUERS = 'Выбор эмитентов 📝';
+    private const BTN_ISSUERS = 'Выбор компаний 📝';
     private const BTN_STATUS = 'Статус 📍';
     private const BTN_SUBSCRIPTION = 'Подписка 🎁';
     private const BTN_ABOUT = 'О сервисе 🌐';
@@ -119,7 +121,7 @@ final class BotCommandHandler
 
         $known = $this->matchKnownCommand($userId, $text);
         if ($known !== null) {
-            $this->telegram->sendMessage($chatId, $known['text'], $known['keyboard'] ?? null);
+            $this->telegram->sendMessage($chatId, $known['text'], $known['keyboard'] ?? null, $known['parseMode'] ?? null);
             return;
         }
 
@@ -161,11 +163,11 @@ final class BotCommandHandler
         $this->telegram->answerCallbackQuery($id, $toast);
     }
 
-    /** @return array{text: string, keyboard?: array<string, mixed>}|null null — не команда и не кнопка меню, дальше — handleFreeText() */
+    /** @return array{text: string, keyboard?: array<string, mixed>, parseMode?: string}|null null — не команда и не кнопка меню, дальше — handleFreeText() */
     private function matchKnownCommand(int $userId, string $text): ?array
     {
         return match ($text) {
-            '/start' => ['text' => $this->handleStart(), 'keyboard' => $this->mainMenuKeyboard()],
+            '/start' => ['text' => $this->handleStart(), 'keyboard' => $this->mainMenuKeyboard(), 'parseMode' => 'HTML'],
             '/help' => ['text' => $this->helpText()],
             self::BTN_ISSUERS => $this->handleIssuerMenuEntry(),
             self::BTN_STATUS => $this->handleStatus($userId),
@@ -290,21 +292,30 @@ final class BotCommandHandler
     }
 
     /** Текст дословно из ТЗ (docs/BOT_UX_SPEC.md, раздел 1.2) — не перефразировать без запроса пользователя. */
+    /**
+     * HTML (не Markdown) — Bot API парсит только <b>/<i>/... в тексте с
+     * parse_mode=HTML, экранировать тут нечего (в статичном тексте и в
+     * названиях кнопок нет ни одного символа "<"/">"/"&"). Названия кнопок
+     * выделены жирным по прямому запросу пользователя (13 сентября 2026) —
+     * только здесь, сами константы BTN_* остаются обычным текстом: это же
+     * значение уходит в reply-клавиатуру и в match() для распознавания
+     * нажатия, а Telegram не рендерит разметку в подписях кнопок.
+     */
     private function handleStart(): string
     {
         return "Знакомство 👋\n\n"
-            . "Привет! Меня зовут Bond…, только не James, а BondKeeper и я буду твоим надёжным помощником на рынке облигаций 📈\n"
+            . "Привет! Меня зовут Bond…, только не James, а BondKeeper и я буду твоим надёжным помощником на рынке облигаций! 📈\n"
             . "Перед тем, как начать, расскажу немного о своём меню.\n\n"
-            . "Чтобы открыть его, просто нажми на кнопку справа от окна сообщения 😉 (квадрат с четырьмя точками внутри).\n\n"
+            . "Чтобы открыть его, просто нажми на кнопку справа от окна сообщения 😉 (квадрат с четырьмя кружочками внутри).\n\n"
             . "Пробежимся по разделам:\n"
-            . self::BTN_ISSUERS . " — жми сюда, чтобы составить или отредактировать список эмитентов, за которыми нужно следить.\n"
-            . self::BTN_STATUS . " — жми сюда, чтобы получить актуальную информацию по конкретному эмитенту или всему списку.\n"
-            . self::BTN_SUBSCRIPTION . " — жми сюда, чтобы получить информацию о текущей подписке и тарифах.\n"
-            . self::BTN_ABOUT . " — жми сюда, чтобы получить больше информации о самом проекте и сервисе. Я подробно расскажу о том, какие данные нам доступны и как их можно использовать.\n"
-            . self::BTN_HELP . " — жми сюда, если у тебя возникли какие-то вопросы или сложности, связанные с проектом. Наша поддержка оперативно тебе поможет и ответит на все вопросы.";
+            . '<b>' . self::BTN_ISSUERS . '</b>' . " — жми сюда, чтобы составить или отредактировать список эмитентов, за которыми нужно следить.\n"
+            . '<b>' . self::BTN_STATUS . '</b>' . " — жми сюда, чтобы получить актуальную информацию по конкретному эмитенту или всему списку.\n"
+            . '<b>' . self::BTN_SUBSCRIPTION . '</b>' . " — жми сюда, чтобы получить информацию о текущей подписке и тарифах.\n"
+            . '<b>' . self::BTN_ABOUT . '</b>' . " — жми сюда, чтобы получить больше информации о самом проекте и сервисе. Я подробно расскажу о том, какие данные нам доступны и как их можно использовать.\n"
+            . '<b>' . self::BTN_HELP . '</b>' . " — жми сюда, если у тебя возникли какие-то вопросы или сложности, связанные с проектом. Наша поддержка оперативно тебе поможет и ответит на все вопросы.";
     }
 
-    // === Раздел "Выбор эмитентов" — docs/BOT_UX_SPEC.md раздел 3 ===
+    // === Раздел "Выбор компаний" — docs/BOT_UX_SPEC.md раздел 3 ===
 
     /** Вход в раздел — сообщение с двумя инлайн-кнопками, дословно из ТЗ. */
     private function handleIssuerMenuEntry(): array

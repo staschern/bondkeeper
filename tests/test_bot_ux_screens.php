@@ -28,7 +28,7 @@ final class FakeTelegramClient implements TelegramClientInterface
     /** @var array{chat_id: int, message_id: int, text: string, keyboard: ?array}|null последний вызов editMessageText() — для проверок содержимого/кнопок */
     public ?array $lastEdit = null;
 
-    public function sendMessage(int $chatId, string $text, ?array $replyMarkup = null): bool
+    public function sendMessage(int $chatId, string $text, ?array $replyMarkup = null, ?string $parseMode = null): bool
     {
         return true;
     }
@@ -147,7 +147,7 @@ check('handleStatus(): оба эмитента в ответе', str_contains($f
 // --- Пустой список ---
 $emptyStatus = callPrivate($ref, $handler, 'handleStatus', [999]);
 check('handleStatus(): пустой список — грустный смайлик из ТЗ', str_contains($emptyStatus['text'], 'пуст 😢'));
-check('handleStatus(): пустой список даёт кнопку "Выбор эмитентов"', isset($emptyStatus['keyboard']['inline_keyboard'][0][0]['callback_data']) && $emptyStatus['keyboard']['inline_keyboard'][0][0]['callback_data'] === 'iss:add_menu');
+check('handleStatus(): пустой список даёт кнопку "Выбор компаний"', isset($emptyStatus['keyboard']['inline_keyboard'][0][0]['callback_data']) && $emptyStatus['keyboard']['inline_keyboard'][0][0]['callback_data'] === 'iss:add_menu');
 
 // --- Подписка ---
 $subscription = callPrivate($ref, $handler, 'handleSubscription', [1]);
@@ -198,7 +198,7 @@ check('relayAdminReplyToUser(): нашёл маппинг и вернул true',
 $notFound = callPrivate($ref, $handler, 'relayAdminReplyToUser', [555, 123456, 'Reply на чужое сообщение']);
 check('relayAdminReplyToUser(): Reply НЕ на наше сообщение -> false (не наш случай)', $notFound === false);
 
-// --- "Выбор эмитентов": умный поиск (searchIssuers) ---
+// --- "Выбор компаний": умный поиск (searchIssuers) ---
 $byIsin = callPrivate($ref, $handler, 'searchIssuers', ['RU000A1035N9']);
 check('searchIssuers(): находит по ISIN', count($byIsin) === 1 && $byIsin[0]['id'] === 1);
 
@@ -303,7 +303,7 @@ check('dispatchIssuerCallback(): реально убрало через полн
 // --- Цвета кнопок меню (прямое указание пользователя, 8 сентября 2026) ---
 $menuKb = callPrivate($ref, $handler, 'mainMenuKeyboard', []);
 $rows = $menuKb['keyboard'];
-check('Меню: "Выбор эмитентов" — style=primary (синяя)', $rows[0][0]['style'] === 'primary');
+check('Меню: "Выбор компаний" — style=primary (синяя)', $rows[0][0]['style'] === 'primary');
 check('Меню: "Подписка" — style=success (зелёная)', $rows[0][1]['style'] === 'success');
 check('Меню: "Статус" — без style (серая по умолчанию)', !isset($rows[1][0]['style']));
 check('Меню: "О сервисе" — style=danger (красная)', $rows[1][1]['style'] === 'danger');
