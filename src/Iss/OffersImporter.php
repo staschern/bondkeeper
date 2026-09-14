@@ -8,38 +8,66 @@ use BondKeeper\Support\Logger;
 use PDO;
 
 /**
- * Наполняет offers через доска-специфичный эндпоинт ISS API
- * (/iss/engines/stock/markets/bonds/boards/{board}/securities/{secid}.json),
- * который до этого момента в проекте не запрашивался вообще — подтверждён
- * вживую (bondkeeper.ru, август 2026) через bin/debug_iss_security.php на
- * 3 бумагах перед тем, как писать этот импортёр.
+ * Переписано 14 сентября 2026 — по итогам отдельного расследования
+ * (задача "почти нет call-оферт", начатая ранее в этом же этапе): исходная
+ * версия опиралась ТОЛЬКО на доска-специфичный эндпоинт
+ * (.../boards/{board}/securities/{secid}.json, поля OFFERDATE/BUYBACKDATE) —
+ * он отдаёт для каждой бумаги не полный график оферт, а как будто снимок
+ * "ближайшая оферта на сегодня", и на части бумаг (пример живьём —
+ * RU000A10B313, «Брусника 002Р-05») эта дата попросту не заполняется, хотя
+ * оферта у бумаги реально есть и видна в другом эндпоинте в тот же день.
  *
- * На всех трёх проверенных бумагах OFFERDATE и BUYBACKDATE (тот же сигнал,
- * что уже даёт securities.has_offer) совпали день в день. Выборка
- * маленькая, поэтому здесь ведётся честный подсчёт по трём группам (оба
- * сигнала / только BUYBACKDATE / только OFFERDATE) на каждом реальном
- * прогоне — а не предполагается, что они всегда совпадают. Строка в
- * offers создаётся, если есть ХОТЯ БЫ ОДИН из двух сигналов — объединение,
- * не пересечение (по прямому запросу пользователя).
+ * Найден более полный бесплатный источник — тот же bondization-эндпоинт,
+ * который уже используется для купонов/амортизаций
+ * (BondizationImporter), с iss.only=offers:
+ *   /iss/statistics/engines/stock/markets/bonds/bondization/{ISIN}.json?iss.only=offers
+ * Отдаёт блок "offers" с колонками isin, offerdate, offertype и др. — по
+ * каждой бумаге может быть несколько строк (история: прошлые оферты,
+ * отменённые, с разными исходами), а не одна дата "на сегодня".
  *
- * BUYBACKDATE в этом эндпоинте у бумаг без оферты приходит не как NULL, а
- * как технический "0000-00-00" — та же защита (nullableDate), что уже
- * была нужна в SecuritiesImporter для другого эндпоинта.
+ * offertype — реально встречающиеся значения (сверено вживую на выборке
+ * bondkeeper.ru, 14 сентября 2026, iss.moex.com):
+ *   'Оферта', 'Оферта/Погашение'                         — актуальна/предстоит
+ *   'Оферта (состоялось)', 'Оферта/Погашение (состоялось)' — уже прошла
+ *   'Оферта (отменено)'                                    — не состоится
+ *   'Оферта (дефолт)', 'Оферта (технический дефолт)'       — не исполнена эмитентом
+ * Берём в offers только предстоящие (см. ACTIONABLE_OFFER_TYPES) и только с
+ * датой не в прошлом — остальные типы либо уже случились, либо не
+ * случатся, отдельная история этих исходов здесь не нужна (offers — это
+ * "что предстоит", не журнал).
  *
- * offer_type — бонус-находка, не было в исходном плане (там должен был
- * остаться 'unknown'): PUTOPTIONDATE/CALLOPTIONDATE в этом же ответе на
- * обоих проверенных примерах с офертой заполнено ровно одно из двух —
- * второе NULL. Даёт put/call бесплатно, без похода на RusBonds. Если оба
- * поля пусты или оба заполнены (не встречалось на 3 примерах, но не
- * исключено на 3000+) — честно 'unknown', не гадаем.
+ * 'Оферта/Погашение' включена в предстоящие наравне с чистой 'Оферта' —
+ * проверено на выборке: если у такой записи реальная (не "0000-00-00")
+ * будущая дата, эта дата — настоящее инвестиционно значимое событие (право
+ * предъявить бумагу к выкупу), суффикс "/Погашение" по всей видимости
+ * означает лишь "если офертой не воспользоваться — далее бумага идёт к
+ * погашению", а не "это не оферта". Отдельного признака put/call у этого
+ * эндпоинта нет вообще ни для одного из 7 значений offertype.
+ *
+ * put/call и признак BUYBACKDATE bondization/offers НЕ отдаёт — для них
+ * по-прежнему нужен доска-специфичный эндпоинт (PUTOPTIONDATE/
+ * CALLOPTIONDATE/BUYBACKDATE), но теперь он запрашивается ВТОРЫМ шагом,
+ * только для бумаг, где bondization/offers уже подтвердил предстоящую
+ * оферту — а не для всех активных бумаг подряд, как раньше. Это не только
+ * точнее (полнота дат), но и дешевле по числу HTTP-запросов на бумагах без
+ * оферты вообще (подавляющее большинство рынка).
+ *
+ * Настоящий бесплатный put/call-типизатор в природе не существует:
+ * сверено с providers-страницей bondana.app (https://bondana.app/providers,
+ * доступ открыт пользователем для этой сверки) — там прямо указано, что
+ * даты И тип (Call/Put) оферт у них идут от Cbonds, платного источника.
+ * Так что 'unknown' по offer_type там, где put/call не удалось определить
+ * из PUTOPTIONDATE/CALLOPTIONDATE — не пробел в реализации, а честный
+ * предел бесплатных данных.
  */
 final class OffersImporter
 {
+    private const ACTIONABLE_OFFER_TYPES = ['Оферта', 'Оферта/Погашение'];
+
     private int $checked = 0;
     private int $foundOffers = 0;
-    private int $bothSignals = 0;
-    private int $onlyBuybackDate = 0;
-    private int $onlyOfferDate = 0;
+    private int $boardLookupMissing = 0;
+    private int $hasBuybackDate = 0;
     private int $offerTypeResolved = 0;
     private int $failed = 0;
 
@@ -52,7 +80,7 @@ final class OffersImporter
     public function importForAllActive(): void
     {
         $stmt = $this->db->query(
-            "SELECT id, issuer_id, secid, moex_board FROM securities
+            "SELECT id, issuer_id, isin, secid, moex_board FROM securities
              WHERE status = 'active' AND secid IS NOT NULL AND moex_board IS NOT NULL"
         );
         $securities = $stmt->fetchAll();
@@ -65,6 +93,7 @@ final class OffersImporter
                 $this->importOne(
                     (int) $row['id'],
                     (int) $row['issuer_id'],
+                    (string) $row['isin'],
                     (string) $row['secid'],
                     (string) $row['moex_board']
                 );
@@ -77,35 +106,42 @@ final class OffersImporter
         $this->printReport();
     }
 
-    private function importOne(int $securityId, int $issuerId, string $secid, string $board): void
+    private function importOne(int $securityId, int $issuerId, string $isin, string $secid, string $board): void
     {
         $response = $this->iss->getJson(
+            "/statistics/engines/stock/markets/bonds/bondization/{$isin}.json",
+            ['iss.only' => 'offers']
+        );
+        $offerRows = IssClient::block($response, 'offers');
+
+        $offerDate = $this->resolveUpcomingOfferDate($offerRows);
+        if ($offerDate === null) {
+            return;
+        }
+
+        $this->foundOffers++;
+
+        // Второй запрос — только теперь, когда предстоящая оферта уже
+        // подтверждена: put/call и BUYBACKDATE в bondization/offers не
+        // приходят вообще, единственный источник — доска-специфичный
+        // эндпоинт (тот же, что раньше был единственным шагом).
+        $boardResponse = $this->iss->getJson(
             "/engines/stock/markets/bonds/boards/{$board}/securities/{$secid}.json",
             ['iss.only' => 'securities']
         );
-        $rows = IssClient::block($response, 'securities');
-        $row = $rows[0] ?? null;
-        if ($row === null) {
-            return;
+        $boardRows = IssClient::block($boardResponse, 'securities');
+        $boardRow = $boardRows[0] ?? null;
+
+        if ($boardRow === null) {
+            $this->boardLookupMissing++;
         }
 
-        $offerDate = $this->nullableDate($row['OFFERDATE'] ?? null);
-        $hasBuybackDate = $this->nullableDate($row['BUYBACKDATE'] ?? null) !== null;
-        $hasOfferDate = $offerDate !== null;
-
-        if (!$hasBuybackDate && !$hasOfferDate) {
-            return;
+        $hasBuybackDate = $boardRow !== null && $this->nullableDate($boardRow['BUYBACKDATE'] ?? null) !== null;
+        if ($hasBuybackDate) {
+            $this->hasBuybackDate++;
         }
 
-        if ($hasBuybackDate && $hasOfferDate) {
-            $this->bothSignals++;
-        } elseif ($hasBuybackDate) {
-            $this->onlyBuybackDate++;
-        } else {
-            $this->onlyOfferDate++;
-        }
-
-        $offerType = $this->resolveOfferType($row);
+        $offerType = $boardRow !== null ? $this->resolveOfferType($boardRow) : 'unknown';
         if ($offerType !== 'unknown') {
             $this->offerTypeResolved++;
         }
@@ -126,8 +162,39 @@ final class OffersImporter
             'has_buyback_date' => (int) $hasBuybackDate,
             'offer_type' => $offerType,
         ]);
+    }
 
-        $this->foundOffers++;
+    /**
+     * Из всех строк bondization/offers для бумаги выбирает ближайшую
+     * будущую (или сегодняшнюю) дату среди "предстоящих" типов оферты —
+     * см. ACTIONABLE_OFFER_TYPES и докблок класса. У бумаги может быть
+     * несколько строк истории (отменённые, уже состоявшиеся) — они
+     * отбрасываются здесь же, до похода на доска-специфичный эндпоинт.
+     *
+     * @param array<int, array<string, mixed>> $offerRows
+     */
+    private function resolveUpcomingOfferDate(array $offerRows): ?string
+    {
+        $today = date('Y-m-d');
+        $best = null;
+
+        foreach ($offerRows as $row) {
+            $type = trim((string) ($row['offertype'] ?? ''));
+            if (!in_array($type, self::ACTIONABLE_OFFER_TYPES, true)) {
+                continue;
+            }
+
+            $date = $this->nullableDate($row['offerdate'] ?? null);
+            if ($date === null || $date < $today) {
+                continue;
+            }
+
+            if ($best === null || $date < $best) {
+                $best = $date;
+            }
+        }
+
+        return $best;
     }
 
     /** @param array<string, mixed> $row */
@@ -159,11 +226,10 @@ final class OffersImporter
     {
         Logger::info('=== Отчёт по импорту оферт (offers) ===');
         Logger::info("Бумаг проверено: {$this->checked}");
-        Logger::info("Найдено оферт (объединение BUYBACKDATE/OFFERDATE): {$this->foundOffers}");
-        Logger::info("  - оба сигнала совпадают: {$this->bothSignals}");
-        Logger::info("  - только BUYBACKDATE (нет OFFERDATE): {$this->onlyBuybackDate}");
-        Logger::info("  - только OFFERDATE (нет BUYBACKDATE): {$this->onlyOfferDate}");
-        Logger::info("Вид оферты определён (PUTOPTIONDATE/CALLOPTIONDATE): {$this->offerTypeResolved}");
+        Logger::info("Найдено предстоящих оферт (bondization/offers): {$this->foundOffers}");
+        Logger::info("  - из них с признаком BUYBACKDATE (доска-эндпоинт): {$this->hasBuybackDate}");
+        Logger::info("  - из них вид оферты определён (PUTOPTIONDATE/CALLOPTIONDATE): {$this->offerTypeResolved}");
+        Logger::info("  - доска-эндпоинт не вернул строку securities: {$this->boardLookupMissing}");
         Logger::info("Ошибок: {$this->failed}");
     }
 }

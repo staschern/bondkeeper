@@ -34,7 +34,7 @@ src/Iss/IssuerNameShortener.php      — issuers.short_name из full_name (эв
 src/Iss/BondizationImporter.php      — coupons/amortizations
 src/Fns/NalogBiClient.php            — HTTP-клиент service.nalog.ru/bi.do (блокировки счетов)
 src/Fns/FnsBlocksImporter.php        — fns_blocks, issuers.is_fns_blocked
-src/Iss/OffersImporter.php           — offers (дата, has_buyback_date, offer_type put/call/unknown)
+src/Iss/OffersImporter.php           — offers: дата — bondization/offers, has_buyback_date/offer_type put/call/unknown — доска-эндпоинт (переписано 14 сентября 2026, см. docs/STAGE1_POSTPROCESSING.md)
 src/Ratings/XlsxReader.php           — минимальный читатель .xlsx (ZIP+XML) без зависимостей
 src/Ratings/IssuerMatcher.php        — сопоставление эмитента агентства с issuers.id по ИНН (и по названию, когда ИНН взять неоткуда)
 src/Ratings/RatingsNormalizer.php    — общие преобразования (прогноз, дата) для рейтинговых выгрузок
@@ -83,6 +83,7 @@ tests/test_notification_dispatcher.php — офлайн-проверка рас�
 tests/test_no_duplicate_named_params.php — статическая проверка ->prepare(): нет повторов :имени плейсхолдера в одном запросе (PDO::ATTR_EMULATE_PREPARES=false — MySQL это не прощает, в отличие от SQLite)
 tests/test_issuer_name_shortener.php — офлайн-проверка IssuerNameShortener (24 проверки, чистая текстовая логика, БД не нужна)
 bin/backfill_issuer_short_names.php  — разовая пересборка issuers.short_name из full_name для строк, накопленных до появления IssuerNameShortener (идемпотентно, безопасно перезапускать)
+tests/test_offers_importer.php       — офлайн-проверка OffersImporter (20 проверок: выбор даты/типа оферты из bondization/offers, put/call — чистая логика, БД не нужна)
 ```
 
 ## Запуск
@@ -139,7 +140,7 @@ php bin/seed_offers.php        # offers (дата, has_buyback_date, offer_type)
 
 Из этой же находки — **`is_structured` тоже читается напрямую из `BOND_TYPE`** (ключевое слово «структурн»), просто предыдущая эвристика искала там только признаки характера ставки и игнорировала эту метку. **`is_amortized` берётся не из текста, а из факта: есть ли у бумаги реально загруженные строки в `amortizations`** — это надёжнее, чем текстовое совпадение, и правится не в `SecuritiesImporter`, а в `BondizationImporter` (ставится по итогам импорта графика выплат). Раньше оба поля нигде не выставлялись и оставались `FALSE` для всех бумаг независимо от реальности.
 
-**Оферта (`offers`) — тоже нашлась бесплатно, но в другом эндпоинте.** Не в уже используемом `description` (`/iss/securities/{ISIN}.json`), а в отдельном, доска-специфичном `/iss/engines/stock/markets/bonds/boards/{board}/securities/{secid}.json`, до этой задачи в проекте нигде не запрашивавшемся. Оттуда же — `PUTOPTIONDATE`/`CALLOPTIONDATE`: ровно одно из двух заполнено у проверенных бумаг с офертой, что даёт `offer_type` (put/call) без похода на RusBonds; если оба поля пусты или оба заполнены — честно `unknown`. Подробности и результаты боевой проверки — `docs/STAGE1_POSTPROCESSING.md`.
+**Оферта (`offers`) — тоже нашлась бесплатно, но не в одном эндпоинте.** Дата оферты (14 сентября 2026, переписано) берётся из `bondization`-эндпоинта (`/iss/statistics/engines/stock/markets/bonds/bondization/{ISIN}.json?iss.only=offers`) — того же, что уже используется для купонов/амортизаций — он полнее доска-специфичного `.../boards/{board}/securities/{secid}.json`, который использовался раньше как единственный источник и на практике пропускал реальные оферты (живой пример — `RU000A10B313`, см. `docs/STAGE1_POSTPROCESSING.md`). Вид оферты (put/call) по-прежнему берётся только с доска-специфичного эндпоинта — `PUTOPTIONDATE`/`CALLOPTIONDATE`: ровно одно из двух заполнено у проверенных бумаг с офертой; если оба поля пусты или оба заполнены — честно `unknown`. Свободного источника типизации put/call для всего рынка не существует в принципе — сверено с providers-страницей `bondana.app`, где даты и тип оферты идут от Cbonds (платный источник). Подробности и результаты боевой проверки — `docs/STAGE1_POSTPROCESSING.md`.
 
 **Точно НЕДОСТУПНО бесплатно через ISS API** (не предположение — проверено):
 - `is_instruction_based` — в проверенном ответе описания бумаги без активной оферты этих полей не было; требует проверки на бумаге, у которой оферта реально есть.
