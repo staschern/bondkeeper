@@ -13,13 +13,26 @@ declare(strict_types=1);
  * запросе подряд в одной сессии), и мы ещё не знаем, насколько это
  * реально мешает на большом объёме. Начинаем с маленьких партий.
  *
+ * Запуск по РЕАЛЬНОМУ листу наблюдения (17 сентября 2026, "как изначально
+ * задумано" — прямой запрос пользователя): DISTINCT эмитенты, которых
+ * хоть один пользователь реально отслеживает в боте (таблица `watchlist`),
+ * а не статичный файл-заготовка (см. --watchlist-file ниже, это разные
+ * вещи, несмотря на созвучное название). Это и есть режим для крона —
+ * список автоматически растёт/сужается вместе с реальными подписками, без
+ * ручной правки файла:
+ *   php bin/check_fns_blocks.php --from-watchlist
+ *
  * Запуск по конкретным ИНН (первый тест — известные 6 заблокированных):
  *   php bin/check_fns_blocks.php --inns=1101148661,3702151662,7730176955,7805485840,7826108963,9727020246
  *
  * Запуск по списку ИНН из файла (по одному на строку, # — комментарий) —
- * удобнее --inns для длинных списков и для cron, чтобы не редактировать
- * саму строку crontab при изменении списка:
- *   php bin/check_fns_blocks.php --watchlist=config/fns_watchlist.txt
+ * НЕ связан с реальным листом наблюдения пользователей, это отдельный,
+ * вручную составленный список (см. config/fns_watchlist.txt — исходная
+ * партия из документов пользователя, август 2026, до того, как в боте
+ * появился реальный watchlist) — остаётся для точечной ручной проверки
+ * конкретных эмитентов вне зависимости от того, следит ли за ними кто-то
+ * в боте:
+ *   php bin/check_fns_blocks.php --watchlist-file=config/fns_watchlist.txt
  *
  * Запуск по первым N эмитентам из справочника (по умолчанию N=5):
  *   php bin/check_fns_blocks.php --limit=10
@@ -33,10 +46,10 @@ declare(strict_types=1);
  * (--retries=0 — старое поведение, без повторов, сразу до завтрашнего крона):
  *   php bin/check_fns_blocks.php --limit=10 --retries=3 --retry-delay=120
  *
- * По расписанию — раз в сутки по watchlist, в 08:00 (сервис ФНС не даёт
- * официального API — только точечный список, не весь рынок, см.
- * docs/STAGE1_POSTPROCESSING.md):
- *   0 8 * * * /usr/bin/php /path/to/bondkeeper/bin/check_fns_blocks.php --watchlist=config/fns_watchlist.txt --delay=8 >> /var/log/bondkeeper/check_fns_blocks.log 2>&1
+ * По расписанию — раз в сутки по реальному листу наблюдения, в 08:00
+ * (сервис ФНС не даёт официального API — только точечный список, не весь
+ * рынок, см. docs/STAGE1_POSTPROCESSING.md):
+ *   0 8 * * * /usr/bin/php /path/to/bondkeeper/bin/check_fns_blocks.php --from-watchlist --delay=8 >> /var/log/bondkeeper/check_fns_blocks.log 2>&1
  */
 
 require __DIR__ . '/bootstrap.php';
@@ -48,16 +61,19 @@ use BondKeeper\Fns\NalogBiClient;
 use BondKeeper\Support\Logger;
 
 $inns = null;
+$fromWatchlist = false;
 $limit = 5;
 $delaySeconds = 5;
 $maxRetries = 2;
 $retryDelaySeconds = 90;
 
 foreach ($argv as $arg) {
-    if (str_starts_with($arg, '--inns=')) {
+    if ($arg === '--from-watchlist') {
+        $fromWatchlist = true;
+    } elseif (str_starts_with($arg, '--inns=')) {
         $inns = array_values(array_filter(array_map('trim', explode(',', substr($arg, 7)))));
-    } elseif (str_starts_with($arg, '--watchlist=')) {
-        $inns = readWatchlist(substr($arg, 12));
+    } elseif (str_starts_with($arg, '--watchlist-file=')) {
+        $inns = readWatchlistFile(substr($arg, 17));
     } elseif (str_starts_with($arg, '--limit=')) {
         $limit = max(1, (int) substr($arg, 8));
     } elseif (str_starts_with($arg, '--delay=')) {
@@ -70,7 +86,7 @@ foreach ($argv as $arg) {
 }
 
 /** @return string[] */
-function readWatchlist(string $path): array
+function readWatchlistFile(string $path): array
 {
     $resolved = is_file($path) ? $path : __DIR__ . '/../' . ltrim($path, '/');
     $lines = file($resolved, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
@@ -86,7 +102,21 @@ function readWatchlist(string $path): array
 
 $db = Database::connection();
 
-if ($inns !== null && $inns !== []) {
+if ($fromWatchlist) {
+    // DISTINCT — issuer_id в watchlist заполнен ВСЕГДА, в т.ч. при слежении
+    // за конкретной бумагой (см. докблок CREATE TABLE watchlist), так что
+    // один и тот же эмитент не проверяется дважды, даже если его
+    // отслеживают несколько пользователей или по нескольким бумагам сразу.
+    // inn IS NOT NULL — исключает 2 известных евробондовых SPV без
+    // российского ИНН (см. README.md, "Итог боевых прогонов").
+    $stmt = $db->query(
+        'SELECT DISTINCT i.id, i.inn
+         FROM watchlist w
+         JOIN issuers i ON i.id = w.issuer_id
+         WHERE i.inn IS NOT NULL
+         ORDER BY i.id'
+    );
+} elseif ($inns !== null && $inns !== []) {
     $placeholders = implode(',', array_fill(0, count($inns), '?'));
     $stmt = $db->prepare("SELECT id, inn FROM issuers WHERE inn IN ({$placeholders})");
     $stmt->execute($inns);
