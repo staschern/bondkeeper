@@ -161,6 +161,9 @@ final class BotCommandHandler
         $userId = $this->ensureUser($telegramId, $username);
 
         $toast = $this->dispatchIssuerCallback($userId, $chatId, $messageId, $data);
+        if ($toast === null) {
+            $toast = $this->dispatchStatusCallback($userId, $chatId, $messageId, $data);
+        }
         $this->telegram->answerCallbackQuery($id, $toast);
     }
 
@@ -171,7 +174,7 @@ final class BotCommandHandler
             '/start' => ['text' => $this->handleStart(), 'keyboard' => $this->mainMenuKeyboard(), 'parseMode' => 'HTML'],
             '/help' => ['text' => $this->helpText()],
             self::BTN_ISSUERS => $this->handleIssuerMenuEntry(),
-            self::BTN_STATUS => $this->handleStatus($userId),
+            self::BTN_STATUS => $this->handleStatusMenuEntry($userId),
             self::BTN_SUBSCRIPTION => ['text' => $this->handleSubscription($userId), 'parseMode' => 'HTML'],
             self::BTN_ABOUT => ['text' => $this->aboutServiceText(), 'keyboard' => $this->aboutServiceKeyboard(), 'parseMode' => 'HTML'],
             self::BTN_HELP => ['text' => $this->startSupportFlow($userId)],
@@ -649,8 +652,12 @@ final class BotCommandHandler
         ];
     }
 
-    /** @return array{text: string, keyboard?: array<string, mixed>} docs/BOT_UX_SPEC.md, раздел 4 — формат дословно из ТЗ. */
-    private function handleStatus(int $userId): array
+    /**
+     * @return array<int, array{id: int, short_name: string, inn: string}>
+     * Список отслеживаемых пользователем эмитентов — общий источник для
+     * handleStatusMenuEntry()/statusAllText()/showStatusPickList().
+     */
+    private function watchlistIssuers(int $userId): array
     {
         $stmt = $this->db->prepare(
             'SELECT DISTINCT i.id, i.short_name, i.inn
@@ -660,21 +667,113 @@ final class BotCommandHandler
              ORDER BY i.short_name'
         );
         $stmt->execute(['user_id' => $userId]);
-        $issuers = $stmt->fetchAll();
 
-        if ($issuers === []) {
+        return $stmt->fetchAll();
+    }
+
+    /**
+     * @return array{text: string, keyboard?: array<string, mixed>}
+     * docs/BOT_UX_SPEC.md, раздел 4 — правка от 17 сентября 2026 (было:
+     * сразу весь список по нажатию "Статус"): теперь сначала выбор — одна
+     * компания или весь список, по аналогии с "Выбор компаний"
+     * (handleIssuerMenuEntry()). Пустой список отслеживания — тот же
+     * текст/кнопка, что и раньше, БЕЗ выбора (указывать компанию не из
+     * чего, "весь список" тоже пуст).
+     */
+    private function handleStatusMenuEntry(int $userId): array
+    {
+        if ($this->watchlistIssuers($userId) === []) {
             return [
                 'text' => 'Ваш список эмитентов для отслеживания пуст 😢',
                 'keyboard' => ['inline_keyboard' => [[['text' => self::BTN_ISSUERS, 'callback_data' => 'iss:add_menu']]]],
             ];
         }
 
+        return [
+            'text' => 'Что показать?',
+            'keyboard' => ['inline_keyboard' => [
+                [['text' => 'Указать компанию', 'callback_data' => 'stat:pick_menu']],
+                [['text' => 'Весь список', 'callback_data' => 'stat:all']],
+            ]],
+        ];
+    }
+
+    /** Текст "весь список" — тот же формат, что был единственным до правки от 17 сентября 2026. */
+    private function statusAllText(int $userId): string
+    {
         $blocks = array_map(
             fn (array $issuer): string => $this->formatIssuerStatus((int) $issuer['id'], (string) $issuer['short_name'], (string) $issuer['inn']),
-            $issuers
+            $this->watchlistIssuers($userId)
         );
 
-        return ['text' => implode("\n\n", $blocks)];
+        return implode("\n\n", $blocks);
+    }
+
+    /**
+     * Разбор callback_data вида "stat:<действие>[:...]" — раздел "Статус"
+     * (docs/BOT_UX_SPEC.md, раздел 4), отдельный префикс от "iss:" (тот
+     * отвечает за раздел "Выбор компаний"). Тот же приём возврата тоста/
+     * null, что и dispatchIssuerCallback().
+     */
+    private function dispatchStatusCallback(int $userId, int $chatId, int $messageId, string $data): ?string
+    {
+        $parts = explode(':', $data);
+        if (($parts[0] ?? '') !== 'stat') {
+            return null;
+        }
+
+        return match ($parts[1] ?? '') {
+            'pick_menu' => $this->showStatusPickList($userId, $chatId, $messageId),
+            'all' => $this->showStatusAll($userId, $chatId, $messageId),
+            'one' => $this->showStatusOne($userId, $chatId, $messageId, (int) ($parts[2] ?? 0)),
+            default => null,
+        };
+    }
+
+    /** "Указать компанию" — список ТОЛЬКО из текущего вотчлиста пользователя (не полный рынок, как в "Выбор компаний"). */
+    private function showStatusPickList(int $userId, int $chatId, int $messageId): ?string
+    {
+        $buttons = array_map(
+            static fn (array $issuer): array => [['text' => $issuer['short_name'], 'callback_data' => 'stat:one:' . $issuer['id']]],
+            $this->watchlistIssuers($userId)
+        );
+
+        $this->telegram->editMessageText($chatId, $messageId, 'Выберите компанию:', ['inline_keyboard' => $buttons]);
+
+        return null;
+    }
+
+    private function showStatusAll(int $userId, int $chatId, int $messageId): ?string
+    {
+        $this->telegram->editMessageText($chatId, $messageId, $this->statusAllText($userId));
+
+        return null;
+    }
+
+    /**
+     * Сверяем issuerId с реальным вотчлистом пользователя (а не берём
+     * любой id из callback_data как есть) — та же защита, что и у
+     * remove/toggle в разделе "Выбор компаний": чужой/устаревший id
+     * (эмитента убрали из списка между показом кнопок и нажатием) не
+     * должен тихо показать статус не туда.
+     */
+    private function showStatusOne(int $userId, int $chatId, int $messageId, int $issuerId): ?string
+    {
+        $match = null;
+        foreach ($this->watchlistIssuers($userId) as $issuer) {
+            if ((int) $issuer['id'] === $issuerId) {
+                $match = $issuer;
+                break;
+            }
+        }
+
+        $text = $match !== null
+            ? $this->formatIssuerStatus((int) $match['id'], (string) $match['short_name'], (string) $match['inn'])
+            : 'Эта компания больше не в вашем списке отслеживания.';
+
+        $this->telegram->editMessageText($chatId, $messageId, $text);
+
+        return null;
     }
 
     private function formatIssuerStatus(int $issuerId, string $shortName, string $inn): string
@@ -691,7 +790,7 @@ final class BotCommandHandler
                 'Дата блокировки: %s | Количество заблокированных счетов: %d | Заблокированная сумма: %s',
                 BotFormatting::formatDate($fns['block_date'] !== null ? (string) $fns['block_date'] : null),
                 (int) $fns['active_bank_count'],
-                $fns['blocked_amount'] !== null ? (string) $fns['blocked_amount'] : 'не указана'
+                BotFormatting::formatMoney($fns['blocked_amount'] !== null ? (string) $fns['blocked_amount'] : null)
             );
 
         $ratingsStmt = $this->db->prepare(

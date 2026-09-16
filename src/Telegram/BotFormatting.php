@@ -38,4 +38,20 @@ final class BotFormatting
 
         return $dt !== false ? $dt->format('d.m.y') : $isoDate;
     }
+
+    /**
+     * DECIMAL-строка из БД ('46740445.40') -> "46 740 445.40 ₽" — разделитель
+     * разрядов пробелом, по прямому запросу пользователя (17 сентября 2026):
+     * до этого сумма блокировки выводилась как есть, сплошной строкой цифр,
+     * что тяжело читается на суммах от 7 знаков. null/'' -> 'не указана'
+     * (тот же текст, что уже был запасным значением в formatIssuerStatus()).
+     */
+    public static function formatMoney(?string $decimal): string
+    {
+        if ($decimal === null || $decimal === '') {
+            return 'не указана';
+        }
+
+        return number_format((float) $decimal, 2, '.', ' ') . ' ₽';
+    }
 }

@@ -131,7 +131,7 @@ $status1 = callPrivate($ref, $handler, 'formatIssuerStatus', [1, 'Роснефт
 check('Статус: название и ИНН на месте', str_starts_with($status1, 'Роснефть | ИНН 7706107510'));
 check('Статус: дата блокировки в формате дд.мм.гг', str_contains($status1, '15.08.26'));
 check('Статус: количество банков', str_contains($status1, 'Количество заблокированных счетов: 3'));
-check('Статус: сумма блокировки', str_contains($status1, '1500000.00'));
+check('Статус: сумма блокировки с разделителем разрядов и знаком ₽ (решение от 17 сентября)', str_contains($status1, '1 500 000.00 ₽'));
 check('Статус: НКР с человекочитаемым названием агентства', str_contains($status1, 'Агентство: НКР | Рейтинг: AAA.ru | Прогноз: stable | Дата действия: 01.07.26'));
 check('Статус: АКРА тоже присутствует (два рейтинга по одному эмитенту)', str_contains($status1, 'Агентство: АКРА | Рейтинг: AAA(RU)'));
 
@@ -140,14 +140,49 @@ $status2 = callPrivate($ref, $handler, 'formatIssuerStatus', [2, 'Газпром
 check('Статус: "нет блокировки" при is_fns_blocked=0', str_contains($status2, 'Заблокированных счетов нет ✅'));
 check('Статус: "без рейтинга" когда нет строк current_ratings', str_contains($status2, 'Эмитент без рейтинга'));
 
-// --- Полный экран handleStatus() для пользователя с обоими эмитентами ---
-$fullStatus = callPrivate($ref, $handler, 'handleStatus', [1])['text'];
-check('handleStatus(): оба эмитента в ответе', str_contains($fullStatus, 'Роснефть') && str_contains($fullStatus, 'Газпром'));
+// --- Раздел "Статус" — правка от 17 сентября 2026: сначала выбор, не сразу весь список ---
+$statusMenu = callPrivate($ref, $handler, 'handleStatusMenuEntry', [1]);
+check('handleStatusMenuEntry(): непустой список — две кнопки выбора, не сразу текст', $statusMenu['text'] === 'Что показать?');
+check(
+    'handleStatusMenuEntry(): кнопка "Указать компанию" -> stat:pick_menu',
+    $statusMenu['keyboard']['inline_keyboard'][0][0]['text'] === 'Указать компанию'
+    && $statusMenu['keyboard']['inline_keyboard'][0][0]['callback_data'] === 'stat:pick_menu'
+);
+check(
+    'handleStatusMenuEntry(): кнопка "Весь список" -> stat:all',
+    $statusMenu['keyboard']['inline_keyboard'][1][0]['text'] === 'Весь список'
+    && $statusMenu['keyboard']['inline_keyboard'][1][0]['callback_data'] === 'stat:all'
+);
 
-// --- Пустой список ---
-$emptyStatus = callPrivate($ref, $handler, 'handleStatus', [999]);
-check('handleStatus(): пустой список — грустный смайлик из ТЗ', str_contains($emptyStatus['text'], 'пуст 😢'));
-check('handleStatus(): пустой список даёт кнопку "Выбор компаний"', isset($emptyStatus['keyboard']['inline_keyboard'][0][0]['callback_data']) && $emptyStatus['keyboard']['inline_keyboard'][0][0]['callback_data'] === 'iss:add_menu');
+// --- Пустой список — БЕЗ выбора, тот же текст/кнопка, что и раньше ---
+$emptyStatus = callPrivate($ref, $handler, 'handleStatusMenuEntry', [999]);
+check('handleStatusMenuEntry(): пустой список — грустный смайлик из ТЗ', str_contains($emptyStatus['text'], 'пуст 😢'));
+check('handleStatusMenuEntry(): пустой список даёт кнопку "Выбор компаний"', isset($emptyStatus['keyboard']['inline_keyboard'][0][0]['callback_data']) && $emptyStatus['keyboard']['inline_keyboard'][0][0]['callback_data'] === 'iss:add_menu');
+
+// --- "Весь список" (statusAllText) — тот же формат, что был единственным раньше ---
+$fullStatus = callPrivate($ref, $handler, 'statusAllText', [1]);
+check('statusAllText(): оба эмитента в ответе', str_contains($fullStatus, 'Роснефть') && str_contains($fullStatus, 'Газпром'));
+
+// --- dispatchStatusCallback(): маршрутизация "stat:" ---
+$notStatPrefix = callPrivate($ref, $handler, 'dispatchStatusCallback', [1, 5001, 42, 'iss:add_menu']);
+check('dispatchStatusCallback(): чужой префикс (не "stat:") -> null', $notStatPrefix === null);
+
+callPrivate($ref, $handler, 'dispatchStatusCallback', [1, 5001, 42, 'stat:pick_menu']);
+check('dispatchStatusCallback("pick_menu"): показывает кнопки эмитентов из вотчлиста', str_contains($telegram->lastEdit['text'], 'Выберите компанию'));
+check(
+    'dispatchStatusCallback("pick_menu"): среди кнопок — Роснефть с callback_data stat:one:1',
+    str_contains(json_encode($telegram->lastEdit['keyboard'], JSON_UNESCAPED_UNICODE), '"text":"Роснефть","callback_data":"stat:one:1"')
+);
+
+callPrivate($ref, $handler, 'dispatchStatusCallback', [1, 5001, 42, 'stat:all']);
+check('dispatchStatusCallback("all"): оба эмитента в отредактированном тексте', str_contains($telegram->lastEdit['text'], 'Роснефть') && str_contains($telegram->lastEdit['text'], 'Газпром'));
+
+callPrivate($ref, $handler, 'dispatchStatusCallback', [1, 5001, 42, 'stat:one:1']);
+check('dispatchStatusCallback("one"): только выбранный эмитент в тексте', str_contains($telegram->lastEdit['text'], 'Роснефть') && !str_contains($telegram->lastEdit['text'], 'Газпром'));
+
+// Эмитент не из вотчлиста этого пользователя (id=3, "Алроса", в watchlist не добавлен) — не показываем чужой статус молча.
+callPrivate($ref, $handler, 'dispatchStatusCallback', [1, 5001, 42, 'stat:one:3']);
+check('dispatchStatusCallback("one"): id вне вотчлиста -> не показывает статус, честное сообщение', str_contains($telegram->lastEdit['text'], 'больше не в вашем списке'));
 
 // --- Подписка ---
 $subscription = callPrivate($ref, $handler, 'handleSubscription', [1]);
