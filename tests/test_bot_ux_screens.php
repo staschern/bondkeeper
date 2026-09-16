@@ -121,8 +121,10 @@ $db->exec("INSERT INTO fns_blocks (issuer_id, is_fns_blocked, block_date, active
 $db->exec("INSERT INTO current_ratings (issuer_id, agency, rating, outlook, last_action_date) VALUES (1, 'nkr', 'AAA.ru', 'stable', '2026-07-01')");
 $db->exec("INSERT INTO current_ratings (issuer_id, agency, rating, outlook, last_action_date) VALUES (1, 'acra', 'AAA(RU)', 'positive', '2026-06-20')");
 
-// Эмитент 2: без блокировок, без рейтинга.
+// Эмитент 2: без блокировок, без рейтинга. "Свежая" fns_blocks — та же
+// причина, что и у эмитентов 3-12 ниже (checkFnsOnAdd() при добавлении).
 $db->exec("INSERT INTO issuers (id, inn, full_name, short_name) VALUES (2, '7736050003', 'ПАО Газпром', 'Газпром')");
+$db->exec("INSERT INTO fns_blocks (issuer_id, is_fns_blocked, active_bank_count, verification, date_verification) VALUES (2, 0, 0, 'success', datetime('now'))");
 
 // Бумага эмитента 1 — для проверки "умного поиска" по ISIN/тикеру.
 $db->exec("INSERT INTO securities (isin, secid, issuer_id) VALUES ('RU000A1035N9', 'RU000ROSN01', 1)");
@@ -274,6 +276,31 @@ $db->exec("INSERT INTO subscriptions (user_id, tariff_code, status, current_peri
 $paidSubscription = callPrivate($ref, $handler, 'handleSubscription', [99]);
 check('Подписка (платный тариф): показывает настоящую дату жирным, не счётчик дней', str_contains($paidSubscription, 'Окончание действия подписки: <b>05.10.26</b>'));
 check('Подписка (платный тариф): название тарифа "Basic" жирным', str_contains($paidSubscription, 'Ваша текущая подписка: <b>Basic</b>'));
+
+// --- Тариф 'founder' (миграция 020, 17 сентября 2026): max_tracked_issuers=NULL -> без лимита ---
+$db->exec("INSERT INTO tariffs (code, name, max_tracked_issuers, duration_days) VALUES ('founder', 'Founder', NULL, 36500)");
+$db->exec("INSERT INTO users (id, telegram_id) VALUES (98, 1007481909)");
+$db->exec("INSERT INTO subscriptions (user_id, tariff_code, status, current_period_end) VALUES (98, 'founder', 'active', '9999-12-31')");
+
+$currentTariffLimit = $ref->getMethod('currentTariffLimit');
+$currentTariffLimit->setAccessible(true);
+check(
+    "currentTariffLimit(): тариф 'founder' (max_tracked_issuers=NULL) -> null (без ограничения)",
+    $currentTariffLimit->invokeArgs($handler, [98]) === null
+);
+
+$founderSubscription = callPrivate($ref, $handler, 'handleSubscription', [98]);
+check('Подписка (founder): лимит эмитентов — "без ограничения"', str_contains($founderSubscription, 'Количество эмитентов доступных для отслеживания: <b>без ограничения</b>'));
+
+// toggleIssuer() реально не упирается в лимит — добавляем ВСЕ 12 тестовых
+// эмитентов подряд (у 'free' лимит 10, тут ни один не должен отказать).
+foreach (range(1, 12) as $issuerId) {
+    $founderToast = callPrivate($ref, $handler, 'toggleIssuer', [98, 5001, 42, $issuerId, 0]);
+    check("toggleIssuer() для 'founder': issuer_id={$issuerId} добавлен без отказа по лимиту", $founderToast === 'Добавлено');
+}
+$founderWatchCount = (int) $db->query('SELECT COUNT(DISTINCT issuer_id) FROM watchlist WHERE user_id = 98')->fetchColumn();
+check("toggleIssuer() для 'founder': реально добавлено 12 эмитентов (больше лимита free=10)", $founderWatchCount === 12);
+$db->exec('DELETE FROM watchlist WHERE user_id = 98');
 
 // --- ensureFreeSubscription(): автопродление Free (решение от 13 сентября 2026) ---
 $daysUntil = $ref->getMethod('daysUntil');

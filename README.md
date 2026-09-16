@@ -70,6 +70,8 @@ bin/debug_acra_ratings.php           — разведка списка/карт�
 src/Events/EventPublisher.php        — единственная точка создания events/raw_messages (C5 рейтинговые действия, E1 блокировки ФНС), этап 4, см. docs/STAGE4_EVENT_ENGINE.md
 tests/test_event_engine.php          — офлайн-проверка EventPublisher на SQLite (запуск: php -d extension=pdo_sqlite -d extension=mbstring tests/test_event_engine.php)
 database/019_bot_ux_tariff_and_dialog_state.sql — миграция: тариф free (10 эмитентов/14 дней), таблицы bot_dialog_state/support_thread_map
+database/020_founder_tariff.sql — миграция: тариф founder (max_tracked_issuers=NULL — без ограничения)
+bin/grant_founder_subscription.php — разовая выдача тарифа founder двум учредителям по telegram_id (безлимит эмитентов + фактически бессрочно), идемпотентно
 src/Telegram/TelegramClientInterface.php — интерфейс Bot API (sendMessage/answerCallbackQuery/editMessageText) для подмены фейком в офлайн-тестах
 src/Telegram/TelegramClient.php      — HTTP-клиент Telegram Bot API (long polling, sendMessage/editMessageText/answerCallbackQuery)
 src/Telegram/TelegramBotConfig.php   — токен бота + admin_telegram_id из config/telegram_bot.php (не коммитится, см. .example рядом)
@@ -104,6 +106,14 @@ mysql -u root -p bondkeeper < database/010_fns_blocks_one_row_per_issuer.sql
 mysql -u root -p bondkeeper < database/011_fns_verification_to_fns_blocks.sql
 mysql -u root -p bondkeeper < database/012_offers_unknown_and_buyback_flag.sql
 mysql -u root -p bondkeeper < database/013_rating_actions_outlook_split.sql
+mysql -u root -p bondkeeper < database/014_rating_actions_dedup_key.sql
+mysql -u root -p bondkeeper < database/015_rating_actions_review_queue.sql
+mysql -u root -p bondkeeper < database/016_rating_actions_source_title.sql
+mysql -u root -p bondkeeper < database/017_rating_news_log.sql
+mysql -u root -p bondkeeper < database/018_outlook_under_review.sql
+mysql -u root -p bondkeeper < database/019_bot_ux_tariff_and_dialog_state.sql
+mysql -u root -p bondkeeper < database/020_founder_tariff.sql
+php bin/grant_founder_subscription.php   # разовая выдача тарифа founder учредителям
 
 php bin/seed_market.php        # issuers, securities, redemptions(scheduled_maturity)
 php bin/seed_bondization.php   # coupons, amortizations
