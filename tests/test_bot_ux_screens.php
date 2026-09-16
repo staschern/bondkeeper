@@ -221,6 +221,20 @@ $about = callPrivate($ref, $handler, 'aboutServiceText', []);
 check('О сервисе: "BondKeeper" жирным', str_contains($about, '<b>BondKeeper</b>'));
 check('О сервисе: пустая строка после первой строки (решение от 13 сентября)', str_contains($about, "Благодарим за интерес к нашему проекту! 🙏\n\n"));
 check('О сервисе: содержит блок преимуществ', str_contains($about, 'Главные преимущества проекта'));
+check(
+    'О сервисе: последний абзац — новый текст со ссылкой на статью (решение от 16 сентября)',
+    str_contains($about, 'Получить больше информации о самом проекте можно в статье по ссылке ниже 👇')
+);
+
+// --- О сервисе — инлайн-кнопка "Читать статью 📚" со ссылкой (16 сентября 2026) ---
+$aboutKeyboard = callPrivate($ref, $handler, 'aboutServiceKeyboard', []);
+$aboutButton = $aboutKeyboard['inline_keyboard'][0][0] ?? null;
+check('О сервисе: кнопка "Читать статью 📚" присутствует', $aboutButton !== null && $aboutButton['text'] === 'Читать статью 📚');
+check('О сервисе: кнопка ведёт на присланную статью', $aboutButton !== null && $aboutButton['url'] === 'https://teletype.in/@kvint_invest/-mSGn-tfdhZ');
+
+// --- Знакомство — заголовок "Знакомство" жирным (решение от 16 сентября 2026) ---
+$greeting = callPrivate($ref, $handler, 'handleStart', []);
+check('Знакомство: слово "Знакомство" в заголовке жирным', str_contains($greeting, '<b>Знакомство</b> 👋'));
 
 // --- BotFormatting::formatDate() edge cases (вынесено из BotCommandHandler в общий класс) ---
 check('formatDate(null) -> тире', \BondKeeper\Telegram\BotFormatting::formatDate(null) === '—');

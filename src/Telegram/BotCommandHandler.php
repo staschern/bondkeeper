@@ -65,6 +65,7 @@ final class BotCommandHandler
     private const BTN_ABOUT = 'О сервисе 🌐';
     private const BTN_HELP = 'Помощь 🛠';
     private const BROWSE_PAGE_SIZE = 8;
+    private const ABOUT_ARTICLE_URL = 'https://teletype.in/@kvint_invest/-mSGn-tfdhZ';
 
     public function __construct(
         private readonly PDO $db,
@@ -172,7 +173,7 @@ final class BotCommandHandler
             self::BTN_ISSUERS => $this->handleIssuerMenuEntry(),
             self::BTN_STATUS => $this->handleStatus($userId),
             self::BTN_SUBSCRIPTION => ['text' => $this->handleSubscription($userId), 'parseMode' => 'HTML'],
-            self::BTN_ABOUT => ['text' => $this->aboutServiceText(), 'parseMode' => 'HTML'],
+            self::BTN_ABOUT => ['text' => $this->aboutServiceText(), 'keyboard' => $this->aboutServiceKeyboard(), 'parseMode' => 'HTML'],
             self::BTN_HELP => ['text' => $this->startSupportFlow($userId)],
             default => $this->matchSlashCommandWithArgument($userId, $text),
         };
@@ -340,7 +341,7 @@ final class BotCommandHandler
      */
     private function handleStart(): string
     {
-        return "Знакомство 👋\n\n"
+        return "<b>Знакомство</b> 👋\n\n"
             . "Привет! Меня зовут Bond…, только не James, а BondKeeper и я буду твоим надёжным помощником на рынке облигаций! 📈\n"
             . "Перед тем, как начать, расскажу немного о своём меню.\n\n"
             . "Чтобы открыть его, просто нажми на кнопку справа от окна сообщения 😉 (квадрат с четырьмя кружочками внутри).\n\n"
@@ -783,11 +784,12 @@ final class BotCommandHandler
     }
 
     /**
-     * docs/BOT_UX_SPEC.md, раздел 6 — текст дословно из ТЗ. Кнопка "Читать
-     * статью" не добавлена — URL ещё не прислан заказчиком. Пустая строка
+     * docs/BOT_UX_SPEC.md, раздел 6 — текст дословно из ТЗ. Пустая строка
      * после первой строки и жирный "BondKeeper" — по прямому запросу
      * пользователя (13 сентября 2026), разметка `<b>...</b>` —
-     * parse_mode=HTML, см. matchKnownCommand().
+     * parse_mode=HTML, см. matchKnownCommand(). Последний абзац и кнопка
+     * "Читать статью 📚" (ссылка — ABOUT_ARTICLE_URL) — по запросу
+     * пользователя (16 сентября 2026), URL статьи прислан.
      */
     private function aboutServiceText(): string
     {
@@ -798,7 +800,13 @@ final class BotCommandHandler
             . "- пользователь сам настраивает список интересующих его эмитентов и облигаций (исключён рыночный шум и бесконечный спам);\n"
             . "- все сигналы (выплаты, блокировки и рейтинги) объединены в один удобный канал уведомлений.\n\n"
             . "Мы постоянно дорабатываем и улучшаем наш сервис и на сегодняшний день его функционал включает: информацию о блокировках ФНС и уведомления о рейтинговых действиях.\n\n"
-            . "Получить больше технической информации о самом проекте можно в статье — ссылку добавим здесь, как только она будет готова.";
+            . "Получить больше информации о самом проекте можно в статье по ссылке ниже 👇";
+    }
+
+    /** @return array<string, mixed> inline-кнопка со ссылкой на статью под сообщением "О сервисе" */
+    private function aboutServiceKeyboard(): array
+    {
+        return ['inline_keyboard' => [[['text' => 'Читать статью 📚', 'url' => self::ABOUT_ARTICLE_URL]]]];
     }
 
     // === Раздел "Помощь" — чат-релей, docs/BOT_UX_SPEC.md раздел 7 ===
