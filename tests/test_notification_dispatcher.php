@@ -83,16 +83,23 @@ $db = new PDO('sqlite::memory:');
 $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
 $db->sqliteCreateFunction('NOW', static fn (): string => date('Y-m-d H:i:s'), 0);
 
-$db->exec('CREATE TABLE issuers (id INTEGER PRIMARY KEY, short_name TEXT)');
+$db->exec('CREATE TABLE issuers (id INTEGER PRIMARY KEY, short_name TEXT, inn TEXT)');
 $db->exec('CREATE TABLE users (id INTEGER PRIMARY KEY, telegram_id INTEGER, telegram_bot_blocked INTEGER DEFAULT 0)');
-$db->exec('CREATE TABLE watchlist (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, issuer_id INTEGER)');
+// added_at — DEFAULT (datetime('now')), тот же приём, что и detected_at
+// у events ниже: естественный порядок строк в этом файле (watchlist
+// всегда вставляется РАНЬШЕ соответствующего события) сам по себе
+// удовлетворяет новому фильтру `w.added_at <= e.detected_at` (см.
+// докблок NotificationDispatcher::fetchPendingPairs(), баг найден 17
+// сентября 2026) — <= (не <) специально, чтобы вставки в одну и ту же
+// секунду не считались "событие раньше подписки".
+$db->exec("CREATE TABLE watchlist (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, issuer_id INTEGER, added_at TEXT DEFAULT (datetime('now')))");
 $db->exec('CREATE TABLE event_types (code TEXT PRIMARY KEY, notify_client INTEGER)');
-$db->exec('CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, issuer_id INTEGER, event_type_code TEXT, payload_json TEXT)');
+$db->exec("CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, issuer_id INTEGER, event_type_code TEXT, payload_json TEXT, detected_at TEXT DEFAULT (datetime('now')))");
 $db->exec('CREATE TABLE notifications (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, event_id INTEGER, channel TEXT, status TEXT, failure_reason TEXT, sent_at TEXT, UNIQUE(user_id, event_id, channel))');
 
 $db->exec("INSERT INTO event_types (code, notify_client) VALUES ('C5', 1), ('E1', 1), ('A1', 0)"); // A1 — есть в схеме, но notify_client=FALSE, для проверки фильтра
 
-$db->exec("INSERT INTO issuers (id, short_name) VALUES (1, 'Роснефть')");
+$db->exec("INSERT INTO issuers (id, short_name, inn) VALUES (1, 'Роснефть', '7706107510')");
 $db->exec("INSERT INTO users (id, telegram_id, telegram_bot_blocked) VALUES (1, 1007481909, 0)");
 $db->exec('INSERT INTO watchlist (user_id, issuer_id) VALUES (1, 1)');
 
@@ -126,15 +133,16 @@ check('C5: агентство АКРА в читаемом виде', str_contai
 check('C5: прогноз в тексте', str_contains($telegram->sent[0]['text'], 'прогноз: positive'));
 check('C5: ссылка на источник в тексте', str_contains($telegram->sent[0]['text'], 'https://example.com/press/1'));
 
-// --- E1: started ---
+// --- E1: started — формат переписан 17 сентября 2026 (ИНН + разделитель разрядов, см. BotFormatting::formatMoney()) ---
 $db->exec("INSERT INTO events (id, issuer_id, event_type_code, payload_json) VALUES (3, 1, 'E1', '"
     . json_encode(['kind' => 'started', 'old_blocked_amount' => null, 'new_blocked_amount' => '1500000.00', 'active_bank_count' => 2, 'block_date' => '2026-08-20', 'reason' => 'Код 01: взыскание задолженности'], JSON_UNESCAPED_UNICODE)
     . "')");
 $telegram->sent = [];
 $dispatcher->dispatchPending();
-check('E1 started: количество банков', str_contains($telegram->sent[0]['text'], '2 банк(ов)'));
-check('E1 started: сумма', str_contains($telegram->sent[0]['text'], '1500000.00'));
-check('E1 started: дата дд.мм.гг', str_contains($telegram->sent[0]['text'], '20.08.26'));
+check('E1 started: заголовок с ИНН', str_starts_with($telegram->sent[0]['text'], '⚠️ Роснефть | ИНН 7706107510: Блокировка счетов ФНС'));
+check('E1 started: количество счетов', str_contains($telegram->sent[0]['text'], 'Количество заблокированных счетов: 2'));
+check('E1 started: сумма с разделителем разрядов и ₽', str_contains($telegram->sent[0]['text'], 'Заблокированная сумма: 1 500 000.00 ₽'));
+check('E1 started: дата дд.мм.гг', str_contains($telegram->sent[0]['text'], 'Дата блокировки: 20.08.26'));
 check('E1 started: причина', str_contains($telegram->sent[0]['text'], 'взыскание задолженности'));
 
 // --- E1: amount_changed ---
@@ -143,15 +151,27 @@ $db->exec("INSERT INTO events (id, issuer_id, event_type_code, payload_json) VAL
     . "')");
 $telegram->sent = [];
 $dispatcher->dispatchPending();
-check('E1 amount_changed: было/стало', str_contains($telegram->sent[0]['text'], 'было 1500000.00 ₽, стало 2000000.00 ₽'));
+check('E1 amount_changed: заголовок с ИНН', str_starts_with($telegram->sent[0]['text'], '⚠️ Роснефть | ИНН 7706107510: сумма блокировки ФНС изменилась'));
+check('E1 amount_changed: было/стало с разделителем разрядов', str_contains($telegram->sent[0]['text'], 'было 1 500 000.00 ₽, стало 2 000 000.00 ₽'));
+check('E1 amount_changed: число заблокированных счетов', str_contains($telegram->sent[0]['text'], '(заблокированных счетов: 3)'));
 
-// --- E1: lifted ---
+// --- E1: count_changed (новый вид, 17 сентября 2026 — решение от 4 сентября "не триггер" пересмотрено) ---
+// id=12 — не 6, чтобы не столкнуться с event_id=6, занятым ниже A1-тестом.
+$db->exec("INSERT INTO events (id, issuer_id, event_type_code, payload_json) VALUES (12, 1, 'E1', '"
+    . json_encode(['kind' => 'count_changed', 'old_active_bank_count' => 3, 'active_bank_count' => 4, 'block_date' => '2026-08-20', 'reason' => null], JSON_UNESCAPED_UNICODE)
+    . "')");
+$telegram->sent = [];
+$dispatcher->dispatchPending();
+check('E1 count_changed: заголовок с ИНН', str_starts_with($telegram->sent[0]['text'], '⚠️ Роснефть | ИНН 7706107510: количество заблокированных счетов ФНС изменилось'));
+check('E1 count_changed: было/стало', str_contains($telegram->sent[0]['text'], 'было 3, стало 4'));
+
+// --- E1: lifted — без ИНН (по образцу от пользователя), "по состоянию на X" без "нашу проверку от" ---
 $db->exec("INSERT INTO events (id, issuer_id, event_type_code, payload_json) VALUES (5, 1, 'E1', '"
     . json_encode(['kind' => 'lifted', 'old_blocked_amount' => '2000000.00', 'new_blocked_amount' => null, 'active_bank_count' => 0, 'block_date' => '2026-09-01', 'reason' => null], JSON_UNESCAPED_UNICODE)
     . "')");
 $telegram->sent = [];
 $dispatcher->dispatchPending();
-check('E1 lifted: "снята"', str_contains($telegram->sent[0]['text'], 'блокировка счетов ФНС снята'));
+check('E1 lifted: формат "снята (по состоянию на 01.09.26)", без ИНН и без "нашу проверку от"', $telegram->sent[0]['text'] === '✅ Роснефть: блокировка счетов ФНС снята (по состоянию на 01.09.26).');
 
 // --- Фильтр notify_client=FALSE (event_types.A1) — событие не должно попасть в выборку вообще ---
 $db->exec("INSERT INTO events (id, issuer_id, event_type_code, payload_json) VALUES (6, 1, 'A1', '{}')");
@@ -225,6 +245,38 @@ $raceResult = $dispatchOne->invokeArgs($dispatcher, [5, 11]);
 check('Гонка на INSERT: dispatchOne() возвращает false, не бросает исключение', $raceResult === false);
 check('Гонка на INSERT: ничего не отправлено повторно', $telegram->sent === []);
 check('Гонка на INSERT: вторая строка в notifications не появилась (осталась одна)', (int) $db->query('SELECT COUNT(*) FROM notifications WHERE user_id = 5 AND event_id = 11')->fetchColumn() === 1);
+
+// ---------------------------------------------------------------------
+// Регрессия: "бэклог" при добавлении эмитента в список (найдено 17
+// сентября 2026, см. докблок fetchPendingPairs()) — живой пример из
+// продакшена: пользователь добавил ООО «КОНТРОЛ лизинг» и разом получил
+// 4 старых сообщения, накопленных ДО того, как он начал отслеживание.
+// Эмитент id=6, событие СТАРОЕ (detected_at — явно в прошлом), ДО того,
+// как пользователь начал следить (watchlist.added_at — позже события).
+// ---------------------------------------------------------------------
+echo "\n=== Регрессия: бэклог старых событий при добавлении эмитента ===\n";
+
+$db->exec("INSERT INTO issuers (id, short_name, inn) VALUES (6, 'КОНТРОЛ лизинг', '7805485840')");
+$db->exec("INSERT INTO events (id, issuer_id, event_type_code, payload_json, detected_at) VALUES (20, 6, 'E1', '"
+    . json_encode(['kind' => 'started', 'old_blocked_amount' => null, 'new_blocked_amount' => '500000000.00', 'active_bank_count' => 14, 'block_date' => '2026-08-14', 'reason' => null], JSON_UNESCAPED_UNICODE)
+    . "', '2026-09-10 08:00:00')"); // старое событие, до добавления в список
+$db->exec("INSERT INTO users (id, telegram_id, telegram_bot_blocked) VALUES (6, 111222333, 0)");
+$db->exec("INSERT INTO watchlist (user_id, issuer_id, added_at) VALUES (6, 6, '2026-09-14 11:11:00')"); // добавлен ПОЗЖЕ события
+$telegram->sent = [];
+$dispatcher->dispatchPending();
+$backlogSentTo = array_filter($telegram->sent, static fn (array $s): bool => $s['chat_id'] === 111222333);
+check('Бэклог: старое событие (до added_at) НЕ отправлено новому подписчику', $backlogSentTo === []);
+check('Бэклог: пара (user=6, event=20) не попала в notifications вообще', (int) $db->query('SELECT COUNT(*) FROM notifications WHERE user_id = 6 AND event_id = 20')->fetchColumn() === 0);
+
+// Контрольный случай на том же эмитенте — событие ПОСЛЕ added_at (обычный
+// новый E1 уже во время отслеживания) ДОЛЖНО дойти как обычно.
+$db->exec("INSERT INTO events (id, issuer_id, event_type_code, payload_json, detected_at) VALUES (21, 6, 'E1', '"
+    . json_encode(['kind' => 'lifted', 'old_blocked_amount' => '500000000.00', 'new_blocked_amount' => null, 'active_bank_count' => 0, 'block_date' => '2026-09-15', 'reason' => null], JSON_UNESCAPED_UNICODE)
+    . "', '2026-09-15 08:00:00')"); // новое событие, после added_at
+$telegram->sent = [];
+$dispatcher->dispatchPending();
+$freshSentTo = array_filter($telegram->sent, static fn (array $s): bool => $s['chat_id'] === 111222333);
+check('Бэклог: событие ПОСЛЕ added_at доходит как обычно (фильтр не ломает нормальный путь)', count($freshSentTo) === 1);
 
 echo "\n";
 if ($failures === 0) {

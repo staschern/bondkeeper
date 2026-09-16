@@ -53,21 +53,34 @@ use PDO;
  *
  * Перед апсертом читаем ТЕКУЩЕЕ состояние строки (fetchCurrentState()) —
  * это и есть "было" для EventPublisher::publishFnsBlockChange(),
- * вызываемого после успешной записи. Ровно 3 триггера события E1
- * (решение пользователя, не любое изменение вообще): начало блокировки,
- * изменение СУММЫ при уже активной блокировке, полное снятие. Смена
- * ТОЛЬКО active_bank_count (число банков) без изменения суммы —
- * пользователь явно решил, что это неважно для клиента, событие не
- * создаётся. Неуспешная проверка (капча/сеть, markVerificationError())
+ * вызываемого после успешной записи. 4 триггера события E1 (решение
+ * пользователя, не любое изменение вообще, см. докблок EventPublisher):
+ * начало блокировки, изменение СУММЫ при уже активной блокировке,
+ * изменение ЧИСЛА банков при той же сумме (добавлено 17 сентября 2026),
+ * полное снятие. Неуспешная проверка (капча/сеть, markVerificationError())
  * событие не создаёт вообще — мы не узнали ничего нового.
  *
  * fns_blocks.event_id проставляется отдельным UPDATE ПОСЛЕ публикации —
  * той же строки, что только что апсертили (issuer_id тут первичный
  * ключ, апсерт не создаёт вторую строку). Событие могло не создаться
- * (ни один из 3 триггеров не сработал) — тогда UPDATE вообще не
+ * (ни один из 4 триггеров не сработал) — тогда UPDATE вообще не
  * выполняется, старое значение event_id (если было — от предыдущего
  * реального триггера) не трогается, а не затирается NULL'ом. Подробности
  * — docs/STAGE4_EVENT_ENGINE.md.
+ *
+ * === Повторные попытки внутри одного прогона (17 сентября 2026) ===
+ *
+ * Раньше неудачная попытка (капча/сеть) просто дожидалась следующего
+ * ежедневного крона — целые сутки. Пользователь ожидал автоматический
+ * повтор "через какое-то время" в рамках того же прогона, его не было —
+ * добавлено: checkIssuers() делает до $maxRetries дополнительных проходов
+ * ТОЛЬКО по тем эмитентам, что не прошли проверку (капча или ошибка), с
+ * паузой $retryDelaySeconds перед каждым повторным проходом (отдельная,
+ * более длинная пауза, чем между обычными эмитентами внутри одного
+ * прохода — капча у service.nalog.ru эмпирически завязана на сессию/IP,
+ * не только на конкретный эмитент, поэтому имеет смысл переждать дольше).
+ * Суточный крон остаётся финальной страховкой, если все повторы исчерпаны
+ * — не заменяется этим механизмом, а дополняется.
  */
 final class FnsBlocksImporter
 {
@@ -75,6 +88,7 @@ final class FnsBlocksImporter
     private int $blockedFound = 0;
     private int $skippedCaptcha = 0;
     private int $failed = 0;
+    private int $recoveredOnRetry = 0;
 
     public function __construct(
         private readonly NalogBiClientInterface $client,
@@ -84,40 +98,67 @@ final class FnsBlocksImporter
     ) {
     }
 
-    /** @param array<int, array{id: int, inn: string}> $issuers */
-    public function checkIssuers(array $issuers): void
+    /**
+     * @param array<int, array{id: int, inn: string}> $issuers
+     * @param int $maxRetries сколько ДОПОЛНИТЕЛЬНЫХ проходов сделать по
+     *     эмитентам, не прошедшим проверку (0 — без повторов, как раньше)
+     * @param int $retryDelaySeconds пауза перед каждым повторным проходом
+     */
+    public function checkIssuers(array $issuers, int $maxRetries = 2, int $retryDelaySeconds = 90): void
     {
-        foreach ($issuers as $index => $issuer) {
-            if ($index > 0) {
-                sleep($this->delaySeconds);
+        $this->checked = count($issuers);
+        $pending = $issuers;
+
+        for ($attempt = 0; $pending !== [] && $attempt <= $maxRetries; $attempt++) {
+            if ($attempt > 0) {
+                Logger::info(
+                    "ФНС: повторная попытка #{$attempt} для " . count($pending)
+                    . " эмитент(ов), не прошедших проверку с первого раза (капча/ошибка) — пауза {$retryDelaySeconds} с"
+                );
+                sleep($retryDelaySeconds);
             }
-            $this->checkOne((int) $issuer['id'], (string) $issuer['inn']);
+
+            $stillPending = [];
+            foreach ($pending as $index => $issuer) {
+                if ($index > 0) {
+                    sleep($this->delaySeconds);
+                }
+                $success = $this->checkOne((int) $issuer['id'], (string) $issuer['inn']);
+                if (!$success) {
+                    $stillPending[] = $issuer;
+                } elseif ($attempt > 0) {
+                    $this->recoveredOnRetry++;
+                }
+            }
+            $pending = $stillPending;
         }
+
+        // Что осталось в $pending после всех попыток — окончательно не
+        // прошедшие проверку в этом прогоне (попадут в следующий крон).
+        $this->failed = count($pending);
 
         $this->printReport();
     }
 
-    private function checkOne(int $issuerId, string $inn): void
+    private function checkOne(int $issuerId, string $inn): bool
     {
-        $this->checked++;
-
         try {
             $result = $this->client->check($inn);
         } catch (\Throwable $e) {
-            $this->failed++;
             Logger::warn("ФНС: ошибка проверки ИНН {$inn}: {$e->getMessage()}");
             $this->markVerificationError($issuerId);
-            return;
+            return false;
         }
 
         if ($result->captchaRequired) {
             $this->skippedCaptcha++;
             Logger::warn("ФНС: капча для ИНН {$inn} — статус блокировки не тронут, отмечена только попытка");
             $this->markVerificationError($issuerId);
-            return;
+            return false;
         }
 
         $this->applyResult($issuerId, $inn, $result->rows);
+        return true;
     }
 
     /**
@@ -226,6 +267,7 @@ final class FnsBlocksImporter
             $issuerId,
             $old['is_fns_blocked'],
             $old['blocked_amount'],
+            $old['active_bank_count'],
             $isBlocked,
             $summary['blocked_amount'] ?? null,
             $summary['active_bank_count'] ?? 0,
@@ -235,7 +277,7 @@ final class FnsBlocksImporter
         );
 
         // fns_blocks.event_id — только если событие реально создалось
-        // (один из 3 триггеров сработал). publishFnsBlockChange() уже
+        // (один из 4 триггеров сработал). publishFnsBlockChange() уже
         // содержит проверку фильтра существенности — здесь просто не
         // трогаем строку, если он вернул null, а не затираем прежний
         // event_id NULL'ом.
@@ -255,21 +297,22 @@ final class FnsBlocksImporter
      * Строки ещё нет вообще (эмитент проверяется впервые) — трактуем как
      * "не заблокирован", это и есть нейтральное начальное состояние.
      *
-     * @return array{is_fns_blocked: bool, blocked_amount: ?string}
+     * @return array{is_fns_blocked: bool, blocked_amount: ?string, active_bank_count: int}
      */
     private function fetchCurrentState(int $issuerId): array
     {
-        $stmt = $this->db->prepare('SELECT is_fns_blocked, blocked_amount FROM fns_blocks WHERE issuer_id = :issuer_id');
+        $stmt = $this->db->prepare('SELECT is_fns_blocked, blocked_amount, active_bank_count FROM fns_blocks WHERE issuer_id = :issuer_id');
         $stmt->execute(['issuer_id' => $issuerId]);
         $row = $stmt->fetch();
 
         if ($row === false) {
-            return ['is_fns_blocked' => false, 'blocked_amount' => null];
+            return ['is_fns_blocked' => false, 'blocked_amount' => null, 'active_bank_count' => 0];
         }
 
         return [
             'is_fns_blocked' => (bool) $row['is_fns_blocked'],
             'blocked_amount' => $row['blocked_amount'],
+            'active_bank_count' => (int) $row['active_bank_count'],
         ];
     }
 
@@ -397,7 +440,8 @@ final class FnsBlocksImporter
         Logger::info('=== Отчёт по проверке блокировок счетов (ФНС, service.nalog.ru) ===');
         Logger::info("Эмитентов проверено: {$this->checked}");
         Logger::info("С активной блокировкой: {$this->blockedFound}");
-        Logger::info("Пропущено (капча): {$this->skippedCaptcha}");
-        Logger::info("Ошибок: {$this->failed}");
+        Logger::info("Пропущено (капча, суммарно по всем попыткам): {$this->skippedCaptcha}");
+        Logger::info("Восстановлено повтором (не прошли с первого раза, но прошли на повторной попытке): {$this->recoveredOnRetry}");
+        Logger::info("Окончательно не прошли проверку в этом прогоне (после всех повторов): {$this->failed}");
     }
 }

@@ -162,10 +162,14 @@ check('третье C5-событие создано (подтверждение
 check('текст — "подтверждён на уровне", НЕ "X → X" при неизменном рейтинге', $c5Events[2]['status_text'] === 'подтверждён на уровне ruAA, прогноз: stable');
 
 // ---------------------------------------------------------------------
-// Сценарий 2: E1 — блокировка ФНС, 3 триггера + 1 "не триггер".
+// Сценарий 2: E1 — блокировка ФНС, 4 триггера + 1 "не триггер".
 // Симулируем applyResult() напрямую через EventPublisher, минуя реальный
 // HTTP-клиент ФНС (FnsBlocksImporter требует NalogBiClientInterface —
 // нам нужна только сама логика publishFnsBlockChange + запись в БД).
+//
+// 'count_changed' (изменение ТОЛЬКО числа банков) добавлен 17 сентября
+// 2026 — решение от 4 сентября ("это не триггер") пересмотрено прямым
+// запросом пользователя.
 // ---------------------------------------------------------------------
 echo "\n=== E1: блокировка ФНС ===\n";
 
@@ -174,6 +178,7 @@ $id = $events->publishFnsBlockChange(
     issuerId: 2,
     oldBlocked: false,
     oldBlockedAmount: null,
+    oldActiveBankCount: 0,
     newBlocked: true,
     newBlockedAmount: '100000.00',
     newActiveBankCount: 2,
@@ -183,29 +188,47 @@ $id = $events->publishFnsBlockChange(
 );
 check('триггер "начало блокировки" создаёт событие', $id !== null);
 
-// Не-триггер: только число банков изменилось (сумма та же) — НЕ должно
-// создавать событие (явное решение пользователя).
+// Триггер 4 (новый, 17 сентября): только число банков изменилось (сумма
+// та же) — ТЕПЕРЬ это триггер (kind='count_changed').
 $id = $events->publishFnsBlockChange(
     issuerId: 2,
     oldBlocked: true,
     oldBlockedAmount: '100000.00',
+    oldActiveBankCount: 2,
     newBlocked: true,
     newBlockedAmount: '100000.00',
-    newActiveBankCount: 5, // изменилось, но это не триггер
+    newActiveBankCount: 5,
     blockDate: '2026-09-01',
     reason: 'Код 01: взыскание задолженности',
     sourceReference: 'service.nalog.ru bi.do, решение №123',
 );
-check('изменение ТОЛЬКО active_bank_count НЕ создаёт событие', $id === null);
+check('изменение ТОЛЬКО active_bank_count теперь создаёт событие (count_changed)', $id !== null);
 
-// Триггер 2: сумма изменилась при активной блокировке.
+// Не-триггер: ни сумма, ни число банков не изменились — событие НЕ создаётся.
 $id = $events->publishFnsBlockChange(
     issuerId: 2,
     oldBlocked: true,
     oldBlockedAmount: '100000.00',
+    oldActiveBankCount: 5,
+    newBlocked: true,
+    newBlockedAmount: '100000.00',
+    newActiveBankCount: 5,
+    blockDate: '2026-09-01',
+    reason: 'Код 01: взыскание задолженности',
+    sourceReference: 'service.nalog.ru bi.do, решение №123',
+);
+check('ничего не изменилось (ни сумма, ни число банков) — событие НЕ создаётся', $id === null);
+
+// Триггер 2: сумма изменилась при активной блокировке (одновременно с
+// числом банков — приоритет у amount_changed, не count_changed).
+$id = $events->publishFnsBlockChange(
+    issuerId: 2,
+    oldBlocked: true,
+    oldBlockedAmount: '100000.00',
+    oldActiveBankCount: 5,
     newBlocked: true,
     newBlockedAmount: '250000.50',
-    newActiveBankCount: 5,
+    newActiveBankCount: 7,
     blockDate: '2026-09-01',
     reason: 'Код 01: взыскание задолженности',
     sourceReference: 'service.nalog.ru bi.do, решение №123',
@@ -217,6 +240,7 @@ $id = $events->publishFnsBlockChange(
     issuerId: 2,
     oldBlocked: true,
     oldBlockedAmount: '250000.50',
+    oldActiveBankCount: 7,
     newBlocked: false,
     newBlockedAmount: null,
     newActiveBankCount: 0,
@@ -231,6 +255,7 @@ $id = $events->publishFnsBlockChange(
     issuerId: 3,
     oldBlocked: false,
     oldBlockedAmount: null,
+    oldActiveBankCount: 0,
     newBlocked: false,
     newBlockedAmount: null,
     newActiveBankCount: 0,
@@ -241,10 +266,10 @@ $id = $events->publishFnsBlockChange(
 check('нет блокировки -> нет блокировки — событие НЕ создаётся', $id === null);
 
 $e1Events = $db->query("SELECT payload_json FROM events WHERE event_type_code = 'E1' ORDER BY id")->fetchAll(PDO::FETCH_ASSOC);
-check('всего ровно 3 события E1 (started/amount_changed/lifted)', count($e1Events) === 3);
+check('всего ровно 4 события E1 (started/count_changed/amount_changed/lifted)', count($e1Events) === 4);
 
 $kinds = array_map(static fn (array $r): string => json_decode((string) $r['payload_json'], true)['kind'], $e1Events);
-check('kind-последовательность верна: started, amount_changed, lifted', $kinds === ['started', 'amount_changed', 'lifted']);
+check('kind-последовательность верна: started, count_changed, amount_changed, lifted', $kinds === ['started', 'count_changed', 'amount_changed', 'lifted']);
 
 // ---------------------------------------------------------------------
 // Статическая проверка проводки event_id (НЕ поведенческий тест — SQLite

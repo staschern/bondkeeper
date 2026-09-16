@@ -73,7 +73,7 @@ database/019_bot_ux_tariff_and_dialog_state.sql — миграция: тариф
 src/Telegram/TelegramClientInterface.php — интерфейс Bot API (sendMessage/answerCallbackQuery/editMessageText) для подмены фейком в офлайн-тестах
 src/Telegram/TelegramClient.php      — HTTP-клиент Telegram Bot API (long polling, sendMessage/editMessageText/answerCallbackQuery)
 src/Telegram/TelegramBotConfig.php   — токен бота + admin_telegram_id из config/telegram_bot.php (не коммитится, см. .example рядом)
-src/Telegram/BotFormatting.php       — общие форматтеры (agencyDisplayName/formatDate) для BotCommandHandler и NotificationDispatcher
+src/Telegram/BotFormatting.php       — общие форматтеры (agencyDisplayName/formatDate/formatMoney) для BotCommandHandler и NotificationDispatcher
 src/Telegram/BotCommandHandler.php   — разбор команд/кнопок бота: меню, «Выбор эмитентов» (умный поиск + листалка), «Статус», «Подписка», «О сервисе», чат-релей «Помощь» — см. docs/BOT_UX_SPEC.md
 src/Telegram/NotificationDispatcher.php — рассылка событий (events) подписчикам из watchlist в Telegram, этап 4 Фаза 3, см. docs/STAGE4_EVENT_ENGINE.md
 bin/daemon_telegram_bot.php          — цикл бота: long-polling команд + рассылка раз в 60 с, один процесс

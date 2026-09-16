@@ -28,6 +28,24 @@ use PDOException;
  * упасть между вставкой строки и отправкой, следующий проход увидит
  * status='queued' и решит, что делать (см. requeueStuckQueued()) —
  * не тихая потеря события.
+ *
+ * === Фильтр "не заваливать историей" (баг, найден 17 сентября 2026) ===
+ *
+ * fetchPendingPairs() дополнительно требует `w.added_at <= e.detected_at`:
+ * без этого условия пользователь, ДОБАВИВШИЙ эмитента в список, тут же
+ * получал ВСЕ его исторические события (любой E1/C5, когда-либо созданный
+ * для этого эмитента другими прогонами задолго до того, как пользователь
+ * вообще начал его отслеживать) — потому что для новой пары (user_id,
+ * event_id) строки в `notifications` ещё нет ни для одного старого
+ * события, весь бэклог считался "ещё не отправленным". Живой пример —
+ * при добавлении ООО «КОНТРОЛ лизинг» пользователь получил 4 сообщения
+ * разом (2 старых "заблокировано" с разными суммами + 2 старых "снято" с
+ * разными датами проверки — накопленные за несколько дней ежедневного
+ * крона ДО того, как этот пользователь начал отслеживание). С фильтром —
+ * пользователь видит только события, случившиеся ПОСЛЕ того, как он сам
+ * начал следить за эмитентом; за "здесь и сейчас" статус на момент
+ * добавления отвечает отдельный, не через events/notifications, канал —
+ * см. BotCommandHandler::checkFnsOnAdd().
  */
 final class NotificationDispatcher
 {
@@ -56,7 +74,7 @@ final class NotificationDispatcher
         return $this->db->query(
             "SELECT DISTINCT w.user_id, e.id AS event_id
              FROM events e
-             JOIN watchlist w ON w.issuer_id = e.issuer_id
+             JOIN watchlist w ON w.issuer_id = e.issuer_id AND w.added_at <= e.detected_at
              LEFT JOIN notifications n ON n.event_id = e.id AND n.user_id = w.user_id AND n.channel = 'telegram'
              JOIN event_types et ON et.code = e.event_type_code
              WHERE et.notify_client = 1 AND n.id IS NULL"
@@ -101,7 +119,12 @@ final class NotificationDispatcher
             return false;
         }
 
-        $text = $this->buildMessageText((string) $event['event_type_code'], $this->decodePayload($event['payload_json']), (string) $event['issuer_name']);
+        $text = $this->buildMessageText(
+            (string) $event['event_type_code'],
+            $this->decodePayload($event['payload_json']),
+            (string) $event['issuer_name'],
+            (string) $event['issuer_inn'],
+        );
 
         if ($this->telegram->sendMessage($user['telegram_id'], $text)) {
             $this->markSent($notificationId);
@@ -129,11 +152,11 @@ final class NotificationDispatcher
             : null;
     }
 
-    /** @return array{event_type_code: string, payload_json: ?string, issuer_name: string}|null */
+    /** @return array{event_type_code: string, payload_json: ?string, issuer_name: string, issuer_inn: string}|null */
     private function fetchEvent(int $eventId): ?array
     {
         $stmt = $this->db->prepare(
-            'SELECT e.event_type_code, e.payload_json, i.short_name AS issuer_name
+            'SELECT e.event_type_code, e.payload_json, i.short_name AS issuer_name, i.inn AS issuer_inn
              FROM events e
              JOIN issuers i ON i.id = e.issuer_id
              WHERE e.id = :id'
@@ -142,7 +165,12 @@ final class NotificationDispatcher
         $row = $stmt->fetch();
 
         return $row !== false
-            ? ['event_type_code' => (string) $row['event_type_code'], 'payload_json' => $row['payload_json'], 'issuer_name' => (string) $row['issuer_name']]
+            ? [
+                'event_type_code' => (string) $row['event_type_code'],
+                'payload_json' => $row['payload_json'],
+                'issuer_name' => (string) $row['issuer_name'],
+                'issuer_inn' => (string) ($row['issuer_inn'] ?? ''),
+            ]
             : null;
     }
 
@@ -166,11 +194,11 @@ final class NotificationDispatcher
      *
      * @param array<string, mixed> $payload
      */
-    private function buildMessageText(string $eventTypeCode, array $payload, string $issuerName): string
+    private function buildMessageText(string $eventTypeCode, array $payload, string $issuerName, string $issuerInn): string
     {
         return match ($eventTypeCode) {
             'C5' => $this->buildRatingActionText($payload, $issuerName),
-            'E1' => $this->buildFnsBlockText($payload, $issuerName),
+            'E1' => $this->buildFnsBlockText($payload, $issuerName, $issuerInn),
             default => "Новое событие по эмитенту «{$issuerName}».",
         };
     }
@@ -203,29 +231,49 @@ final class NotificationDispatcher
         return $text;
     }
 
-    /** @param array<string, mixed> $payload */
-    private function buildFnsBlockText(array $payload, string $issuerName): string
+    /**
+     * Форматы — дословно по правкам пользователя (17 сентября 2026):
+     * ИНН добавлен в started/amount_changed/count_changed (в lifted —
+     * намеренно без ИНН, по тому же образцу, что прислан); суммы — через
+     * BotFormatting::formatMoney() (разделитель разрядов + "₽", тот же
+     * формат, что и в разделе "Статус"). 'count_changed' — новый вид
+     * (см. EventPublisher::publishFnsBlockChange(), решение пересмотрено
+     * 17 сентября — раньше изменение только числа банков без изменения
+     * суммы события не создавало вообще).
+     *
+     * @param array<string, mixed> $payload
+     */
+    private function buildFnsBlockText(array $payload, string $issuerName, string $issuerInn): string
     {
         $kind = (string) ($payload['kind'] ?? '');
 
         return match ($kind) {
             'started' => sprintf(
-                '⚠️ %s: ФНС заблокировала счета (%d банк(ов)), сумма ~%s ₽. Дата решения ФНС: %s.%s',
+                '⚠️ %s | ИНН %s: Блокировка счетов ФНС | Дата блокировки: %s | Количество заблокированных счетов: %d | Заблокированная сумма: %s | %s',
                 $issuerName,
-                (int) ($payload['active_bank_count'] ?? 0),
-                $payload['new_blocked_amount'] ?? 'не указана',
+                $issuerInn,
                 BotFormatting::formatDate($payload['block_date'] ?? null),
-                isset($payload['reason']) ? ' ' . $payload['reason'] : ''
+                (int) ($payload['active_bank_count'] ?? 0),
+                BotFormatting::formatMoney($payload['new_blocked_amount'] ?? null),
+                $payload['reason'] ?? 'основание не указано'
             ),
             'amount_changed' => sprintf(
-                '⚠️ %s: сумма блокировки ФНС изменилась — было %s ₽, стало %s ₽ (банков: %d).',
+                '⚠️ %s | ИНН %s: сумма блокировки ФНС изменилась — было %s, стало %s (заблокированных счетов: %d).',
                 $issuerName,
-                $payload['old_blocked_amount'] ?? '—',
-                $payload['new_blocked_amount'] ?? '—',
+                $issuerInn,
+                BotFormatting::formatMoney($payload['old_blocked_amount'] ?? null),
+                BotFormatting::formatMoney($payload['new_blocked_amount'] ?? null),
+                (int) ($payload['active_bank_count'] ?? 0)
+            ),
+            'count_changed' => sprintf(
+                '⚠️ %s | ИНН %s: количество заблокированных счетов ФНС изменилось — было %d, стало %d.',
+                $issuerName,
+                $issuerInn,
+                (int) ($payload['old_active_bank_count'] ?? 0),
                 (int) ($payload['active_bank_count'] ?? 0)
             ),
             'lifted' => sprintf(
-                '✅ %s: блокировка счетов ФНС снята (по состоянию на нашу проверку от %s).',
+                '✅ %s: блокировка счетов ФНС снята (по состоянию на %s).',
                 $issuerName,
                 BotFormatting::formatDate($payload['block_date'] ?? null)
             ),

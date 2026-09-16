@@ -22,14 +22,17 @@ use PDO;
  * релиз задвоился бы событием от обоих путей записи (см. докблок в
  * STAGE4).
  *
- * Фильтр существенности — решение пользователя (4 сентября 2026):
+ * Фильтр существенности — решение пользователя (4 сентября 2026, ЧЕТВЁРТЫЙ
+ * триггер E1 про число банков добавлен 17 сентября 2026, см. ниже):
  *   - C5 (рейтинговое действие) — фильтра НЕТ, событие ВСЕГДА, включая
  *     "подтверждено без изменений".
- *   - E1 (блокировка ФНС) — строго 3 триггера: начало блокировки,
- *     изменение СУММЫ (не числа банков — сознательно проигнорировано,
- *     подтверждено пользователем), полное снятие. Ни один из трёх не
- *     наступил — событие не создаётся (publishFnsBlockChange() вернёт
- *     null).
+ *   - E1 (блокировка ФНС) — 4 триггера: начало блокировки, изменение
+ *     СУММЫ, изменение ЧИСЛА банков (без изменения суммы — раньше, 4
+ *     сентября, было сознательно проигнорировано как неважное для
+ *     клиента; решение пересмотрено пользователем 17 сентября — число
+ *     заблокированных счетов всё же стоит отдельного уведомления), полное
+ *     снятие. Ни один из четырёх не наступил — событие не создаётся
+ *     (publishFnsBlockChange() вернёт null).
  */
 final class EventPublisher
 {
@@ -102,17 +105,22 @@ final class EventPublisher
      * SELECT из уже существующей строки, не гарантированно побайтово
      * совпадает даже при той же сумме).
      *
-     * Возвращает null, если ни один из 3 триггеров не наступил (сумма
-     * та же, блокировка не появилась и не пропала) — событие НЕ
-     * создаётся. Различие "какой именно из трёх" — в payload_json.kind
-     * и в тексте status_text, event_type_code у всех троих один — 'E1'
-     * (в event_types нет отдельных кодов на каждый подслучай, это
-     * осознанно, см. STAGE4).
+     * Возвращает null, если ни один из 4 триггеров не наступил (сумма и
+     * число банков те же, блокировка не появилась и не пропала) —
+     * событие НЕ создаётся. Различие "какой именно" — в payload_json.kind
+     * и в тексте status_text, event_type_code у всех один — 'E1' (в
+     * event_types нет отдельных кодов на каждый подслучай, это осознанно,
+     * см. STAGE4). Приоритет при одновременном изменении суммы И числа
+     * банков — 'amount_changed' (сумма информативнее для клиента, см.
+     * буквенный порядок match ниже) — 'count_changed' срабатывает, только
+     * когда сумма НЕ изменилась, иначе на одном и том же реальном событии
+     * ушли бы два разных уведомления подряд.
      */
     public function publishFnsBlockChange(
         int $issuerId,
         bool $oldBlocked,
         ?string $oldBlockedAmount,
+        int $oldActiveBankCount,
         bool $newBlocked,
         ?string $newBlockedAmount,
         int $newActiveBankCount,
@@ -124,6 +132,7 @@ final class EventPublisher
             !$oldBlocked && $newBlocked => 'started',
             $oldBlocked && !$newBlocked => 'lifted',
             $oldBlocked && $newBlocked && $this->amountsDiffer($oldBlockedAmount, $newBlockedAmount) => 'amount_changed',
+            $oldBlocked && $newBlocked && $oldActiveBankCount !== $newActiveBankCount => 'count_changed',
             default => null,
         };
 
@@ -141,6 +150,7 @@ final class EventPublisher
             'kind' => $kind,
             'old_blocked' => $oldBlocked,
             'old_blocked_amount' => $oldBlockedAmount,
+            'old_active_bank_count' => $oldActiveBankCount,
             'new_blocked' => $newBlocked,
             'new_blocked_amount' => $newBlockedAmount,
             'active_bank_count' => $newActiveBankCount,
@@ -151,6 +161,7 @@ final class EventPublisher
         $statusText = match ($kind) {
             'started' => "Новая блокировка счетов, банков: {$newActiveBankCount}",
             'amount_changed' => "Сумма блокировки изменена: {$oldBlockedAmount} → {$newBlockedAmount}",
+            'count_changed' => "Число заблокированных счетов изменено: {$oldActiveBankCount} → {$newActiveBankCount}",
             'lifted' => 'Блокировка счетов снята',
         };
 

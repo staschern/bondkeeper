@@ -19,6 +19,8 @@ declare(strict_types=1);
 
 require dirname(__DIR__) . '/bin/bootstrap.php';
 
+use BondKeeper\Fns\NalogBiClientInterface;
+use BondKeeper\Fns\NalogBiResult;
 use BondKeeper\Ratings\IssuerMatcher;
 use BondKeeper\Telegram\BotCommandHandler;
 use BondKeeper\Telegram\TelegramClientInterface;
@@ -56,6 +58,27 @@ final class FakeTelegramClient implements TelegramClientInterface
     }
 }
 
+/**
+ * Заглушка ФНС для checkFnsOnAdd() — всегда "блокировок нет, без капчи",
+ * БЕЗ сети (реального service.nalog.ru здесь быть не должно, тот же
+ * принцип, что и у FakeTelegramClient). Реальную запись результата всё
+ * равно делает FnsBlocksImporter::applyResult() через MySQL-диалект
+ * (ON DUPLICATE KEY UPDATE/NOW()), которого в SQLite нет — тот самый
+ * давний нюанс офлайн-тестирования (см. докблок наверху файла): в этих
+ * тестах checkFnsOnAdd() поэтому либо тихо ловит исключение сама (см. её
+ * докблок в BotCommandHandler), либо вообще не доходит до сети/записи,
+ * если для эмитента уже есть "свежая" строка в fns_blocks (см. посев ниже
+ * и isFnsCheckFresh()) — тестируется здесь только ЭТА развилка, а не сам
+ * поход в FnsBlocksImporter.
+ */
+final class FakeNalogBiClient implements NalogBiClientInterface
+{
+    public function check(string $inn): NalogBiResult
+    {
+        return NalogBiResult::fromJson(['rows' => []]);
+    }
+}
+
 $failures = 0;
 $checks = 0;
 
@@ -82,7 +105,7 @@ $db->exec('CREATE TABLE issuers (id INTEGER PRIMARY KEY, inn TEXT, full_name TEX
 // "по эмитенту целиком", этого достаточно для проверки поведения при
 // дубле.
 $db->exec('CREATE TABLE watchlist (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, issuer_id INTEGER, security_id INTEGER, UNIQUE(user_id, issuer_id))');
-$db->exec('CREATE TABLE fns_blocks (issuer_id INTEGER PRIMARY KEY, is_fns_blocked INTEGER, block_date TEXT, active_bank_count INTEGER, blocked_amount TEXT)');
+$db->exec('CREATE TABLE fns_blocks (issuer_id INTEGER PRIMARY KEY, is_fns_blocked INTEGER, block_date TEXT, active_bank_count INTEGER, blocked_amount TEXT, reason TEXT, verification TEXT, date_verification TEXT)');
 $db->exec('CREATE TABLE current_ratings (issuer_id INTEGER, agency TEXT, rating TEXT, outlook TEXT, last_action_date TEXT)');
 $db->exec('CREATE TABLE subscriptions (id INTEGER PRIMARY KEY, user_id INTEGER, tariff_code TEXT, status TEXT, current_period_end TEXT)');
 $db->exec('CREATE TABLE tariffs (code TEXT PRIMARY KEY, name TEXT, max_tracked_issuers INTEGER, duration_days INTEGER)');
@@ -94,7 +117,7 @@ $db->exec("INSERT INTO tariffs (code, name, max_tracked_issuers, duration_days) 
 
 // Эмитент 1: заблокирован ФНС, два рейтинга (НКР + АКРА).
 $db->exec("INSERT INTO issuers (id, inn, full_name, short_name) VALUES (1, '7706107510', 'ПАО Роснефть', 'Роснефть')");
-$db->exec("INSERT INTO fns_blocks (issuer_id, is_fns_blocked, block_date, active_bank_count, blocked_amount) VALUES (1, 1, '2026-08-15', 3, '1500000.00')");
+$db->exec("INSERT INTO fns_blocks (issuer_id, is_fns_blocked, block_date, active_bank_count, blocked_amount, verification, date_verification) VALUES (1, 1, '2026-08-15', 3, '1500000.00', 'success', datetime('now'))");
 $db->exec("INSERT INTO current_ratings (issuer_id, agency, rating, outlook, last_action_date) VALUES (1, 'nkr', 'AAA.ru', 'stable', '2026-07-01')");
 $db->exec("INSERT INTO current_ratings (issuer_id, agency, rating, outlook, last_action_date) VALUES (1, 'acra', 'AAA(RU)', 'positive', '2026-06-20')");
 
@@ -109,6 +132,12 @@ $letters = ['Алроса', 'Башнефть', 'Вымпелком', 'Детс�
 foreach ($letters as $i => $name) {
     $id = $i + 3;
     $db->exec("INSERT INTO issuers (id, inn, full_name, short_name) VALUES ({$id}, '000000000{$i}', '{$name} ПАО', '{$name}')");
+    // "Свежая" проверка ФНС (без блокировки) для каждого — toggleIssuer()/
+    // pickIssuer() ниже добавляют этих эмитентов в вотчлист и синхронно
+    // зовут checkFnsOnAdd(); isFnsCheckFresh() должна остановить её ДО
+    // похода в FnsBlocksImporter (MySQL-диалект, недоступный в SQLite —
+    // см. докблок класса FakeNalogBiClient выше).
+    $db->exec("INSERT INTO fns_blocks (issuer_id, is_fns_blocked, active_bank_count, verification, date_verification) VALUES ({$id}, 0, 0, 'success', datetime('now'))");
 }
 
 $db->exec('INSERT INTO watchlist (user_id, issuer_id) VALUES (1, 1)');
@@ -116,7 +145,7 @@ $db->exec('INSERT INTO watchlist (user_id, issuer_id) VALUES (1, 2)');
 $db->exec("INSERT INTO subscriptions (user_id, tariff_code, status, current_period_end) VALUES (1, 'free', 'active', '2026-09-21')");
 
 $telegram = new FakeTelegramClient();
-$handler = new BotCommandHandler($db, $telegram, new IssuerMatcher($db), 555);
+$handler = new BotCommandHandler($db, $telegram, new IssuerMatcher($db), 555, new FakeNalogBiClient());
 $ref = new ReflectionClass($handler);
 
 function callPrivate(ReflectionClass $ref, object $obj, string $method, array $args)
@@ -183,6 +212,42 @@ check('dispatchStatusCallback("one"): только выбранный эмите
 // Эмитент не из вотчлиста этого пользователя (id=3, "Алроса", в watchlist не добавлен) — не показываем чужой статус молча.
 callPrivate($ref, $handler, 'dispatchStatusCallback', [1, 5001, 42, 'stat:one:3']);
 check('dispatchStatusCallback("one"): id вне вотчлиста -> не показывает статус, честное сообщение', str_contains($telegram->lastEdit['text'], 'больше не в вашем списке'));
+
+// --- checkFnsOnAdd(): fnsBlockAddedText()/isFnsCheckFresh() — чистая логика, без сети/БД (17 сентября 2026) ---
+$fnsAddedBlocked = callPrivate($ref, $handler, 'fnsBlockAddedText', [
+    'ООО «КОНТРОЛ лизинг»', '7805485840',
+    ['is_fns_blocked' => 1, 'block_date' => '2026-08-14', 'active_bank_count' => 14, 'blocked_amount' => '510141949.02', 'reason' => 'Код 01: Принятие налоговым органом решения о взыскании задолженности'],
+]);
+check('fnsBlockAddedText(): формат "Блокировка счетов ФНС" с ИНН', str_starts_with((string) $fnsAddedBlocked, '⚠️ ООО «КОНТРОЛ лизинг» | ИНН 7805485840: Блокировка счетов ФНС'));
+check('fnsBlockAddedText(): дата в формате дд.мм.гг', str_contains((string) $fnsAddedBlocked, 'Дата блокировки: 14.08.26'));
+check('fnsBlockAddedText(): сумма с разделителем разрядов и ₽', str_contains((string) $fnsAddedBlocked, '510 141 949.02 ₽'));
+check('fnsBlockAddedText(): основание на месте', str_contains((string) $fnsAddedBlocked, 'Код 01: Принятие налоговым органом решения о взыскании задолженности'));
+
+check(
+    'fnsBlockAddedText(): нет блокировки (is_fns_blocked=0) -> null, молчим (прямое решение пользователя)',
+    callPrivate($ref, $handler, 'fnsBlockAddedText', ['ООО «Омега»', '7826108963', ['is_fns_blocked' => 0, 'block_date' => null, 'active_bank_count' => 0, 'blocked_amount' => null, 'reason' => null]]) === null
+);
+check(
+    'fnsBlockAddedText(): проверка не дала результата (fns=null) -> null',
+    callPrivate($ref, $handler, 'fnsBlockAddedText', ['ООО «Омега»', '7826108963', null]) === null
+);
+
+check(
+    'isFnsCheckFresh(): fns=null (ещё не проверяли) -> не свежая',
+    callPrivate($ref, $handler, 'isFnsCheckFresh', [null]) === false
+);
+check(
+    'isFnsCheckFresh(): verification=error (капча/сеть на последней попытке) -> не свежая, даже если недавняя',
+    callPrivate($ref, $handler, 'isFnsCheckFresh', [['verification' => 'error', 'date_verification' => date('Y-m-d H:i:s')]]) === false
+);
+check(
+    'isFnsCheckFresh(): success только что -> свежая',
+    callPrivate($ref, $handler, 'isFnsCheckFresh', [['verification' => 'success', 'date_verification' => date('Y-m-d H:i:s')]]) === true
+);
+check(
+    'isFnsCheckFresh(): success сутки назад (> FNS_ON_ADD_FRESH_HOURS) -> не свежая, проверяем заново',
+    callPrivate($ref, $handler, 'isFnsCheckFresh', [['verification' => 'success', 'date_verification' => date('Y-m-d H:i:s', time() - 24 * 3600)]]) === false
+);
 
 // --- Подписка ---
 $subscription = callPrivate($ref, $handler, 'handleSubscription', [1]);

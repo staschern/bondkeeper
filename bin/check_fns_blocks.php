@@ -27,6 +27,12 @@ declare(strict_types=1);
  * Пауза между проверками — 5 секунд по умолчанию, меняется через --delay:
  *   php bin/check_fns_blocks.php --limit=10 --delay=8
  *
+ * Повторные попытки внутри ОДНОГО прогона (17 сентября 2026) — по
+ * умолчанию 2 доп. прохода по тем, кто не прошёл проверку (капча/ошибка),
+ * пауза перед каждым — 90 секунд. Меняется через --retries/--retry-delay
+ * (--retries=0 — старое поведение, без повторов, сразу до завтрашнего крона):
+ *   php bin/check_fns_blocks.php --limit=10 --retries=3 --retry-delay=120
+ *
  * По расписанию — раз в сутки по watchlist, в 08:00 (сервис ФНС не даёт
  * официального API — только точечный список, не весь рынок, см.
  * docs/STAGE1_POSTPROCESSING.md):
@@ -44,6 +50,8 @@ use BondKeeper\Support\Logger;
 $inns = null;
 $limit = 5;
 $delaySeconds = 5;
+$maxRetries = 2;
+$retryDelaySeconds = 90;
 
 foreach ($argv as $arg) {
     if (str_starts_with($arg, '--inns=')) {
@@ -54,6 +62,10 @@ foreach ($argv as $arg) {
         $limit = max(1, (int) substr($arg, 8));
     } elseif (str_starts_with($arg, '--delay=')) {
         $delaySeconds = max(1, (int) substr($arg, 8));
+    } elseif (str_starts_with($arg, '--retries=')) {
+        $maxRetries = max(0, (int) substr($arg, 10));
+    } elseif (str_starts_with($arg, '--retry-delay=')) {
+        $retryDelaySeconds = max(1, (int) substr($arg, 14));
     }
 }
 
@@ -89,6 +101,6 @@ Logger::info('Старт: проверка блокировок счетов Ф�
     . " (пауза между проверками: {$delaySeconds} с)");
 
 $importer = new FnsBlocksImporter(new NalogBiClient(), $db, new EventPublisher($db), $delaySeconds);
-$importer->checkIssuers($issuers);
+$importer->checkIssuers($issuers, $maxRetries, $retryDelaySeconds);
 
 Logger::info('Готово.');

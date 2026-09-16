@@ -4,7 +4,12 @@ declare(strict_types=1);
 
 namespace BondKeeper\Telegram;
 
+use BondKeeper\Events\EventPublisher;
+use BondKeeper\Fns\FnsBlocksImporter;
+use BondKeeper\Fns\NalogBiClient;
+use BondKeeper\Fns\NalogBiClientInterface;
 use BondKeeper\Ratings\IssuerMatcher;
+use BondKeeper\Support\Logger;
 use PDO;
 use PDOException;
 
@@ -66,6 +71,7 @@ final class BotCommandHandler
     private const BTN_HELP = 'Помощь 🛠';
     private const BROWSE_PAGE_SIZE = 8;
     private const ABOUT_ARTICLE_URL = 'https://teletype.in/@kvint_invest/-mSGn-tfdhZ';
+    private const FNS_ON_ADD_FRESH_HOURS = 12;
 
     public function __construct(
         private readonly PDO $db,
@@ -73,6 +79,8 @@ final class BotCommandHandler
         private readonly IssuerMatcher $matcher,
         /** 0 — не настроено, раздел "Помощь" тогда не работает (см. forwardToAdmin()). */
         private readonly int $adminTelegramId = 0,
+        /** Подмена в офлайн-тестах (checkFnsOnAdd()) — без сети, по умолчанию настоящий сервис ФНС. */
+        private readonly NalogBiClientInterface $nalogBiClient = new NalogBiClient(),
     ) {
     }
 
@@ -494,10 +502,12 @@ final class BotCommandHandler
                 }
             }
 
+            $justAdded = false;
             try {
                 $this->db->prepare('INSERT INTO watchlist (user_id, issuer_id) VALUES (:user_id, :issuer_id)')
                     ->execute(['user_id' => $userId, 'issuer_id' => $issuerId]);
                 $toast = 'Добавлено';
+                $justAdded = true;
             } catch (PDOException $e) {
                 if (!$this->isDuplicateKeyViolation($e)) {
                     throw $e;
@@ -507,6 +517,12 @@ final class BotCommandHandler
         }
 
         $this->showIssuerBrowsePage($userId, $chatId, $messageId, $page);
+
+        // Проверка ФНС — уже ПОСЛЕ обновления списка на экране (быстрый
+        // отклик на нажатие), см. checkFnsOnAdd().
+        if ($justAdded ?? false) {
+            $this->checkFnsOnAdd($chatId, $issuerId);
+        }
 
         return $toast;
     }
@@ -550,6 +566,10 @@ final class BotCommandHandler
             "Список успешно обновлён! 🥳\nЧтобы получить актуальную информацию по конкретному эмитенту или всему списку нажми на команду " . self::BTN_STATUS
         );
 
+        // Проверка ФНС — уже ПОСЛЕ подтверждения добавления (быстрый
+        // отклик на нажатие), см. checkFnsOnAdd().
+        $this->checkFnsOnAdd($chatId, $issuerId);
+
         return "Добавлено: {$name}";
     }
 
@@ -562,6 +582,117 @@ final class BotCommandHandler
         $this->showEditListScreen($userId, $chatId, $messageId);
 
         return $removed ? 'Убрано' : null;
+    }
+
+    /**
+     * Разовая проверка ФНС сразу при добавлении эмитента в список
+     * (решение пользователя, 17 сентября 2026): раньше пользователь узнавал
+     * о блокировке только на следующей плановой проверке (до суток
+     * ожидания), а "Статус" по только что добавленному эмитенту молчал,
+     * пока хотя бы одна проверка не случится вообще. Идём в
+     * service.nalog.ru СИНХРОННО прямо здесь (см. FnsBlocksImporter) — это
+     * заведомо небольшая нагрузка (одно действие пользователя = одна
+     * проверка), а не массовый прогон.
+     *
+     * НЕ дёргаем сеть повторно, если проверка уже была недавно и прошла
+     * успешно (isFnsCheckFresh()) — экономим лишний запрос к
+     * service.nalog.ru, у которого и так проблемы с капчей на объёме (см.
+     * докблок FnsBlocksImporter про капчу и повторные попытки).
+     *
+     * Уведомление о результате — НАПРЯМУЮ этому пользователю (sendMessage),
+     * а НЕ через events/notifications: тот путь общий для ВСЕХ подписчиков
+     * эмитента и не должен сработать только из-за того, что кто-то НОВЫЙ
+     * начал отслеживание (см. докблок NotificationDispatcher::fetchPendingPairs()
+     * про баг с историческим бэклогом, найденный тем же днём). Молчим,
+     * если блокировки нет — по прямому решению пользователя ("присылать
+     * нужно, если блокировка реально есть").
+     *
+     * Ошибка/капча при этой разовой проверке — не критично, тихо
+     * пропускаем: следующая плановая проверка (крон) доберётся до этого
+     * эмитента как обычно, а событие E1 (если реально что-то изменится)
+     * дойдёт до пользователя через обычный канал рассылки.
+     */
+    private function checkFnsOnAdd(int $chatId, int $issuerId): void
+    {
+        $issuerStmt = $this->db->prepare('SELECT short_name, inn FROM issuers WHERE id = :id');
+        $issuerStmt->execute(['id' => $issuerId]);
+        $issuer = $issuerStmt->fetch();
+        if ($issuer === false || $issuer['inn'] === null || $issuer['inn'] === '') {
+            return;
+        }
+
+        $fns = $this->fetchFnsBlockRow($issuerId);
+        if (!$this->isFnsCheckFresh($fns)) {
+            try {
+                (new FnsBlocksImporter($this->nalogBiClient, $this->db, new EventPublisher($this->db)))
+                    ->checkIssuers([['id' => $issuerId, 'inn' => (string) $issuer['inn']]], maxRetries: 0);
+            } catch (\Throwable $e) {
+                Logger::warn("ФНС: разовая проверка при добавлении эмитента id={$issuerId} не удалась: {$e->getMessage()}");
+                return;
+            }
+            $fns = $this->fetchFnsBlockRow($issuerId);
+        }
+
+        $text = $this->fnsBlockAddedText((string) $issuer['short_name'], (string) $issuer['inn'], $fns);
+        if ($text !== null) {
+            $this->telegram->sendMessage($chatId, $text);
+        }
+    }
+
+    /** @return array<string, mixed>|null */
+    private function fetchFnsBlockRow(int $issuerId): ?array
+    {
+        $stmt = $this->db->prepare(
+            'SELECT is_fns_blocked, block_date, active_bank_count, blocked_amount, reason, verification, date_verification
+             FROM fns_blocks WHERE issuer_id = :issuer_id'
+        );
+        $stmt->execute(['issuer_id' => $issuerId]);
+        $row = $stmt->fetch();
+
+        return $row !== false ? $row : null;
+    }
+
+    /**
+     * Свежая успешная проверка (не старше FNS_ON_ADD_FRESH_HOURS часов) —
+     * не дёргаем service.nalog.ru повторно ради того же самого ответа.
+     * verification='error' (капча/сеть на последней попытке) НЕ считается
+     * свежей — реальное состояние всё ещё неизвестно, есть смысл
+     * попробовать ещё раз.
+     *
+     * @param array<string, mixed>|null $fns
+     */
+    private function isFnsCheckFresh(?array $fns): bool
+    {
+        if ($fns === null || $fns['verification'] !== 'success' || $fns['date_verification'] === null) {
+            return false;
+        }
+
+        return strtotime((string) $fns['date_verification']) >= time() - self::FNS_ON_ADD_FRESH_HOURS * 3600;
+    }
+
+    /**
+     * Текст уведомления о блокировке при добавлении эмитента — чистая
+     * функция (без сети/БД), тестируется отдельно от checkFnsOnAdd().
+     * null — блокировки нет (или проверка не дала результата) — тогда
+     * checkFnsOnAdd() ничего не отправляет.
+     *
+     * @param array<string, mixed>|null $fns строка fns_blocks
+     */
+    private function fnsBlockAddedText(string $shortName, string $inn, ?array $fns): ?string
+    {
+        if ($fns === null || !(bool) $fns['is_fns_blocked']) {
+            return null;
+        }
+
+        return sprintf(
+            '⚠️ %s | ИНН %s: Блокировка счетов ФНС | Дата блокировки: %s | Количество заблокированных счетов: %d | Заблокированная сумма: %s | %s',
+            $shortName,
+            $inn,
+            BotFormatting::formatDate($fns['block_date'] !== null ? (string) $fns['block_date'] : null),
+            (int) $fns['active_bank_count'],
+            BotFormatting::formatMoney($fns['blocked_amount'] !== null ? (string) $fns['blocked_amount'] : null),
+            $fns['reason'] !== null ? (string) $fns['reason'] : 'основание не указано'
+        );
     }
 
     /**
