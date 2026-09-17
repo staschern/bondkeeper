@@ -46,10 +46,19 @@ declare(strict_types=1);
  * (--retries=0 — старое поведение, без повторов, сразу до завтрашнего крона):
  *   php bin/check_fns_blocks.php --limit=10 --retries=3 --retry-delay=120
  *
- * По расписанию — раз в сутки по реальному листу наблюдения, в 08:00
- * (сервис ФНС не даёт официального API — только точечный список, не весь
- * рынок, см. docs/STAGE1_POSTPROCESSING.md):
- *   0 8 * * * /usr/bin/php /path/to/bondkeeper/bin/check_fns_blocks.php --from-watchlist --delay=8 >> /var/log/bondkeeper/check_fns_blocks.log 2>&1
+ * По расписанию — боевой режим (17 сентября 2026, прямой запрос
+ * пользователя "посмотрим, как это будет работать"): каждые 30 минут, по
+ * тому же расписанию, что и *-news у рейтинговых агентств
+ * (0,30 5-16 * * 1-5 + отдельный слот в 17:00, будни, без ночи/выходных —
+ * см. bin/seed_ratings.php) — со сдвигом на 10 минут (:10/:40, слот
+ * 17:10), чтобы не создавать одновременную сетевую нагрузку с прогонами
+ * рейтингов на те же самые минуты :00/:30. Раньше было раз в сутки в
+ * 08:00 — с ростом частоты запусков добавлена блокировка от
+ * параллельного прогона (см. ниже, тот же приём, что в seed_ratings.php)
+ * — на случай, если один прогон (сеть/капча/повторы) не уложится в
+ * 30-минутный интервал до следующего срабатывания крона.
+ *   10,40 5-16 * * 1-5 /usr/bin/php /path/to/bondkeeper/bin/check_fns_blocks.php --from-watchlist --delay=8 >> /var/log/bondkeeper/check_fns_blocks.log 2>&1
+ *   10 17 * * 1-5      /usr/bin/php /path/to/bondkeeper/bin/check_fns_blocks.php --from-watchlist --delay=8 >> /var/log/bondkeeper/check_fns_blocks.log 2>&1
  */
 
 require __DIR__ . '/bootstrap.php';
@@ -98,6 +107,22 @@ function readWatchlistFile(string $path): array
         array_map('trim', $lines),
         static fn (string $line): bool => $line !== '' && !str_starts_with($line, '#')
     ));
+}
+
+// Блокировка от параллельного запуска — на случай, если прогон (сеть/
+// капча/повторы) не уложится в 30-минутный интервал между двумя
+// срабатываниями крона (боевой режим с 17 сентября 2026, см. докблок
+// класса). Тот же приём, что и у bin/seed_ratings.php — второй запуск
+// просто тихо завершается (exit 0, не ошибка), а не встаёт в очередь и
+// не запускается поверх ещё выполняющегося.
+$lockDir = __DIR__ . '/../var/lock';
+if (!is_dir($lockDir)) {
+    @mkdir($lockDir, 0775, true);
+}
+$lockHandle = fopen($lockDir . '/check_fns_blocks.lock', 'c');
+if ($lockHandle === false || !flock($lockHandle, LOCK_EX | LOCK_NB)) {
+    Logger::info('Пропуск: другой прогон check_fns_blocks.php ещё не завершился.');
+    exit(0);
 }
 
 $db = Database::connection();

@@ -61,7 +61,7 @@ bin/seed_ratings.php                 — запуск сидирования р�
 bin/daemon_nkr_news.php              — автономный цикл nkr-news вместо OS cron (частый/глубокий проход), если на сервере нет доступа к обычному планировщику
 bin/daemon_expert_ra_news.php        — то же для expert_ra-news
 bin/daemon_nra.php                   — то же для nra (простой цикл, без деления на частый/глубокий)
-bin/check_fns_blocks.php             — точечная/по расписанию проверка блокировок счетов; по расписанию — --from-watchlist (реальный лист наблюдения пользователей бота, см. docs/STAGE1_POSTPROCESSING.md)
+bin/check_fns_blocks.php             — точечная/по расписанию (каждые 30 мин, будни 5-17) проверка блокировок счетов; по расписанию — --from-watchlist (реальный лист наблюдения пользователей бота, см. docs/STAGE1_POSTPROCESSING.md)
 config/fns_watchlist.txt             — статичный список ИНН для ручной точечной проверки (--watchlist-file=), НЕ используется в кроне с 17 сентября 2026
 bin/debug_iss_security.php           — разовая диагностика сырого ответа ISS API по ISIN
 bin/debug_rating_page.php            — разовая диагностика структуры страницы рейтингового агентства (этап 3, см. docs/STAGE3_RATINGS.md)

@@ -370,10 +370,32 @@ watchlist`). `inn IS NOT NULL` — исключает 2 известных ев�
 инструмент для проверки конкретных эмитентов вне зависимости от того,
 следит ли за ними кто-то в боте, не для крона.
 
+Крон, изначально раз в сутки в 08:00 — см. ниже, "Боевой режим", где
+переведён на каждые 30 минут.
+
+## Боевой режим: каждые 30 минут (17 сентября 2026)
+
+Прямой запрос пользователя — "посмотрим, как это будет работать".
+Расписание — то же, что у `seed_ratings.php --agency=*-news` (будни,
+без ночи/выходных, каждые 30 минут с 5:00 до 17:00 по времени сервера,
+UTC), но со сдвигом на 10 минут (`:10`/`:40` вместо `:00`/`:30`), чтобы
+не создавать одновременную сетевую нагрузку с прогонами рейтингов на те
+же самые минуты — прямая просьба пользователя ("небольшой сдвиг ...
+минут на 10-15").
+
+С ростом частоты запусков добавлена файловая блокировка от
+параллельного прогона (`var/lock/check_fns_blocks.lock`, тот же приём,
+что уже был у `seed_ratings.php`, см. её докблок) — на случай, если один
+прогон (сеть/капча/повторы, см. "Доработки 17 сентября 2026" в
+`docs/STAGE4_EVENT_ENGINE.md`) не уложится в 30-минутный интервал до
+следующего срабатывания крона: второй запуск просто тихо завершается,
+не встаёт поверх ещё выполняющегося.
+
 Крон (добавить в `crontab -u www-root -e`, по аналогии с
-`seed_market.php`/`seed_bondization.php`):
+`seed_ratings.php --agency=*-news`):
 ```
-0 8 * * * /usr/bin/php /var/www/www-root/data/bondkeeper-app/bin/check_fns_blocks.php --from-watchlist --delay=8 >> /var/www/www-root/data/bondkeeper-app/var/log/check_fns_blocks.log 2>&1
+10,40 5-16 * * 1-5 /usr/bin/php /var/www/www-root/data/bondkeeper-app/bin/check_fns_blocks.php --from-watchlist --delay=8 >> /var/www/www-root/data/bondkeeper-app/var/log/check_fns_blocks.log 2>&1
+10 17 * * 1-5      /usr/bin/php /var/www/www-root/data/bondkeeper-app/bin/check_fns_blocks.php --from-watchlist --delay=8 >> /var/www/www-root/data/bondkeeper-app/var/log/check_fns_blocks.log 2>&1
 ```
 
 ---
