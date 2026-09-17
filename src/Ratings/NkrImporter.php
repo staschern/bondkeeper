@@ -47,6 +47,19 @@ use PDO;
  * normalizeWithdrawnRatingText() сводит любое написание со словом
  * "отозван" к тому же литералу, что и у NkrNewsImporter — оба импортёра
  * теперь согласованы независимо от порядка прогонов.
+ *
+ * === fetchSnapshot() — переиспользуется сверщиком (17 сентября 2026) ===
+ *
+ * Скачивание+разбор выгрузки вынесены в отдельный публичный метод
+ * fetchSnapshot() — возвращает нормализованный "снимок сейчас" БЕЗ
+ * записи в БД. import() сам теперь просто пишет то, что вернул этот
+ * метод. Нужно это было CurrentRatingsReconciler (см.
+ * docs/STAGE3_RATINGS.md, раздел "Сверка current_ratings") — той же
+ * логике скачивания и разбора, но для СРАВНЕНИЯ с current_ratings, а не
+ * для слепой перезаписи. Прямой запрос пользователя: НКР — единственное
+ * агентство с отдельной страницей "снимок сейчас", поэтому именно здесь
+ * сверка переиспользует существующий импортёр буквально, а не
+ * пересчитывает что-то заново (в отличие от НРА, см. NraImporter).
  */
 final class NkrImporter
 {
@@ -68,6 +81,26 @@ final class NkrImporter
 
     public function import(): void
     {
+        $snapshot = $this->fetchSnapshot();
+
+        foreach ($snapshot as $row) {
+            $this->writeCurrentRating($row);
+        }
+
+        $this->printReport();
+    }
+
+    /**
+     * Скачивает и разбирает выгрузку НКР в нормализованный снимок "сейчас"
+     * — БЕЗ записи в БД. Побочный эффект: заполняет те же счётчики
+     * (matched/unmatchedNoInn/...), что и раньше заполнял import() —
+     * printReport() продолжает работать одинаково что для import(), что
+     * при вызове только этого метода.
+     *
+     * @return array<int, array{issuer_id: int, issuer_name: string, rating: string, outlook: ?string, last_action_date: string}>
+     */
+    public function fetchSnapshot(): array
+    {
         $tmpFile = sys_get_temp_dir() . '/bondkeeper_nkr_issuers_' . uniqid('', true) . '.xlsx';
         file_put_contents($tmpFile, RatingsHttp::get(self::EXPORT_URL));
 
@@ -77,18 +110,25 @@ final class NkrImporter
             unlink($tmpFile);
         }
 
+        $this->totalRows = count($rows);
         Logger::info('НКР: строк в выгрузке (эмитенты): ' . count($rows));
 
+        $snapshot = [];
         foreach ($rows as $row) {
-            $this->totalRows++;
-            $this->importRow($row);
+            $parsed = $this->parseRow($row);
+            if ($parsed !== null) {
+                $snapshot[] = $parsed;
+            }
         }
 
-        $this->printReport();
+        return $snapshot;
     }
 
-    /** @param array<string, string> $row */
-    private function importRow(array $row): void
+    /**
+     * @param array<string, string> $row
+     * @return array{issuer_id: int, issuer_name: string, rating: string, outlook: ?string, last_action_date: string}|null
+     */
+    private function parseRow(array $row): ?array
     {
         $tin = $row['TIN'] ?? '';
         $issuerId = $this->matcher->findIssuerIdByInn($tin);
@@ -99,15 +139,30 @@ final class NkrImporter
                 $this->unmatchedNoIssuer++;
             }
             $this->unmatchedNames[] = ($row['Issuer Name'] ?? '?') . " (TIN={$tin})";
-            return;
+            return null;
         }
 
         $lastActionDate = RatingsNormalizer::parseDate($row['Date'] ?? '');
         if ($lastActionDate === null) {
             $this->skippedNoDate++;
-            return;
+            return null;
         }
 
+        $this->matched++;
+
+        return [
+            'issuer_id' => $issuerId,
+            'issuer_name' => (string) ($row['Issuer Name'] ?? ''),
+            'rating' => RatingsNormalizer::normalizeWithdrawnRatingText($row['Rating'] ?? ''),
+            'outlook' => RatingsNormalizer::extractReviewStatusFromProse($row['Outlook'] ?? '')
+                ?? RatingsNormalizer::mapOutlook($row['Outlook'] ?? ''),
+            'last_action_date' => $lastActionDate,
+        ];
+    }
+
+    /** @param array{issuer_id: int, issuer_name: string, rating: string, outlook: ?string, last_action_date: string} $row */
+    private function writeCurrentRating(array $row): void
+    {
         $stmt = $this->db->prepare(
             'INSERT INTO current_ratings (issuer_id, agency, rating, outlook, last_action_date)
              VALUES (:issuer_id, :agency, :rating, :outlook, :last_action_date)
@@ -117,15 +172,12 @@ final class NkrImporter
                 last_action_date = VALUES(last_action_date)'
         );
         $stmt->execute([
-            'issuer_id' => $issuerId,
+            'issuer_id' => $row['issuer_id'],
             'agency' => 'nkr',
-            'rating' => RatingsNormalizer::normalizeWithdrawnRatingText($row['Rating'] ?? ''),
-            'outlook' => RatingsNormalizer::extractReviewStatusFromProse($row['Outlook'] ?? '')
-                ?? RatingsNormalizer::mapOutlook($row['Outlook'] ?? ''),
-            'last_action_date' => $lastActionDate,
+            'rating' => $row['rating'],
+            'outlook' => $row['outlook'],
+            'last_action_date' => $row['last_action_date'],
         ]);
-
-        $this->matched++;
     }
 
     private function printReport(): void

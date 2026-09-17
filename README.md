@@ -46,6 +46,8 @@ src/Ratings/ExpertRaImporter.php     — current_ratings из raexpert.ru (Эк�
 src/Ratings/AcraImporter.php         — current_ratings из JSON-файла АКРА, который готовит пользователь (см. docs/STAGE3_RATINGS.md)
 src/Ratings/ManualRatingsImporter.php — current_ratings из ручного xlsx (рейтинги, не найденные через автоматические источники)
 src/Ratings/RatingActionsWriter.php  — общий апсерт в rating_actions (ключ — UNIQUE(issuer_id, agency, action_date), полностью распознанные действия, см. docs/STAGE3_RATINGS.md)
+src/Ratings/CurrentRatingsReconciler.php — сверка current_ratings с "истиной" от агентства (НЕ импортёр — ничего не пишет, только сравнивает и печатает расхождения), см. docs/STAGE3_RATINGS.md
+bin/reconcile_ratings.php            — запуск сверки (--agency=nkr|nra|all), см. docs/STAGE3_RATINGS.md
 src/Ratings/CurrentRatingsSync.php   — чтение/запись current_ratings для новостных импортёров (источник rating_from/outlook_from; апсерт кэша только если действие не старше уже сохранённого)
 src/Ratings/RatingNewsLog.php        — журнал просмотренных пресс-релизов (rating_news_log) — дедуп/ретрай по (agency, source_url), независимо от rating_actions
 src/Ratings/NkrTitleParser.php       — чистый (без БД/сети) разбор заголовков пресс-релизов НКР
@@ -88,6 +90,7 @@ tests/test_issuer_name_shortener.php — офлайн-проверка IssuerNam
 bin/backfill_issuer_short_names.php  — разовая пересборка issuers.short_name из full_name для строк, накопленных до появления IssuerNameShortener (идемпотентно, безопасно перезапускать)
 tests/test_offers_importer.php       — офлайн-проверка OffersImporter (20 проверок: выбор даты/типа оферты из bondization/offers, put/call — чистая логика, БД не нужна)
 tests/test_ratings_normalizer.php    — офлайн-проверка RatingsNormalizer::isBondIssueRedemptionWithdrawal() (8 проверок, чистая текстовая логика, БД не нужна)
+tests/test_current_ratings_reconciler.php — офлайн-проверка CurrentRatingsReconciler (16 проверок, полностью покрыта — класс только читает/сравнивает, MySQL-диалекта нет)
 bin/debug_bond_redemption_ratings.php — диагностика (без записи в БД): находит уже записанные ДО фикса 17 сентября ложные "рейтинг отозван" от отзыва выпуска из-за погашения
 bin/fix_bond_redemption_ratings.php  — разовое исправление (ПИШЕТ в БД): удаляет эти ложные rating_actions/events и пересчитывает current_ratings из оставшейся истории; запускать после debug_bond_redemption_ratings.php
 ```

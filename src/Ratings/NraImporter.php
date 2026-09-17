@@ -95,6 +95,17 @@ use RuntimeException;
  * при том что C5 для НРА явно входит в MVP (см. docs/STAGE4_EVENT_ENGINE.md).
  * current_ratings (через CurrentRatingsSync) upsert() не трогает — это
  * по-прежнему обязанность НРА-специфичного кода здесь же.
+ *
+ * === fetchCreditRatingCandidates() — переиспользуется сверщиком (17 сентября 2026) ===
+ *
+ * Скачивание+фильтрация (по виду рейтинга/ИНН/дате, БЕЗ сортировки и БЕЗ
+ * решения issuer_id) вынесены в отдельный публичный метод — import() сам
+ * теперь досортировывает и обрабатывает построчно, как раньше.
+ * CurrentRatingsReconciler переиспользует именно этот метод: у НРА, в
+ * отличие от НКР, НЕТ отдельной страницы "снимок сейчас" (вся история
+ * одним файлом с 2020 года) — "истина сейчас" пересчитывается сверщиком
+ * как последняя по дате строка НА КАЖДОГО ЭМИТЕНТА среди возвращённых
+ * этим методом кандидатов, а не берётся из отдельного источника.
  */
 final class NraImporter
 {
@@ -141,6 +152,33 @@ final class NraImporter
 
     public function import(): void
     {
+        $candidates = $this->fetchCreditRatingCandidates();
+
+        // Хронологический порядок (от старых к новым) — обязательное
+        // условие корректности CurrentRatingsSync (см. докблок класса).
+        // В отличие от НКР, порядок строк в самом файле НЕ гарантирован,
+        // сортируем явно, а не полагаемся на порядок в источнике.
+        usort($candidates, static fn (array $a, array $b) => $a['_date'] <=> $b['_date']);
+
+        foreach ($candidates as $row) {
+            $this->importRow($row);
+        }
+
+        $this->printReport();
+    }
+
+    /**
+     * Скачивает выгрузку целиком и фильтрует до кандидатов — строк,
+     * которые реально относятся к кредитному рейтингу ЭМИТЕНТА (не ESG/
+     * услуг/отдельного выпуска облигаций), с валидными ИНН и датой.
+     * НЕ сортирует и НЕ решает issuer_id — это остаётся на вызывающем
+     * коде (import() — построчно, хронологически; CurrentRatingsReconciler
+     * — сводит к последней строке на эмитента, см. докблок класса).
+     *
+     * @return array<int, array<string, string>> строки выгрузки с добавленными ключами '_inn'/'_date'
+     */
+    public function fetchCreditRatingCandidates(): array
+    {
         $exportUrl = $this->discoverExportUrl();
         Logger::info("НРА: ссылка на выгрузку найдена: {$exportUrl}");
 
@@ -180,17 +218,7 @@ final class NraImporter
             $candidates[] = $row;
         }
 
-        // Хронологический порядок (от старых к новым) — обязательное
-        // условие корректности CurrentRatingsSync (см. докблок класса).
-        // В отличие от НКР, порядок строк в самом файле НЕ гарантирован,
-        // сортируем явно, а не полагаемся на порядок в источнике.
-        usort($candidates, static fn (array $a, array $b) => $a['_date'] <=> $b['_date']);
-
-        foreach ($candidates as $row) {
-            $this->importRow($row);
-        }
-
-        $this->printReport();
+        return $candidates;
     }
 
     /** @param array<string, string> $row строка выгрузки + '_inn'/'_date' */
