@@ -47,7 +47,7 @@ src/Ratings/AcraImporter.php         — current_ratings из JSON-файла А
 src/Ratings/ManualRatingsImporter.php — current_ratings из ручного xlsx (рейтинги, не найденные через автоматические источники)
 src/Ratings/RatingActionsWriter.php  — общий апсерт в rating_actions (ключ — UNIQUE(issuer_id, agency, action_date), полностью распознанные действия, см. docs/STAGE3_RATINGS.md)
 src/Ratings/CurrentRatingsReconciler.php — сверка current_ratings с "истиной" от агентства (НЕ импортёр — ничего не пишет, только сравнивает и печатает расхождения), см. docs/STAGE3_RATINGS.md
-bin/reconcile_ratings.php            — запуск сверки (--agency=nkr|nra|all), см. docs/STAGE3_RATINGS.md
+bin/reconcile_ratings.php            — запуск сверки (--agency=nkr|expert_ra|nra|all), см. docs/STAGE3_RATINGS.md
 src/Ratings/CurrentRatingsSync.php   — чтение/запись current_ratings для новостных импортёров (источник rating_from/outlook_from; апсерт кэша только если действие не старше уже сохранённого)
 src/Ratings/RatingNewsLog.php        — журнал просмотренных пресс-релизов (rating_news_log) — дедуп/ретрай по (agency, source_url), независимо от rating_actions
 src/Ratings/NkrTitleParser.php       — чистый (без БД/сети) разбор заголовков пресс-релизов НКР

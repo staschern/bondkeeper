@@ -25,6 +25,17 @@ use Throwable;
  * https://raexpert.ru/ratings/ (чекбоксы с data-path), см. STAGE3_RATINGS.md
  * про то, что осталось за бортом и почему.
  */
+/**
+ * === fetchSnapshot() — переиспользуется сверщиком (17 сентября 2026) ===
+ *
+ * Обход категорий + резолв ИНН вынесены в отдельный публичный метод
+ * fetchSnapshot() — возвращает нормализованный "снимок сейчас" БЕЗ
+ * записи в БД. import() сам теперь просто пишет то, что вернул этот
+ * метод. Как и НКР (в отличие от НРА), у Эксперт РА ЕСТЬ отдельная
+ * страница "снимок сейчас" (список действующих рейтингов по категориям,
+ * не история с датой начала) — CurrentRatingsReconciler переиспользует
+ * этот метод буквально, см. docs/STAGE3_RATINGS.md.
+ */
 final class ExpertRaImporter
 {
     private const AGENCY = 'expert_ra';
@@ -65,42 +76,83 @@ final class ExpertRaImporter
 
     public function import(): void
     {
+        $snapshot = $this->fetchSnapshot();
+
+        foreach ($snapshot as $row) {
+            $this->writeCurrentRating($row);
+        }
+
+        $this->printReport();
+    }
+
+    /**
+     * Обходит все категории сайта + резолвит ИНН по карточке каждой
+     * компании, возвращает нормализованный снимок "сейчас" — БЕЗ записи
+     * в БД. Побочный эффект: заполняет те же счётчики, что и раньше
+     * заполнял import() — printReport() работает одинаково что для
+     * import(), что при вызове только этого метода.
+     *
+     * @return array<int, array{issuer_id: int, issuer_name: string, rating: string, outlook: ?string, last_action_date: string}>
+     */
+    public function fetchSnapshot(): array
+    {
+        $snapshot = [];
         foreach (self::CATEGORIES as $slug => $label) {
             Logger::info("Эксперт РА: категория «{$label}» ({$slug})");
             $rows = $this->client->fetchCategoryRows($slug, $this->delayMicroseconds);
             Logger::info('  строк в категории: ' . count($rows));
 
             foreach ($rows as $row) {
-                $this->importRow($row);
+                $parsed = $this->parseRow($row);
+                if ($parsed !== null) {
+                    $snapshot[] = $parsed;
+                }
             }
         }
 
-        $this->printReport();
+        return $snapshot;
     }
 
-    /** @param array{name: string, card_url: string, rating: string, outlook: string, date: string} $row */
-    private function importRow(array $row): void
+    /**
+     * @param array{name: string, card_url: string, rating: string, outlook: string, date: string} $row
+     * @return array{issuer_id: int, issuer_name: string, rating: string, outlook: ?string, last_action_date: string}|null
+     */
+    private function parseRow(array $row): ?array
     {
         $this->totalRows++;
 
         $inn = $this->resolveInn($row['card_url']);
         if ($inn === null) {
-            return;
+            return null;
         }
 
         $issuerId = $this->matcher->findIssuerIdByInn($inn);
         if ($issuerId === null) {
             $this->unmatchedNoIssuer++;
             $this->unmatchedNames[] = "{$row['name']} (ИНН={$inn})";
-            return;
+            return null;
         }
 
         $date = RatingsNormalizer::parseDate($row['date']);
         if ($date === null) {
             $this->skippedNoDate++;
-            return;
+            return null;
         }
 
+        $this->matched++;
+
+        return [
+            'issuer_id' => $issuerId,
+            'issuer_name' => $row['name'],
+            'rating' => mb_substr(trim($row['rating']), 0, 20),
+            'outlook' => RatingsNormalizer::mapOutlook($row['outlook']),
+            'last_action_date' => $date,
+        ];
+    }
+
+    /** @param array{issuer_id: int, issuer_name: string, rating: string, outlook: ?string, last_action_date: string} $row */
+    private function writeCurrentRating(array $row): void
+    {
         $stmt = $this->db->prepare(
             'INSERT INTO current_ratings (issuer_id, agency, rating, outlook, last_action_date)
              VALUES (:issuer_id, :agency, :rating, :outlook, :last_action_date)
@@ -110,14 +162,12 @@ final class ExpertRaImporter
                 last_action_date = VALUES(last_action_date)'
         );
         $stmt->execute([
-            'issuer_id' => $issuerId,
+            'issuer_id' => $row['issuer_id'],
             'agency' => self::AGENCY,
-            'rating' => mb_substr(trim($row['rating']), 0, 20),
-            'outlook' => RatingsNormalizer::mapOutlook($row['outlook']),
-            'last_action_date' => $date,
+            'rating' => $row['rating'],
+            'outlook' => $row['outlook'],
+            'last_action_date' => $row['last_action_date'],
         ]);
-
-        $this->matched++;
     }
 
     private function resolveInn(string $cardUrl): ?string

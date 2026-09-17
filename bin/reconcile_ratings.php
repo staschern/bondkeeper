@@ -15,19 +15,26 @@ declare(strict_types=1);
  * скачанный и разобранный Excel, что и обычный `--agency=nkr`, просто
  * БЕЗ записи в БД).
  *
+ * Эксперт РА — тоже ЕСТЬ отдельный "снимок сейчас" (список действующих
+ * рейтингов по категориям на raexpert.ru, не история с датами начала) —
+ * переиспользует ExpertRaImporter::fetchSnapshot() буквально, по тому же
+ * принципу, что и НКР. Реальный полный обход категорий + резолв ИНН по
+ * карточке каждой компании — тот же сетевой объём, что и обычный
+ * `--agency=expert_ra` (уже стоит в кроне раз в месяц), не более
+ * "дёшево".
+ *
  * НРА — у агентства нет отдельной страницы "снимок сейчас" (вся история
  * одним файлом с 2020 года) — "истина сейчас" пересчитывается здесь как
  * последняя по дате строка НА КАЖДОГО ЭМИТЕНТА среди кандидатов
  * NraImporter::fetchCreditRatingCandidates().
  *
- * АКРА/Эксперт РА — сюда пока не добавлены: у АКРА current_ratings
- * наполняется вручную из JSON-файла пользователя (нет автоматического
- * "снимка сейчас" для сверки), у Эксперт РА полный автоматический
- * импортёр current_ratings ещё не реализован (см. README.md/
- * docs/STAGE3_RATINGS.md) — добавить сюда, когда появятся.
+ * АКРА — пока не добавлена: current_ratings наполняется вручную из
+ * JSON-файла пользователя, нет автоматического "снимка сейчас" для
+ * сверки — добавить сюда, если/когда автоматический обход АКРА появится.
  *
  * Запуск:
  *   php bin/reconcile_ratings.php --agency=nkr
+ *   php bin/reconcile_ratings.php --agency=expert_ra
  *   php bin/reconcile_ratings.php --agency=nra
  *   php bin/reconcile_ratings.php --agency=all
  *
@@ -46,6 +53,8 @@ require __DIR__ . '/bootstrap.php';
 use BondKeeper\Database;
 use BondKeeper\Events\EventPublisher;
 use BondKeeper\Ratings\CurrentRatingsReconciler;
+use BondKeeper\Ratings\ExpertRaClient;
+use BondKeeper\Ratings\ExpertRaImporter;
 use BondKeeper\Ratings\IssuerMatcher;
 use BondKeeper\Ratings\NkrImporter;
 use BondKeeper\Ratings\NraImporter;
@@ -60,8 +69,8 @@ foreach ($argv as $arg) {
     }
 }
 
-if (!in_array($agency, ['nkr', 'nra', 'all'], true)) {
-    fwrite(STDERR, "Использование: php bin/reconcile_ratings.php --agency=nkr|nra|all\n");
+if (!in_array($agency, ['nkr', 'expert_ra', 'nra', 'all'], true)) {
+    fwrite(STDERR, "Использование: php bin/reconcile_ratings.php --agency=nkr|expert_ra|nra|all\n");
     exit(1);
 }
 
@@ -104,6 +113,12 @@ if ($agency === 'nkr' || $agency === 'all') {
     Logger::info('=== Сверка current_ratings: НКР ===');
     $snapshot = (new NkrImporter($db, $matcher))->fetchSnapshot();
     printReconcileReport('nkr', $reconciler->reconcile('nkr', $snapshot));
+}
+
+if ($agency === 'expert_ra' || $agency === 'all') {
+    Logger::info('=== Сверка current_ratings: Эксперт РА ===');
+    $snapshot = (new ExpertRaImporter($db, $matcher, new ExpertRaClient()))->fetchSnapshot();
+    printReconcileReport('expert_ra', $reconciler->reconcile('expert_ra', $snapshot));
 }
 
 if ($agency === 'nra' || $agency === 'all') {
