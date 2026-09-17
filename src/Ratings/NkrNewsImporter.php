@@ -117,6 +117,7 @@ final class NkrNewsImporter
     private int $totalCandidates = 0;
     private int $skippedAlreadyLogged = 0;
     private int $skippedNotRatingAction = 0;
+    private int $skippedBondRedemption = 0;
     private int $skippedNonStandardRating = 0;
     private int $skippedNoRatingParsed = 0;
     /** Штук пресс-релизов, по которым записана хотя бы одна строка rating_actions. */
@@ -225,6 +226,17 @@ final class NkrNewsImporter
         if ($verb === null || !NkrTitleParser::isCreditRatingAction($row['title'])) {
             RatingNewsLog::log($this->db, self::AGENCY, $row['url'], $row['date'], 'skipped_not_rating');
             $this->skippedNotRatingAction++;
+            return;
+        }
+
+        // Отзыв рейтинга КОНКРЕТНОГО ВЫПУСКА облигаций из-за его
+        // погашения — технический шум, не отзыв рейтинга эмитента (см.
+        // докблок RatingsNormalizer::isBondIssueRedemptionWithdrawal() —
+        // NkrTitleParser уже предвидел этот случай в своём докблоке
+        // ("в связи с его погашением"), но раньше не обрабатывал).
+        if (str_starts_with($verb, 'отозвал') && RatingsNormalizer::isBondIssueRedemptionWithdrawal($row['title'])) {
+            RatingNewsLog::log($this->db, self::AGENCY, $row['url'], $row['date'], 'skipped_bond_redemption');
+            $this->skippedBondRedemption++;
             return;
         }
 
@@ -347,6 +359,7 @@ final class NkrNewsImporter
         Logger::info("Кандидатов в окне: {$this->totalCandidates}");
         Logger::info("Уже были окончательно обработаны раньше (status=matched в rating_news_log): {$this->skippedAlreadyLogged}");
         Logger::info("Пропущено (не похоже на кредитное рейтинговое действие): {$this->skippedNotRatingAction}");
+        Logger::info("Пропущено (отзыв рейтинга выпуска облигаций из-за погашения — шум, не эмитентское действие): {$this->skippedBondRedemption}");
         Logger::info("Пропущено (нестандартная шкала, напр. 'sf'): {$this->skippedNonStandardRating}");
         Logger::info("Пропущено (не удалось разобрать уровень рейтинга и нет данных в current_ratings): {$this->skippedNoRatingParsed}");
         Logger::info("Действий записано (matchedActions): {$this->matchedActions}");

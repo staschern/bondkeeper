@@ -37,7 +37,7 @@ src/Fns/FnsBlocksImporter.php        — fns_blocks, issuers.is_fns_blocked
 src/Iss/OffersImporter.php           — offers: дата — bondization/offers, has_buyback_date/offer_type put/call/unknown — доска-эндпоинт (переписано 14 сентября 2026, см. docs/STAGE1_POSTPROCESSING.md)
 src/Ratings/XlsxReader.php           — минимальный читатель .xlsx (ZIP+XML) без зависимостей
 src/Ratings/IssuerMatcher.php        — сопоставление эмитента агентства с issuers.id по ИНН (и по названию, когда ИНН взять неоткуда)
-src/Ratings/RatingsNormalizer.php    — общие преобразования (прогноз, дата) для рейтинговых выгрузок
+src/Ratings/RatingsNormalizer.php    — общие преобразования (прогноз, дата) для рейтинговых выгрузок; isBondIssueRedemptionWithdrawal() — фильтр шума "отозван рейтинг выпуска из-за погашения" (не эмитента), см. docs/STAGE3_RATINGS.md
 src/Ratings/RatingsHttp.php          — HTTP-загрузчик с ретраями для сайтов рейтинговых агентств
 src/Ratings/NkrImporter.php          — current_ratings из Excel-выгрузки НКР (ratings.ru)
 src/Ratings/NraImporter.php          — current_ratings из Excel-выгрузки НРА (ra-national.ru)
@@ -72,6 +72,7 @@ tests/test_event_engine.php          — офлайн-проверка EventPubl
 database/019_bot_ux_tariff_and_dialog_state.sql — миграция: тариф free (10 эмитентов/14 дней), таблицы bot_dialog_state/support_thread_map
 database/020_founder_tariff.sql — миграция: тариф founder (max_tracked_issuers=NULL — без ограничения)
 bin/grant_founder_subscription.php — разовая выдача тарифа founder двум учредителям по telegram_id (безлимит эмитентов + фактически бессрочно), идемпотентно
+database/021_rating_news_log_bond_redemption_status.sql — миграция: новый статус rating_news_log.status для отфильтрованного шума "отозван рейтинг выпуска из-за погашения"
 src/Telegram/TelegramClientInterface.php — интерфейс Bot API (sendMessage/answerCallbackQuery/editMessageText) для подмены фейком в офлайн-тестах
 src/Telegram/TelegramClient.php      — HTTP-клиент Telegram Bot API (long polling, sendMessage/editMessageText/answerCallbackQuery)
 src/Telegram/TelegramBotConfig.php   — токен бота + admin_telegram_id из config/telegram_bot.php (не коммитится, см. .example рядом)
@@ -86,6 +87,7 @@ tests/test_no_duplicate_named_params.php — статическая провер
 tests/test_issuer_name_shortener.php — офлайн-проверка IssuerNameShortener (24 проверки, чистая текстовая логика, БД не нужна)
 bin/backfill_issuer_short_names.php  — разовая пересборка issuers.short_name из full_name для строк, накопленных до появления IssuerNameShortener (идемпотентно, безопасно перезапускать)
 tests/test_offers_importer.php       — офлайн-проверка OffersImporter (20 проверок: выбор даты/типа оферты из bondization/offers, put/call — чистая логика, БД не нужна)
+tests/test_ratings_normalizer.php    — офлайн-проверка RatingsNormalizer::isBondIssueRedemptionWithdrawal() (8 проверок, чистая текстовая логика, БД не нужна)
 ```
 
 ## Запуск
@@ -114,6 +116,7 @@ mysql -u root -p bondkeeper < database/018_outlook_under_review.sql
 mysql -u root -p bondkeeper < database/019_bot_ux_tariff_and_dialog_state.sql
 mysql -u root -p bondkeeper < database/020_founder_tariff.sql
 php bin/grant_founder_subscription.php   # разовая выдача тарифа founder учредителям
+mysql -u root -p bondkeeper < database/021_rating_news_log_bond_redemption_status.sql
 
 php bin/seed_market.php        # issuers, securities, redemptions(scheduled_maturity)
 php bin/seed_bondization.php   # coupons, amortizations

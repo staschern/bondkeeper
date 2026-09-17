@@ -79,6 +79,7 @@ final class AcraNewsImporter
     private int $totalCandidates = 0;
     private int $skippedAlreadyLogged = 0;
     private int $skippedNotRatingAction = 0;
+    private int $skippedBondRedemption = 0;
     private int $skippedNoRatingParsed = 0;
     private int $matched = 0;
     private int $matchedByInn = 0;
@@ -148,6 +149,17 @@ final class AcraNewsImporter
         if ($verb === null || !AcraNewsTitleParser::isCreditRatingAction($row['title'])) {
             RatingNewsLog::log($this->db, self::AGENCY, $row['url'], $row['date'], 'skipped_not_rating');
             $this->skippedNotRatingAction++;
+            return;
+        }
+
+        // Отзыв рейтинга КОНКРЕТНОГО ВЫПУСКА облигаций из-за его
+        // погашения — технический шум, не отзыв рейтинга эмитента (см.
+        // докблок RatingsNormalizer::isBondIssueRedemptionWithdrawal(),
+        // живой найденный баг с ФосАгро, 17 сентября 2026). Полностью
+        // исключается из БД, а не просто помечается ошибкой разбора.
+        if (str_starts_with($verb, 'отозвал') && RatingsNormalizer::isBondIssueRedemptionWithdrawal($row['title'])) {
+            RatingNewsLog::log($this->db, self::AGENCY, $row['url'], $row['date'], 'skipped_bond_redemption');
+            $this->skippedBondRedemption++;
             return;
         }
 
@@ -308,6 +320,7 @@ final class AcraNewsImporter
         Logger::info("Кандидатов в окне: {$this->totalCandidates}");
         Logger::info("Уже были окончательно обработаны раньше (status=matched в rating_news_log): {$this->skippedAlreadyLogged}");
         Logger::info("Пропущено (не похоже на кредитное рейтинговое действие): {$this->skippedNotRatingAction}");
+        Logger::info("Пропущено (отзыв рейтинга выпуска облигаций из-за погашения — шум, не эмитентское действие): {$this->skippedBondRedemption}");
         Logger::info("Пропущено (не удалось разобрать уровень рейтинга): {$this->skippedNoRatingParsed}");
         Logger::info("Сопоставлено с issuers и записано: {$this->matched} (по ИНН: {$this->matchedByInn}, по ISIN: {$this->matchedByIsin}, по имени запасным путём: {$this->matchedByName})");
         Logger::info("Не сопоставлено ни с одним issuer_id (попробуем снова на следующем прогоне): {$this->skippedNoIssuerResolved}");

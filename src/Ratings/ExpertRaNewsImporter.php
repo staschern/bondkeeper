@@ -90,6 +90,7 @@ final class ExpertRaNewsImporter
     private int $totalItems = 0;
     private int $skippedAlreadyLogged = 0;
     private int $skippedNotRatingAction = 0;
+    private int $skippedBondRedemption = 0;
     private int $skippedNonStandardRating = 0;
     private int $skippedNoRatingParsed = 0;
     private int $skippedNoEntityFound = 0;
@@ -160,6 +161,15 @@ final class ExpertRaNewsImporter
         if ($verb === null || !preg_match('/кредитн\w+\s+рейтинг/ui', $combined)) {
             RatingNewsLog::log($this->db, self::AGENCY, $item['url'], $item['_date'], 'skipped_not_rating');
             $this->skippedNotRatingAction++;
+            return;
+        }
+
+        // Отзыв рейтинга КОНКРЕТНОГО ВЫПУСКА облигаций из-за его
+        // погашения — технический шум, не отзыв рейтинга эмитента (см.
+        // докблок RatingsNormalizer::isBondIssueRedemptionWithdrawal()).
+        if (str_starts_with($verb, 'отозвал') && RatingsNormalizer::isBondIssueRedemptionWithdrawal($combined)) {
+            RatingNewsLog::log($this->db, self::AGENCY, $item['url'], $item['_date'], 'skipped_bond_redemption');
+            $this->skippedBondRedemption++;
             return;
         }
 
@@ -336,6 +346,7 @@ final class ExpertRaNewsImporter
         Logger::info("Кандидатов в окне: {$this->totalItems}");
         Logger::info("Уже были окончательно обработаны раньше (status=matched в rating_news_log): {$this->skippedAlreadyLogged}");
         Logger::info("Пропущено (не похоже на кредитное рейтинговое действие): {$this->skippedNotRatingAction}");
+        Logger::info("Пропущено (отзыв рейтинга выпуска облигаций из-за погашения — шум, не эмитентское действие): {$this->skippedBondRedemption}");
         Logger::info("Пропущено (нестандартная шкала, напр. '.sf'): {$this->skippedNonStandardRating}");
         Logger::info("Сопоставлено с issuers и записано: {$this->matched} (по ИНН: {$this->matchedByInn}, по имени запасным путём: {$this->matchedByName})");
         Logger::info("Не сопоставлено (ни одно название в кавычках не нашлось в issuers, попробуем снова на следующем прогоне): {$this->skippedNoEntityFound}");
