@@ -89,6 +89,7 @@ bin/backfill_issuer_short_names.php  — разовая пересборка iss
 tests/test_offers_importer.php       — офлайн-проверка OffersImporter (20 проверок: выбор даты/типа оферты из bondization/offers, put/call — чистая логика, БД не нужна)
 tests/test_ratings_normalizer.php    — офлайн-проверка RatingsNormalizer::isBondIssueRedemptionWithdrawal() (8 проверок, чистая текстовая логика, БД не нужна)
 bin/debug_bond_redemption_ratings.php — диагностика (без записи в БД): находит уже записанные ДО фикса 17 сентября ложные "рейтинг отозван" от отзыва выпуска из-за погашения
+bin/fix_bond_redemption_ratings.php  — разовое исправление (ПИШЕТ в БД): удаляет эти ложные rating_actions/events и пересчитывает current_ratings из оставшейся истории; запускать после debug_bond_redemption_ratings.php
 ```
 
 ## Запуск
