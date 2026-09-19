@@ -438,4 +438,42 @@ final class RatingsNormalizer
 
         return $isIssueLevel && $isRedemption;
     }
+
+    /**
+     * "D"/"SD" (дефолт/выборочный дефолт) — по прямому запросу
+     * пользователя (найдено вживую: НКР понизило ООО «ЛКХ» до "D", в
+     * заголовке про прогноз ничего не было, и в current_ratings прогноз
+     * молча остался старым от прошлого действия): для дефолтного грейда
+     * прогноз не предусмотрен вообще — CurrentRatingsSync::sync()
+     * вызывает этот метод и, если true, пишет outlook = NULL независимо
+     * от того, что было в кэше или в самом действии.
+     *
+     * Буквенный код "D"/"SD" — общий для всех агентств проекта (см.
+     * NkrTitleParser::extractRatingChange() и
+     * AcraNewsTitleParser::GRADE_WORDS, где оба подтверждены вживую),
+     * но каждое агентство украшает его по-своему: НКР — голым словом без
+     * декораций, АКРА — опциональным ведущим "e"/"е" (грейд "ожидаемый")
+     * и/или хвостовым "(RU)", Эксперт РА — ведущим "ru" (весь их алфавит
+     * с этим префиксом, не только D), НРА — хвостовым "|ru|" (см. реальный
+     * пример "AA|ru|" в STAGE3_RATINGS.md). Для Эксперт РА/НРА само "D"
+     * вживую не встречалось (только по аналогии с общей схемой
+     * декораций их шкалы) — снимаем декорации и сравниваем именно
+     * буквенный код, а не гадаем про регистр/скобки по каждому агентству
+     * отдельно.
+     */
+    public static function isDefaultGrade(?string $rating): bool
+    {
+        if ($rating === null) {
+            return false;
+        }
+
+        $normalized = mb_strtoupper(trim($rating));
+        $normalized = preg_replace('/^E/u', '', $normalized) ?? $normalized;
+        $normalized = preg_replace('/^RU/u', '', $normalized) ?? $normalized;
+        $normalized = preg_replace('/\s*\(RU\)$/u', '', $normalized) ?? $normalized;
+        $normalized = preg_replace('/\.RU$/u', '', $normalized) ?? $normalized;
+        $normalized = preg_replace('/\|RU\|$/u', '', $normalized) ?? $normalized;
+
+        return in_array(trim($normalized), ['D', 'SD'], true);
+    }
 }

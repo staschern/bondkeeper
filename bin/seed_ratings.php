@@ -157,6 +157,20 @@ declare(strict_types=1);
  * событий НЕ создают и не должны: иначе один и тот же реальный релиз
  * задвоился бы событием от новостного импортёра и ещё раз от следующего
  * планового полного прогона. Подробности — docs/STAGE4_EVENT_ENGINE.md.
+ *
+ * === Сопоставление "по корню" названия — SPV/материнская компания (миграция 022) ===
+ *
+ * Все 7 импортёров current_ratings/rating_actions (--agency=nkr/expert_ra/
+ * acra/nra/nkr-news/expert_ra-news/acra-news) теперь, если не помогли ИНН
+ * (и точное имя, где оно есть), пробуют последним IssuerMatcher::
+ * findIssuerIdByRootName() — по прямому запросу пользователя, кейс "в
+ * issuers заведена только SPV, а источник называет материнскую компанию"
+ * (и наоборот). Такая строка пишется как обычно, но с флагом
+ * matched_by_root_name — после прогона notifyAdminOfRootMatches() (см.
+ * выше) отправляет администратору короткое уведомление в Telegram для
+ * выборочной ручной проверки (config/telegram_bot.php должен быть
+ * настроен — при его отсутствии/ошибке отправки прогон импорта не падает,
+ * только пишет предупреждение в лог).
  */
 
 require __DIR__ . '/bootstrap.php';
@@ -175,6 +189,43 @@ use BondKeeper\Ratings\NkrNewsImporter;
 use BondKeeper\Ratings\NraImporter;
 use BondKeeper\Ratings\RatingActionsWriter;
 use BondKeeper\Support\Logger;
+use BondKeeper\Telegram\TelegramBotConfig;
+use BondKeeper\Telegram\TelegramClient;
+
+/**
+ * Уведомление администратору о совпадениях "по корню" названия (SPV/
+ * материнская компания, миграция 022, см. докблок IssuerMatcher::
+ * findIssuerIdByRootName()) — самый неточный из уровней сопоставления в
+ * проекте. По решению пользователя (сентябрь 2026) такая строка
+ * пишется в БД как обычно (не теряем данные), но с отдельной пометкой
+ * matched_by_root_name — и коротким уведомлением в Telegram
+ * администратору для выборочной ручной проверки. Ошибка отправки
+ * (сломанный/отсутствующий config/telegram_bot.php, сетевой сбой) не
+ * должна ронять сам прогон импорта — это вспомогательное уведомление,
+ * а не критичная часть пайплайна.
+ *
+ * @param array<int, string> $notices
+ */
+function notifyAdminOfRootMatches(array $notices, string $agency): void
+{
+    if ($notices === []) {
+        return;
+    }
+
+    try {
+        $config = TelegramBotConfig::fromFile(__DIR__ . '/../config/telegram_bot.php');
+        if ($config->adminTelegramId === 0) {
+            Logger::warn('Есть совпадения "по корню" названия, но admin_telegram_id не настроен — уведомление не отправлено, см. лог выше.');
+            return;
+        }
+
+        $text = "⚠️ Сопоставление \"по корню\" названия ({$agency}), проверьте вручную:\n\n"
+            . implode("\n\n", $notices);
+        (new TelegramClient($config->botToken))->sendMessage($config->adminTelegramId, mb_substr($text, 0, 4000));
+    } catch (\Throwable $e) {
+        Logger::warn("Не удалось отправить администратору уведомление о root-совпадениях: {$e->getMessage()}");
+    }
+}
 
 $agency = null;
 $delayMs = 400;
@@ -228,22 +279,32 @@ $matcher = new IssuerMatcher($db);
 
 Logger::info("Старт: сидирование рейтингов ({$agency})");
 
+// Ссылка на импортёр этого прогона сохраняется отдельно от switch — нужна
+// ПОСЛЕ import()/importFromFile(), чтобы забрать getRootMatchNotices()
+// (миграция 022) и уведомить администратора. ManualRatingsImporter в
+// список не входит — ручная загрузка уже прошла проверку человеком.
+$importer = null;
+
 switch ($agency) {
     case 'nkr':
-        (new NkrImporter($db, $matcher))->import();
+        $importer = new NkrImporter($db, $matcher);
+        $importer->import();
         break;
     case 'nra':
-        (new NraImporter($db, $matcher, new RatingActionsWriter($db, new EventPublisher($db))))->import();
+        $importer = new NraImporter($db, $matcher, new RatingActionsWriter($db, new EventPublisher($db)));
+        $importer->import();
         break;
     case 'expert_ra':
-        (new ExpertRaImporter($db, $matcher, new ExpertRaClient(), $delayMs * 1000))->import();
+        $importer = new ExpertRaImporter($db, $matcher, new ExpertRaClient(), $delayMs * 1000);
+        $importer->import();
         break;
     case 'acra':
         if ($file === null) {
             fwrite(STDERR, "Для --agency=acra обязателен --file=/path/to/acra_issuers.json (см. docs/STAGE3_RATINGS.md — этот импортёр никогда не обращается к acra-ratings.ru сам)\n");
             exit(1);
         }
-        (new AcraImporter($db, $matcher))->importFromFile($file);
+        $importer = new AcraImporter($db, $matcher);
+        $importer->importFromFile($file);
         break;
     case 'manual':
         if ($file === null) {
@@ -253,17 +314,24 @@ switch ($agency) {
         (new ManualRatingsImporter($db, $matcher))->importFromFile($file);
         break;
     case 'nkr-news':
-        (new NkrNewsImporter($db, $matcher, new RatingActionsWriter($db, new EventPublisher($db))))->import($full, $days ?? 2);
+        $importer = new NkrNewsImporter($db, $matcher, new RatingActionsWriter($db, new EventPublisher($db)));
+        $importer->import($full, $days ?? 2);
         break;
     case 'expert_ra-news':
-        (new ExpertRaNewsImporter($db, $matcher, new RatingActionsWriter($db, new EventPublisher($db)), new ExpertRaClient(), $delayMs * 1000))->import($full, $days ?? 2);
+        $importer = new ExpertRaNewsImporter($db, $matcher, new RatingActionsWriter($db, new EventPublisher($db)), new ExpertRaClient(), $delayMs * 1000);
+        $importer->import($full, $days ?? 2);
         break;
     case 'acra-news':
-        (new AcraNewsImporter($db, $matcher, new RatingActionsWriter($db, new EventPublisher($db))))->import($full, $days ?? 2);
+        $importer = new AcraNewsImporter($db, $matcher, new RatingActionsWriter($db, new EventPublisher($db)));
+        $importer->import($full, $days ?? 2);
         break;
     default:
         fwrite(STDERR, "Неизвестное агентство: {$agency}. Поддерживаются: nkr, nra, expert_ra, acra, manual, nkr-news, expert_ra-news, acra-news.\n");
         exit(1);
+}
+
+if ($importer !== null) {
+    notifyAdminOfRootMatches($importer->getRootMatchNotices(), $agency);
 }
 
 Logger::info('Готово.');

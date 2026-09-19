@@ -38,12 +38,15 @@ $db = new PDO('sqlite::memory:');
 $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
 
 $db->exec('CREATE TABLE issuers (id INTEGER PRIMARY KEY, short_name TEXT)');
-$db->exec('CREATE TABLE current_ratings (issuer_id INTEGER, agency TEXT, rating TEXT, outlook TEXT, last_action_date TEXT)');
+$db->exec('CREATE TABLE current_ratings (issuer_id INTEGER, agency TEXT, rating TEXT, outlook TEXT, last_action_date TEXT, matched_by_root_name INTEGER DEFAULT 0)');
+$db->exec('CREATE TABLE issuer_spv_links (spv_inn TEXT PRIMARY KEY, issuer_id INTEGER, spv_name TEXT, note TEXT)');
 
 $db->exec("INSERT INTO issuers (id, short_name) VALUES (1, 'Роснефть')");
 $db->exec("INSERT INTO issuers (id, short_name) VALUES (2, 'Газпром')");
 $db->exec("INSERT INTO issuers (id, short_name) VALUES (3, 'Лукойл')");
 $db->exec("INSERT INTO issuers (id, short_name) VALUES (4, 'Магнит')");
+$db->exec("INSERT INTO issuers (id, short_name) VALUES (7, 'Аэрофьюэлз')");
+$db->exec("INSERT INTO issuers (id, short_name) VALUES (8, 'ФСК Активы')");
 
 // Эмитент 1: полное совпадение — не должно попасть ни в один список расхождений.
 $db->exec("INSERT INTO current_ratings (issuer_id, agency, rating, outlook, last_action_date) VALUES (1, 'nkr', 'AAA.ru', 'stable', '2026-07-01')");
@@ -56,6 +59,17 @@ $db->exec("INSERT INTO current_ratings (issuer_id, agency, rating, outlook, last
 
 // Эмитент 4: другое агентство — не должен попасть в сверку по 'nkr' вообще.
 $db->exec("INSERT INTO current_ratings (issuer_id, agency, rating, outlook, last_action_date) VALUES (4, 'acra', 'BBB(RU)', 'positive', '2026-08-01')");
+
+// Эмитент 7 (кейс 5b, реальный случай Аэрофьюэлз): есть только у нас, но
+// строка получена ТРЕТЬИМ уровнем сопоставления (matched_by_root_name=1)
+// — расхождение "ожидаемое", не сигнал сбоя снимка.
+$db->exec("INSERT INTO current_ratings (issuer_id, agency, rating, outlook, last_action_date, matched_by_root_name) VALUES (7, 'nkr', 'A.ru', null, '2026-04-01', 1)");
+
+// Эмитент 8 (кейс 5b, реальный случай ФСК Активы/ЕВА): есть только у нас,
+// БЕЗ matched_by_root_name, но issuer_id — цель явной ручной связки
+// issuer_spv_links — тоже "ожидаемое" расхождение.
+$db->exec("INSERT INTO current_ratings (issuer_id, agency, rating, outlook, last_action_date) VALUES (8, 'nkr', 'BBB.ru', null, '2026-03-01')");
+$db->exec("INSERT INTO issuer_spv_links (spv_inn, issuer_id, spv_name) VALUES ('7708335695', 8, 'ООО «ЕВА»')");
 
 $snapshot = [
     ['issuer_id' => 1, 'issuer_name' => 'Роснефть', 'rating' => 'AAA.ru', 'outlook' => 'stable', 'last_action_date' => '2026-07-01'],
@@ -88,9 +102,18 @@ check('missing_in_ours: ровно 1 (эмитент 5, есть у агентс
 check('missing_in_ours: issuer_id=5, имя корректно', $result['missing_in_ours'][0]['issuer_id'] === 5 && $result['missing_in_ours'][0]['issuer_name'] === 'Новый эмитент');
 
 // --- missing_in_snapshot ---
-check('missing_in_snapshot: ровно 1 (эмитент 3 — есть у нас для nkr, в снимке нет)', count($result['missing_in_snapshot']) === 1);
-check('missing_in_snapshot: issuer_id=3, наше значение сохранено (A.ru)', $result['missing_in_snapshot'][0]['issuer_id'] === 3 && $result['missing_in_snapshot'][0]['ours'] === 'A.ru');
+check('missing_in_snapshot: ровно 3 (эмитенты 3, 7, 8 — есть у нас для nkr, в снимке нет)', count($result['missing_in_snapshot']) === 3);
+$byIssuerId = [];
+foreach ($result['missing_in_snapshot'] as $d) {
+    $byIssuerId[$d['issuer_id']] = $d;
+}
+check('missing_in_snapshot: issuer_id=3, наше значение сохранено (A.ru)', $byIssuerId[3]['ours'] === 'A.ru');
 check('missing_in_snapshot: эмитент 4 (другое агентство, acra) НЕ попал — фильтр по agency работает', !in_array(4, array_column($result['missing_in_snapshot'], 'issuer_id'), true));
+
+// --- Кейс 5b: expected — matched_by_root_name / issuer_spv_links ---
+check('missing_in_snapshot: эмитент 3 (обычная строка, ни root, ни spv_link) — expected=false', $byIssuerId[3]['expected'] === false);
+check('missing_in_snapshot: эмитент 7 (matched_by_root_name=1, реальный случай Аэрофьюэлз) — expected=true', $byIssuerId[7]['expected'] === true);
+check('missing_in_snapshot: эмитент 8 (issuer_spv_links, реальный случай ФСК Активы/ЕВА) — expected=true', $byIssuerId[8]['expected'] === true);
 
 // --- Полное совпадение снимка с нашими данными -> все три списка пусты ---
 $exactSnapshot = [
@@ -100,11 +123,22 @@ $exactResult = $reconciler->reconcile('nkr', $exactSnapshot);
 check('Полное совпадение: field_mismatches пуст', $exactResult['field_mismatches'] === []);
 check('Полное совпадение: missing_in_ours пуст', $exactResult['missing_in_ours'] === []);
 check(
-    'Полное совпадение: missing_in_snapshot содержит остальных наших nkr-эмитентов (2 и 3), не 1',
+    'Полное совпадение: missing_in_snapshot содержит остальных наших nkr-эмитентов (2, 3, 7, 8), не 1',
     !in_array(1, array_column($exactResult['missing_in_snapshot'], 'issuer_id'), true)
     && in_array(2, array_column($exactResult['missing_in_snapshot'], 'issuer_id'), true)
     && in_array(3, array_column($exactResult['missing_in_snapshot'], 'issuer_id'), true)
+    && in_array(7, array_column($exactResult['missing_in_snapshot'], 'issuer_id'), true)
+    && in_array(8, array_column($exactResult['missing_in_snapshot'], 'issuer_id'), true)
 );
+
+// --- Кейс 3: applyMissingInOurs() — эмитент 5 из missing_in_ours записывается в БД ---
+check('missing_in_ours: перед применением содержит полные данные снимка (rating/outlook/last_action_date)', $result['missing_in_ours'][0]['rating'] === 'A.ru' && $result['missing_in_ours'][0]['outlook'] === null && $result['missing_in_ours'][0]['last_action_date'] === '2026-09-01');
+$db->exec("INSERT INTO issuers (id, short_name) VALUES (5, 'Новый эмитент')");
+$applied = $reconciler->applyMissingInOurs('nkr', $result['missing_in_ours']);
+check('applyMissingInOurs: вернул 1 (записана ровно 1 строка)', $applied === 1);
+$afterApply = $reconciler->reconcile('nkr', $snapshot);
+check('applyMissingInOurs: после применения эмитент 5 больше не в missing_in_ours', $afterApply['missing_in_ours'] === []);
+check('applyMissingInOurs: после применения эмитент 5 не расходится по полям (записан ровно из снимка)', array_values(array_filter($afterApply['field_mismatches'], static fn (array $d): bool => $d['issuer_id'] === 5)) === []);
 
 // --- outlook null у обеих сторон — не расхождение ---
 $db->exec("INSERT INTO current_ratings (issuer_id, agency, rating, outlook, last_action_date) VALUES (6, 'nkr', 'BB.ru', null, '2026-08-20')");

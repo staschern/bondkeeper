@@ -108,6 +108,20 @@ use PDO;
  * один (любой) → 1 строка; ни одного (или ни для одного не нашёлся
  * rating_to) → в rating_news_log со статусом skipped_unmatched/
  * skipped_no_grade (см. resolveIssuerIds()).
+ *
+ * === Третий уровень — "по корню" названия, для SPV (миграция 022) ===
+ *
+ * Составные действия выше решают только случай "агентство САМО назвало
+ * обе стороны в одном заголовке". По прямому запросу пользователя
+ * (сентябрь 2026) добавлен более общий случай: в issuers заведена только
+ * ОДНА сторона (например, только SPV «Х Финанс»), а заголовок называет
+ * ТОЛЬКО ДРУГУЮ («Х») — ни ИНН, ни точное имя не находят такую строку.
+ * Если ни один candidate не сопоставился выше вообще — пробуем явную
+ * ручную связку issuer_spv_links (миграция 023), а если и она не
+ * подошла — IssuerMatcher::findIssuerIdByRootName() для каждого названия
+ * в кавычках. Строка пишется как обычно, но с флагом matched_by_root_name
+ * — самый неточный из уровней, отдельно собирается в уведомление
+ * администратору (getRootMatchNotices(), см. bin/seed_ratings.php).
  */
 final class NkrNewsImporter
 {
@@ -127,6 +141,12 @@ final class NkrNewsImporter
     /** Штук составных действий (2+ разных issuer_id сопоставилось на одно действие). */
     private int $compositeActions = 0;
     private int $skippedNoIssuerResolved = 0;
+    /** Штук действий, сопоставленных ТОЛЬКО третьим, самым неточным уровнем (см. resolveIssuerIds()). */
+    private int $matchedByRoot = 0;
+    /** @var array<int, true> issuer_id => сопоставлен по корню в ТЕКУЩЕМ вызове resolveIssuerIds() */
+    private array $lastRootMatchedIds = [];
+    /** @var array<int, string> заголовки для уведомления администратору о root-совпадениях (см. bin/seed_ratings.php) */
+    private array $rootMatchNotices = [];
     /** @var array<int, string> */
     private array $unmatchedTitles = [];
     /** @var array<int, string> */
@@ -273,6 +293,7 @@ final class NkrNewsImporter
             return;
         }
 
+        $rootMatchedIds = $this->lastRootMatchedIds;
         $writtenCount = 0;
         foreach ($issuerIds as $issuerId) {
             $cached = CurrentRatingsSync::fetch($this->db, $issuerId, self::AGENCY);
@@ -287,6 +308,7 @@ final class NkrNewsImporter
                 continue;
             }
 
+            $matchedByRoot = isset($rootMatchedIds[$issuerId]);
             $this->writer->upsert(
                 $issuerId,
                 self::AGENCY,
@@ -297,8 +319,13 @@ final class NkrNewsImporter
                 $outlookTo,
                 $row['url'],
                 $row['title'],
+                $matchedByRoot,
             );
-            CurrentRatingsSync::sync($this->db, $issuerId, self::AGENCY, $row['date'], $ratingTo, $outlookTo, $cached);
+            CurrentRatingsSync::sync($this->db, $issuerId, self::AGENCY, $row['date'], $ratingTo, $outlookTo, $cached, $matchedByRoot);
+            if ($matchedByRoot) {
+                $this->matchedByRoot++;
+                $this->rootMatchNotices[] = "НКР: «{$row['title']}» → issuer_id={$issuerId} (сопоставлено по корню названия, проверьте) — {$row['url']}";
+            }
             $writtenCount++;
         }
 
@@ -330,20 +357,62 @@ final class NkrNewsImporter
     private function resolveIssuerIds(?string $inn, string $title): array
     {
         $issuerIds = [];
+        $this->lastRootMatchedIds = [];
 
         $primaryId = $inn !== null ? $this->matcher->findIssuerIdByInn($inn) : null;
+        if ($primaryId === null && $inn !== null) {
+            // Явная ручная связка "неизвестный ИНН → issuer_id" (миграция
+            // 023, см. IssuerMatcher::findIssuerIdBySpvLink() за подробным
+            // объяснением и важной оговоркой про направление) — для
+            // случаев вроде «ЕВА»/«ФСК Активы», где имена НЕ ИМЕЮТ НИЧЕГО
+            // ОБЩЕГО (не вариация одного названия, а разные бренды) и
+            // "по корню" их связать нельзя в принципе. Реальный сценарий,
+            // из-за которого это понадобилось: НКР публикует новость о
+            // присвоении рейтинга облигациям, где "Информация о
+            // рейтингуемом лице" на детальной странице называет ОДНУ
+            // сторону пары (например, ООО «ЕВА» — структурно поручитель,
+            // но именно её ИНН в issuers нет), а другая сторона (ООО «ФСК
+            // Активы» — та, что физически в issuers, её облигации на
+            // бирже) упоминается в заголовке только в связи с выпуском —
+            // ни составное действие, ни корень здесь не сработали бы.
+            $primaryId = $this->matcher->findIssuerIdBySpvLink($inn);
+        }
         if ($primaryId !== null) {
             $issuerIds[] = $primaryId;
         }
 
-        foreach (RatingsNormalizer::extractQuotedNames($title) as $candidate) {
+        $candidates = RatingsNormalizer::extractQuotedNames($title);
+
+        foreach ($candidates as $candidate) {
             $id = $this->matcher->findIssuerIdByName($candidate);
             if ($id !== null) {
                 $issuerIds[] = $id;
             }
         }
 
+        // Третий, самый неточный уровень — по "корню" названия (без ОПФ
+        // и маркерных слов SPV "Финанс"/"Капитал", см. IssuerMatcher::
+        // rootCompanyName()) — только когда ИНН и точное имя выше не дали
+        // НИЧЕГО (по прямому указанию пользователя, сентябрь 2026): кейс
+        // "в issuers заведена только SPV/только материнская компания, а
+        // заголовок называет другую сторону".
+        if ($issuerIds === []) {
+            foreach ($candidates as $candidate) {
+                $id = $this->matcher->findIssuerIdByRootName($candidate);
+                if ($id !== null) {
+                    $issuerIds[] = $id;
+                    $this->lastRootMatchedIds[$id] = true;
+                }
+            }
+        }
+
         return array_values(array_unique($issuerIds));
+    }
+
+    /** @return array<int, string> тексты для админ-уведомления о совпадениях "по корню" в этом прогоне */
+    public function getRootMatchNotices(): array
+    {
+        return $this->rootMatchNotices;
     }
 
     private function fetchInnFromDetailPage(string $url): ?string
@@ -365,6 +434,7 @@ final class NkrNewsImporter
         Logger::info("Действий записано (matchedActions): {$this->matchedActions}");
         Logger::info("Строк rating_actions записано (matchedRows): {$this->matchedRows}");
         Logger::info("Из них составных действий (2+ юрлица сопоставились): {$this->compositeActions}");
+        Logger::info("Из них сопоставлено третьим уровнем, 'по корню' названия (SPV/материнская компания, требует выборочной проверки): {$this->matchedByRoot}");
         Logger::info("Не сопоставлено ни с одним issuer_id (попробуем снова на следующем прогоне): {$this->skippedNoIssuerResolved}");
         if ($this->unmatchedTitles !== []) {
             Logger::info('Не сопоставленные: ' . implode('; ', array_slice($this->unmatchedTitles, 0, 20)));

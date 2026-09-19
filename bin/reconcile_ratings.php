@@ -37,6 +37,15 @@ declare(strict_types=1);
  *   php bin/reconcile_ratings.php --agency=expert_ra
  *   php bin/reconcile_ratings.php --agency=nra
  *   php bin/reconcile_ratings.php --agency=all
+ *   php bin/reconcile_ratings.php --agency=nkr --apply-missing
+ *
+ * --apply-missing (кейс 3, сентябрь 2026, прямой запрос пользователя:
+ * "если появился новый эмитент у агентства, которого ранее не было в БД,
+ * то добавить") — после сверки записывает missing_in_ours НАПРЯМУЮ из
+ * снимка через CurrentRatingsReconciler::applyMissingInOurs(). Не трогает
+ * ни field_mismatches, ни missing_in_snapshot — оба вида по решению
+ * пользователя остаются только в отчёте, не чинятся автоматически (см.
+ * докблок CurrentRatingsReconciler).
  *
  * По расписанию — тем же ритмом, что и обычный полный (перезаписывающий)
  * прогон nkr/nra: НКР — 1 число месяца, вместе с seed_ratings.php
@@ -63,14 +72,18 @@ use BondKeeper\Ratings\RatingsNormalizer;
 use BondKeeper\Support\Logger;
 
 $agency = 'all';
+$applyMissing = false;
 foreach ($argv as $arg) {
     if (str_starts_with($arg, '--agency=')) {
         $agency = substr($arg, 9);
     }
+    if ($arg === '--apply-missing') {
+        $applyMissing = true;
+    }
 }
 
 if (!in_array($agency, ['nkr', 'expert_ra', 'nra', 'all'], true)) {
-    fwrite(STDERR, "Использование: php bin/reconcile_ratings.php --agency=nkr|expert_ra|nra|all\n");
+    fwrite(STDERR, "Использование: php bin/reconcile_ratings.php --agency=nkr|expert_ra|nra|all [--apply-missing]\n");
     exit(1);
 }
 
@@ -82,8 +95,8 @@ $reconciler = new CurrentRatingsReconciler($db);
  * @param array{
  *     snapshot_count: int,
  *     field_mismatches: array<int, array{issuer_id: int, issuer_name: string, field: string, ours: ?string, theirs: ?string}>,
- *     missing_in_ours: array<int, array{issuer_id: int, issuer_name: string}>,
- *     missing_in_snapshot: array<int, array{issuer_id: int, issuer_name: string, ours: ?string}>
+ *     missing_in_ours: array<int, array{issuer_id: int, issuer_name: string, rating: string, outlook: ?string, last_action_date: string}>,
+ *     missing_in_snapshot: array<int, array{issuer_id: int, issuer_name: string, ours: ?string, expected: bool}>
  * } $result
  */
 function printReconcileReport(string $agency, array $result): void
@@ -100,25 +113,44 @@ function printReconcileReport(string $agency, array $result): void
 
     Logger::info("[{$agency}] Эмитентов у агентства, которых у нас нет вообще: " . count($result['missing_in_ours']));
     foreach ($result['missing_in_ours'] as $d) {
-        Logger::info("[{$agency}]   {$d['issuer_name']} (issuer_id={$d['issuer_id']}) — current_ratings для этой пары не существует");
+        Logger::info("[{$agency}]   {$d['issuer_name']} (issuer_id={$d['issuer_id']}) — current_ratings для этой пары не существует (rating={$d['rating']})");
     }
 
-    Logger::info("[{$agency}] Эмитентов у нас, которых свежий снимок не упоминает: " . count($result['missing_in_snapshot']));
-    foreach ($result['missing_in_snapshot'] as $d) {
+    // Кейс 5b: 'expected' (matched_by_root_name/issuer_spv_links) —
+    // ожидаемое расхождение (мы взяли рейтинг SPV из старой новости,
+    // снимок агентства его под этим именем не показывает), не сигнал
+    // сбоя снимка — см. докблок CurrentRatingsReconciler.
+    $expected = array_filter($result['missing_in_snapshot'], static fn (array $d): bool => $d['expected']);
+    $unexplained = array_filter($result['missing_in_snapshot'], static fn (array $d): bool => !$d['expected']);
+    Logger::info("[{$agency}] Эмитентов у нас, которых свежий снимок не упоминает: " . count($result['missing_in_snapshot']) . ' (из них ожидаемых SPV/root-совпадений: ' . count($expected) . ')');
+    foreach ($unexplained as $d) {
         Logger::info("[{$agency}]   {$d['issuer_name']} (issuer_id={$d['issuer_id']}) — у нас rating=" . var_export($d['ours'], true) . ', в снимке агентства не найден');
+    }
+    foreach ($expected as $d) {
+        Logger::info("[{$agency}]   {$d['issuer_name']} (issuer_id={$d['issuer_id']}) — у нас rating=" . var_export($d['ours'], true) . ', в снимке агентства не найден (ОЖИДАЕМО — SPV/root-совпадение)');
     }
 }
 
 if ($agency === 'nkr' || $agency === 'all') {
     Logger::info('=== Сверка current_ratings: НКР ===');
     $snapshot = (new NkrImporter($db, $matcher))->fetchSnapshot();
-    printReconcileReport('nkr', $reconciler->reconcile('nkr', $snapshot));
+    $result = $reconciler->reconcile('nkr', $snapshot);
+    printReconcileReport('nkr', $result);
+    if ($applyMissing && $result['missing_in_ours'] !== []) {
+        $applied = $reconciler->applyMissingInOurs('nkr', $result['missing_in_ours']);
+        Logger::info("[nkr] --apply-missing: записано новых строк current_ratings: {$applied}");
+    }
 }
 
 if ($agency === 'expert_ra' || $agency === 'all') {
     Logger::info('=== Сверка current_ratings: Эксперт РА ===');
     $snapshot = (new ExpertRaImporter($db, $matcher, new ExpertRaClient()))->fetchSnapshot();
-    printReconcileReport('expert_ra', $reconciler->reconcile('expert_ra', $snapshot));
+    $result = $reconciler->reconcile('expert_ra', $snapshot);
+    printReconcileReport('expert_ra', $result);
+    if ($applyMissing && $result['missing_in_ours'] !== []) {
+        $applied = $reconciler->applyMissingInOurs('expert_ra', $result['missing_in_ours']);
+        Logger::info("[expert_ra] --apply-missing: записано новых строк current_ratings: {$applied}");
+    }
 }
 
 if ($agency === 'nra' || $agency === 'all') {
@@ -146,7 +178,12 @@ if ($agency === 'nra' || $agency === 'all') {
         }
     }
 
-    printReconcileReport('nra', $reconciler->reconcile('nra', array_values($latestByIssuer)));
+    $result = $reconciler->reconcile('nra', array_values($latestByIssuer));
+    printReconcileReport('nra', $result);
+    if ($applyMissing && $result['missing_in_ours'] !== []) {
+        $applied = $reconciler->applyMissingInOurs('nra', $result['missing_in_ours']);
+        Logger::info("[nra] --apply-missing: записано новых строк current_ratings: {$applied}");
+    }
 }
 
 Logger::info('Готово.');

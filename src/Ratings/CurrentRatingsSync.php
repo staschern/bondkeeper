@@ -22,6 +22,11 @@ use PDO;
  * в ХРОНОЛОГИЧЕСКОМ порядке, это ответственность вызывающего кода).
  * Если действие не называет новый прогноз явно (outlookTo = NULL) —
  * прежнее значение в кэше не затирается NULL'ом, остаётся как было.
+ * ИСКЛЮЧЕНИЕ (по прямому запросу пользователя, найдено вживую на ООО
+ * «ЛКХ», НКР понизило до "D") — если НОВЫЙ рейтинг дефолтный
+ * (RatingsNormalizer::isDefaultGrade()), прогноз для него не
+ * предусмотрен в принципе, поэтому обнуляется ВСЕГДА, даже если сам
+ * кэш до этого хранил какое-то направление — см. sync().
  */
 final class CurrentRatingsSync
 {
@@ -39,7 +44,12 @@ final class CurrentRatingsSync
             : ['rating' => null, 'outlook' => null, 'last_action_date' => null];
     }
 
-    /** @param array{rating: ?string, outlook: ?string, last_action_date: ?string} $cached */
+    /**
+     * @param array{rating: ?string, outlook: ?string, last_action_date: ?string} $cached
+     * $matchedByRootName (миграция 022) — см. RatingActionsWriter::upsert():
+     * та же строка, если issuer_id этого действия получен третьим,
+     * "по корню" уровнем сопоставления (IssuerMatcher::findIssuerIdByRootName()).
+     */
     public static function sync(
         PDO $db,
         int $issuerId,
@@ -48,19 +58,21 @@ final class CurrentRatingsSync
         string $ratingTo,
         ?string $outlookTo,
         array $cached,
+        bool $matchedByRootName = false,
     ): void {
         if ($cached['last_action_date'] !== null && $cached['last_action_date'] > $actionDate) {
             return;
         }
 
-        $outlook = $outlookTo ?? $cached['outlook'];
+        $outlook = self::resolveOutlook($ratingTo, $outlookTo, $cached['outlook']);
         $stmt = $db->prepare(
-            'INSERT INTO current_ratings (issuer_id, agency, rating, outlook, last_action_date)
-             VALUES (:issuer_id, :agency, :rating, :outlook, :last_action_date)
+            'INSERT INTO current_ratings (issuer_id, agency, rating, outlook, last_action_date, matched_by_root_name)
+             VALUES (:issuer_id, :agency, :rating, :outlook, :last_action_date, :matched_by_root_name)
              ON DUPLICATE KEY UPDATE
                 rating = VALUES(rating),
                 outlook = VALUES(outlook),
-                last_action_date = VALUES(last_action_date)'
+                last_action_date = VALUES(last_action_date),
+                matched_by_root_name = VALUES(matched_by_root_name)'
         );
         $stmt->execute([
             'issuer_id' => $issuerId,
@@ -68,6 +80,19 @@ final class CurrentRatingsSync
             'rating' => mb_substr($ratingTo, 0, 20),
             'outlook' => $outlook,
             'last_action_date' => $actionDate,
+            'matched_by_root_name' => $matchedByRootName ? 1 : 0,
         ]);
+    }
+
+    /**
+     * Вынесено отдельным чистым методом ради офлайн-теста без завязки на
+     * MySQL-диалект (SQLite не понимает "ON DUPLICATE KEY UPDATE ...
+     * VALUES()", тот же нюанс, что и везде в проекте, см.
+     * tests/test_offers_importer.php) — см. tests/
+     * test_default_grade_clears_outlook.php, вызывается через Reflection.
+     */
+    private static function resolveOutlook(string $ratingTo, ?string $outlookTo, ?string $cachedOutlook): ?string
+    {
+        return RatingsNormalizer::isDefaultGrade($ratingTo) ? null : ($outlookTo ?? $cachedOutlook);
     }
 }

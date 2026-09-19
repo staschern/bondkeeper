@@ -17,7 +17,6 @@ use PDO;
  * Sector/TIN/OGRN/ESG-Rating/Press release. TIN — уже ИНН текстом (не
  * числом), в отличие от НРА (см. RatingsHttp/XlsxReader/IssuerMatcher) —
  * ведущие нули у 2 региональных ИНН из 259 сохранились без потери.
- * Сопоставление — только по ИНН, см. IssuerMatcher.
  *
  * === Статус "на пересмотре" (адаптация под общую ENUM-логику, сентябрь 2026) ===
  *
@@ -60,6 +59,20 @@ use PDO;
  * агентство с отдельной страницей "снимок сейчас", поэтому именно здесь
  * сверка переиспользует существующий импортёр буквально, а не
  * пересчитывает что-то заново (в отличие от НРА, см. NraImporter).
+ *
+ * === Второй уровень сопоставления — "по корню" названия (миграция 022) ===
+ *
+ * По прямому запросу пользователя (сентябрь 2026): если в issuers
+ * заведена только SPV (или только материнская компания), а строка
+ * официальной выгрузки НКР называет ДРУГУЮ сторону — TIN не совпадёт
+ * вообще (разные юрлица, разные ИНН). parseRow() пробует
+ * IssuerMatcher::findIssuerIdByRootName() как fallback, только если TIN
+ * не подошёл (после явной ручной связки issuer_spv_links, миграция 023
+ * — приоритет выше root). Строка пишется как обычно, но с флагом
+ * matched_by_root_name — собирается в getRootMatchNotices() для
+ * уведомления администратора (см. bin/seed_ratings.php). Дефолтному
+ * грейду ("D"/"SD") прогноз не положен — см. RatingsNormalizer::isDefaultGrade()
+ * (найдено вживую на ООО «ЛКХ»).
  */
 final class NkrImporter
 {
@@ -67,11 +80,17 @@ final class NkrImporter
 
     private int $totalRows = 0;
     private int $matched = 0;
+    private int $matchedByRoot = 0;
     private int $unmatchedNoInn = 0;
     private int $unmatchedNoIssuer = 0;
     private int $skippedNoDate = 0;
     /** @var array<int, string> */
     private array $unmatchedNames = [];
+    /** @var array<int, string> заголовки для уведомления администратору о root-совпадениях (см. bin/seed_ratings.php) */
+    private array $rootMatchNotices = [];
+    private int $skippedRootPriorityConflict = 0;
+    /** @var array<int, true> issuer_id => уже сопоставлен НАПРЯМУЮ по ИНН/явной связке в ЭТОМ прогоне (см. resolveIssuerIdWithPriority()) */
+    private array $innMatchedIssuerIds = [];
 
     public function __construct(
         private readonly PDO $db,
@@ -97,7 +116,7 @@ final class NkrImporter
      * printReport() продолжает работать одинаково что для import(), что
      * при вызове только этого метода.
      *
-     * @return array<int, array{issuer_id: int, issuer_name: string, rating: string, outlook: ?string, last_action_date: string}>
+     * @return array<int, array{issuer_id: int, issuer_name: string, rating: string, outlook: ?string, last_action_date: string, matched_by_root_name: bool}>
      */
     public function fetchSnapshot(): array
     {
@@ -126,19 +145,28 @@ final class NkrImporter
 
     /**
      * @param array<string, string> $row
-     * @return array{issuer_id: int, issuer_name: string, rating: string, outlook: ?string, last_action_date: string}|null
+     * @return array{issuer_id: int, issuer_name: string, rating: string, outlook: ?string, last_action_date: string, matched_by_root_name: bool}|null
      */
     private function parseRow(array $row): ?array
     {
         $tin = $row['TIN'] ?? '';
-        $issuerId = $this->matcher->findIssuerIdByInn($tin);
+        $issuerName = (string) ($row['Issuer Name'] ?? '');
+
+        ['issuerId' => $issuerId, 'matchedByRoot' => $matchedByRoot, 'skippedPriorityConflict' => $skippedPriorityConflict]
+            = $this->resolveIssuerIdWithPriority($tin, $issuerName);
+
+        if ($skippedPriorityConflict) {
+            $this->skippedRootPriorityConflict++;
+            $this->unmatchedNames[] = "{$issuerName} (TIN={$tin}) — root-совпадение проигнорировано: issuer_id уже сопоставлен напрямую по ИНН в этом же прогоне";
+            return null;
+        }
         if ($issuerId === null) {
             if (IssuerMatcher::normalizeInn($tin) === null) {
                 $this->unmatchedNoInn++;
             } else {
                 $this->unmatchedNoIssuer++;
             }
-            $this->unmatchedNames[] = ($row['Issuer Name'] ?? '?') . " (TIN={$tin})";
+            $this->unmatchedNames[] = "{$issuerName} (TIN={$tin})";
             return null;
         }
 
@@ -149,27 +177,86 @@ final class NkrImporter
         }
 
         $this->matched++;
+        if ($matchedByRoot) {
+            $this->matchedByRoot++;
+            $this->rootMatchNotices[] = "НКР (полная сверка): «{$issuerName}» (TIN={$tin}) → issuer_id={$issuerId} (сопоставлено по корню названия, проверьте)";
+        }
+
+        $rating = RatingsNormalizer::normalizeWithdrawnRatingText($row['Rating'] ?? '');
+        // Дефолтному грейду ("D"/"SD") прогноз не положен в принципе — по
+        // прямому запросу пользователя (найдено вживую на ООО «ЛКХ»), см.
+        // RatingsNormalizer::isDefaultGrade(). Здесь это скорее защитная
+        // сетка (собственная колонка "Outlook" у НКР для D-строк на
+        // практике и так обычно пустая), основной случай — новостной путь
+        // через CurrentRatingsSync::sync().
+        $outlook = RatingsNormalizer::isDefaultGrade($rating)
+            ? null
+            : (RatingsNormalizer::extractReviewStatusFromProse($row['Outlook'] ?? '')
+                ?? RatingsNormalizer::mapOutlook($row['Outlook'] ?? ''));
 
         return [
             'issuer_id' => $issuerId,
-            'issuer_name' => (string) ($row['Issuer Name'] ?? ''),
-            'rating' => RatingsNormalizer::normalizeWithdrawnRatingText($row['Rating'] ?? ''),
-            'outlook' => RatingsNormalizer::extractReviewStatusFromProse($row['Outlook'] ?? '')
-                ?? RatingsNormalizer::mapOutlook($row['Outlook'] ?? ''),
+            'issuer_name' => $issuerName,
+            'rating' => $rating,
+            'outlook' => $outlook,
             'last_action_date' => $lastActionDate,
+            'matched_by_root_name' => $matchedByRoot,
         ];
     }
 
-    /** @param array{issuer_id: int, issuer_name: string, rating: string, outlook: ?string, last_action_date: string} $row */
+    /**
+     * Приоритет прямого сопоставления (ИНН, либо явная ручная связка
+     * issuer_spv_links — миграция 023) НАД корнем (по прямому запросу
+     * пользователя, сентябрь 2026, реальный найденный случай — АО
+     * «Аэрофьюэлз»/ООО «Аэрофьюэлз Групп»): если issuer_id уже сопоставлен
+     * прямым путём где-то раньше в ЭТОМ ЖЕ прогоне, root-совпадение на тот
+     * же issuer_id позже — игнорируется, не перезаписывает более надёжный
+     * результат. Обратный порядок (root первым, прямое совпадение вторым)
+     * безопасен сам по себе — прямое совпадение просто законно
+     * "перезапишет" root-значение позже.
+     *
+     * Вынесено отдельным методом ради офлайн-теста без завязки на
+     * MySQL-диалект INSERT — см. tests/test_root_priority_conflict.php.
+     *
+     * @return array{issuerId: ?int, matchedByRoot: bool, skippedPriorityConflict: bool}
+     */
+    private function resolveIssuerIdWithPriority(string $tin, string $issuerName): array
+    {
+        $issuerId = $this->matcher->findIssuerIdByInn($tin);
+        if ($issuerId === null) {
+            $issuerId = $this->matcher->findIssuerIdBySpvLink($tin);
+        }
+        if ($issuerId !== null) {
+            $this->innMatchedIssuerIds[$issuerId] = true;
+
+            return ['issuerId' => $issuerId, 'matchedByRoot' => false, 'skippedPriorityConflict' => false];
+        }
+
+        $rootId = $this->matcher->findIssuerIdByRootName($issuerName);
+        if ($rootId !== null && isset($this->innMatchedIssuerIds[$rootId])) {
+            return ['issuerId' => null, 'matchedByRoot' => false, 'skippedPriorityConflict' => true];
+        }
+
+        return ['issuerId' => $rootId, 'matchedByRoot' => $rootId !== null, 'skippedPriorityConflict' => false];
+    }
+
+    /** @return array<int, string> тексты для админ-уведомления о совпадениях "по корню" в этом прогоне */
+    public function getRootMatchNotices(): array
+    {
+        return $this->rootMatchNotices;
+    }
+
+    /** @param array{issuer_id: int, issuer_name: string, rating: string, outlook: ?string, last_action_date: string, matched_by_root_name: bool} $row */
     private function writeCurrentRating(array $row): void
     {
         $stmt = $this->db->prepare(
-            'INSERT INTO current_ratings (issuer_id, agency, rating, outlook, last_action_date)
-             VALUES (:issuer_id, :agency, :rating, :outlook, :last_action_date)
+            'INSERT INTO current_ratings (issuer_id, agency, rating, outlook, last_action_date, matched_by_root_name)
+             VALUES (:issuer_id, :agency, :rating, :outlook, :last_action_date, :matched_by_root_name)
              ON DUPLICATE KEY UPDATE
                 rating = VALUES(rating),
                 outlook = VALUES(outlook),
-                last_action_date = VALUES(last_action_date)'
+                last_action_date = VALUES(last_action_date),
+                matched_by_root_name = VALUES(matched_by_root_name)'
         );
         $stmt->execute([
             'issuer_id' => $row['issuer_id'],
@@ -177,6 +264,7 @@ final class NkrImporter
             'rating' => $row['rating'],
             'outlook' => $row['outlook'],
             'last_action_date' => $row['last_action_date'],
+            'matched_by_root_name' => $row['matched_by_root_name'] ? 1 : 0,
         ]);
     }
 
@@ -184,7 +272,8 @@ final class NkrImporter
     {
         Logger::info('=== Отчёт по импорту current_ratings (НКР) ===');
         Logger::info("Строк обработано: {$this->totalRows}");
-        Logger::info("Сопоставлено с issuers и записано: {$this->matched}");
+        Logger::info("Сопоставлено с issuers и записано: {$this->matched} (из них по корню названия SPV/материнская компания: {$this->matchedByRoot})");
+        Logger::info("Root-совпадений проигнорировано из-за приоритета прямого сопоставления в этом же прогоне: {$this->skippedRootPriorityConflict}");
         Logger::info("Не сопоставлено (нет валидного ИНН в выгрузке): {$this->unmatchedNoInn}");
         Logger::info("Не сопоставлено (ИНН есть, но такого issuers.inn нет в базе): {$this->unmatchedNoIssuer}");
         Logger::info("Пропущено (не распознана дата): {$this->skippedNoDate}");

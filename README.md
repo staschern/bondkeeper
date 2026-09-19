@@ -36,7 +36,7 @@ src/Fns/NalogBiClient.php            — HTTP-клиент service.nalog.ru/bi.d
 src/Fns/FnsBlocksImporter.php        — fns_blocks, issuers.is_fns_blocked
 src/Iss/OffersImporter.php           — offers: дата — bondization/offers, has_buyback_date/offer_type put/call/unknown — доска-эндпоинт (переписано 14 сентября 2026, см. docs/STAGE1_POSTPROCESSING.md)
 src/Ratings/XlsxReader.php           — минимальный читатель .xlsx (ZIP+XML) без зависимостей
-src/Ratings/IssuerMatcher.php        — сопоставление эмитента агентства с issuers.id по ИНН (и по названию, когда ИНН взять неоткуда)
+src/Ratings/IssuerMatcher.php        — сопоставление эмитента агентства с issuers.id по ИНН → явной связке SPV (findIssuerIdBySpvLink(), issuer_spv_links, миграция 023) → ISIN (АКРА) → точному имени → "по корню" названия (findIssuerIdByRootName(), миграция 022, SPV/материнская компания — см. docs/STAGE3_RATINGS.md)
 src/Ratings/RatingsNormalizer.php    — общие преобразования (прогноз, дата) для рейтинговых выгрузок; isBondIssueRedemptionWithdrawal() — фильтр шума "отозван рейтинг выпуска из-за погашения" (не эмитента), см. docs/STAGE3_RATINGS.md
 src/Ratings/RatingsHttp.php          — HTTP-загрузчик с ретраями для сайтов рейтинговых агентств
 src/Ratings/NkrImporter.php          — current_ratings из Excel-выгрузки НКР (ratings.ru)
@@ -46,8 +46,9 @@ src/Ratings/ExpertRaImporter.php     — current_ratings из raexpert.ru (Эк�
 src/Ratings/AcraImporter.php         — current_ratings из JSON-файла АКРА, который готовит пользователь (см. docs/STAGE3_RATINGS.md)
 src/Ratings/ManualRatingsImporter.php — current_ratings из ручного xlsx (рейтинги, не найденные через автоматические источники)
 src/Ratings/RatingActionsWriter.php  — общий апсерт в rating_actions (ключ — UNIQUE(issuer_id, agency, action_date), полностью распознанные действия, см. docs/STAGE3_RATINGS.md)
-src/Ratings/CurrentRatingsReconciler.php — сверка current_ratings с "истиной" от агентства (НЕ импортёр — ничего не пишет, только сравнивает и печатает расхождения), см. docs/STAGE3_RATINGS.md
-bin/reconcile_ratings.php            — запуск сверки (--agency=nkr|expert_ra|nra|all), см. docs/STAGE3_RATINGS.md
+src/Ratings/CurrentRatingsReconciler.php — сверка current_ratings с "истиной" от агентства (только сравнивает и печатает расхождения; applyMissingInOurs() — единственное исключение, пишет новые строки для эмитентов, которых у нас нет вообще; missing_in_snapshot несёт флаг expected — root/SPV-совпадение, ожидаемое расхождение), см. docs/STAGE3_RATINGS.md
+bin/reconcile_ratings.php            — запуск сверки (--agency=nkr|expert_ra|nra|all [--apply-missing]), см. docs/STAGE3_RATINGS.md
+bin/link_spv.php                     — управление issuer_spv_links: --spv-inn=... --issuer-inn=...|--issuer-id=... [--spv-name=...] [--note=...], --list, --remove — см. docs/STAGE3_RATINGS.md
 src/Ratings/CurrentRatingsSync.php   — чтение/запись current_ratings для новостных импортёров (источник rating_from/outlook_from; апсерт кэша только если действие не старше уже сохранённого)
 src/Ratings/RatingNewsLog.php        — журнал просмотренных пресс-релизов (rating_news_log) — дедуп/ретрай по (agency, source_url), независимо от rating_actions
 src/Ratings/NkrTitleParser.php       — чистый (без БД/сети) разбор заголовков пресс-релизов НКР
@@ -75,6 +76,8 @@ database/019_bot_ux_tariff_and_dialog_state.sql — миграция: тариф
 database/020_founder_tariff.sql — миграция: тариф founder (max_tracked_issuers=NULL — без ограничения)
 bin/grant_founder_subscription.php — разовая выдача тарифа founder двум учредителям по telegram_id (безлимит эмитентов + фактически бессрочно), идемпотентно
 database/021_rating_news_log_bond_redemption_status.sql — миграция: новый статус rating_news_log.status для отфильтрованного шума "отозван рейтинг выпуска из-за погашения"
+database/022_matched_by_root_name.sql — миграция: rating_actions.matched_by_root_name/current_ratings.matched_by_root_name — флаг сопоставления "по корню" названия (SPV/материнская компания)
+database/023_issuer_spv_links.sql — миграция: таблица issuer_spv_links — явная ручная связка "неизвестный ИНН → issuer_id" для пар, где имена текстуально не связаны
 src/Telegram/TelegramClientInterface.php — интерфейс Bot API (sendMessage/answerCallbackQuery/editMessageText) для подмены фейком в офлайн-тестах
 src/Telegram/TelegramClient.php      — HTTP-клиент Telegram Bot API (long polling, sendMessage/editMessageText/answerCallbackQuery)
 src/Telegram/TelegramBotConfig.php   — токен бота + admin_telegram_id из config/telegram_bot.php (не коммитится, см. .example рядом)
@@ -90,9 +93,13 @@ tests/test_issuer_name_shortener.php — офлайн-проверка IssuerNam
 bin/backfill_issuer_short_names.php  — разовая пересборка issuers.short_name из full_name для строк, накопленных до появления IssuerNameShortener (идемпотентно, безопасно перезапускать)
 tests/test_offers_importer.php       — офлайн-проверка OffersImporter (20 проверок: выбор даты/типа оферты из bondization/offers, put/call — чистая логика, БД не нужна)
 tests/test_ratings_normalizer.php    — офлайн-проверка RatingsNormalizer::isBondIssueRedemptionWithdrawal() (8 проверок, чистая текстовая логика, БД не нужна)
-tests/test_current_ratings_reconciler.php — офлайн-проверка CurrentRatingsReconciler (16 проверок, полностью покрыта — класс только читает/сравнивает, MySQL-диалекта нет)
+tests/test_current_ratings_reconciler.php — офлайн-проверка CurrentRatingsReconciler (23 проверки: сравнение + applyMissingInOurs()/кейс 3 + expected-флаг missing_in_snapshot/кейс 5b — MySQL-диалекта нет)
 bin/debug_bond_redemption_ratings.php — диагностика (без записи в БД): находит уже записанные ДО фикса 17 сентября ложные "рейтинг отозван" от отзыва выпуска из-за погашения
 bin/fix_bond_redemption_ratings.php  — разовое исправление (ПИШЕТ в БД): удаляет эти ложные rating_actions/events и пересчитывает current_ratings из оставшейся истории; запускать после debug_bond_redemption_ratings.php
+tests/test_issuer_root_matching.php  — офлайн-проверка IssuerMatcher::rootCompanyName()/findIssuerIdByRootName() (25 проверок, включая реальный случай Аэрофьюэлз/Аэрофьюэлз Групп)
+tests/test_issuer_spv_link.php       — офлайн-проверка IssuerMatcher::findIssuerIdBySpvLink() + приоритет связки над root в resolveIssuerIdWithPriority() (7 проверок)
+tests/test_default_grade_clears_outlook.php — офлайн-проверка RatingsNormalizer::isDefaultGrade() + CurrentRatingsSync::resolveOutlook() (20 проверок, реальный случай ООО «ЛКХ», рейтинг "D")
+tests/test_root_priority_conflict.php — офлайн-проверка приоритета ИНН/связки над root ВНУТРИ одного прогона NkrImporter/ExpertRaImporter/AcraImporter (12 проверок)
 ```
 
 ## Запуск
@@ -122,6 +129,8 @@ mysql -u root -p bondkeeper < database/019_bot_ux_tariff_and_dialog_state.sql
 mysql -u root -p bondkeeper < database/020_founder_tariff.sql
 php bin/grant_founder_subscription.php   # разовая выдача тарифа founder учредителям
 mysql -u root -p bondkeeper < database/021_rating_news_log_bond_redemption_status.sql
+mysql -u root -p bondkeeper < database/022_matched_by_root_name.sql
+mysql -u root -p bondkeeper < database/023_issuer_spv_links.sql
 
 php bin/seed_market.php        # issuers, securities, redemptions(scheduled_maturity)
 php bin/seed_bondization.php   # coupons, amortizations
