@@ -183,8 +183,21 @@ final class CurrentRatingsReconciler
      * "эмитента вообще нет в issuers" — такие строки никогда не попадают
      * в снимок (см. докблок класса), отдельная более сложная задача.
      *
+     * ИСКЛЮЧЕНИЕ (найдено вживую 19 сентября 2026, Эксперт РА, ООО «Озон
+     * Капитал»/issuer_id=1442): одна и та же пара (issuer_id, agency)
+     * может встретиться в $missingInOurs НЕСКОЛЬКО РАЗ — сайт агентства
+     * отдал ОДНУ компанию под РАЗНЫМИ именами в разных категориях (после
+     * переименования юрлица старая категорийная карточка не убрана, либо
+     * баг самого сайта), root/ИНН-сопоставление резолвит оба варианта в
+     * один issuer_id. Конфликт ПЕРВИЧНОГО КЛЮЧА (SQLSTATE 23000) в этом
+     * случае — не гонка, а ожидаемое повторение: пропускаем повторную
+     * строку (первая с этим issuer_id уже записана), не роняем весь
+     * прогон и продолжаем со следующими строками missing_in_ours. Любая
+     * ДРУГАЯ ошибка БД (обрыв соединения и т.п.) пробрасывается дальше,
+     * не глотается.
+     *
      * @param array<int, array{issuer_id: int, issuer_name: string, rating: string, outlook: ?string, last_action_date: string}> $missingInOurs
-     * @return int сколько строк записано
+     * @return int сколько строк реально записано (может быть меньше count($missingInOurs) — см. выше)
      */
     public function applyMissingInOurs(string $agency, array $missingInOurs): int
     {
@@ -195,14 +208,20 @@ final class CurrentRatingsReconciler
 
         $count = 0;
         foreach ($missingInOurs as $row) {
-            $stmt->execute([
-                'issuer_id' => $row['issuer_id'],
-                'agency' => $agency,
-                'rating' => mb_substr($row['rating'], 0, 20),
-                'outlook' => $row['outlook'],
-                'last_action_date' => $row['last_action_date'],
-            ]);
-            $count++;
+            try {
+                $stmt->execute([
+                    'issuer_id' => $row['issuer_id'],
+                    'agency' => $agency,
+                    'rating' => mb_substr($row['rating'], 0, 20),
+                    'outlook' => $row['outlook'],
+                    'last_action_date' => $row['last_action_date'],
+                ]);
+                $count++;
+            } catch (\PDOException $e) {
+                if ($e->getCode() !== '23000') {
+                    throw $e;
+                }
+            }
         }
 
         return $count;

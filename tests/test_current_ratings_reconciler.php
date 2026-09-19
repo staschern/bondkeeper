@@ -38,7 +38,11 @@ $db = new PDO('sqlite::memory:');
 $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
 
 $db->exec('CREATE TABLE issuers (id INTEGER PRIMARY KEY, short_name TEXT)');
-$db->exec('CREATE TABLE current_ratings (issuer_id INTEGER, agency TEXT, rating TEXT, outlook TEXT, last_action_date TEXT, matched_by_root_name INTEGER DEFAULT 0)');
+// PRIMARY KEY (issuer_id, agency) — как в боевой схеме (database/001_schema.sql)
+// — нужен, чтобы тест устойчивости applyMissingInOurs() ниже (дубль
+// issuer_id в missing_in_ours) реально воспроизводил конфликт SQLSTATE
+// 23000, а не проходил мимо из-за более слабой тестовой схемы.
+$db->exec('CREATE TABLE current_ratings (issuer_id INTEGER, agency TEXT, rating TEXT, outlook TEXT, last_action_date TEXT, matched_by_root_name INTEGER DEFAULT 0, PRIMARY KEY (issuer_id, agency))');
 $db->exec('CREATE TABLE issuer_spv_links (spv_inn TEXT PRIMARY KEY, issuer_id INTEGER, spv_name TEXT, note TEXT)');
 
 $db->exec("INSERT INTO issuers (id, short_name) VALUES (1, 'Роснефть')");
@@ -139,6 +143,18 @@ check('applyMissingInOurs: вернул 1 (записана ровно 1 стр�
 $afterApply = $reconciler->reconcile('nkr', $snapshot);
 check('applyMissingInOurs: после применения эмитент 5 больше не в missing_in_ours', $afterApply['missing_in_ours'] === []);
 check('applyMissingInOurs: после применения эмитент 5 не расходится по полям (записан ровно из снимка)', array_values(array_filter($afterApply['field_mismatches'], static fn (array $d): bool => $d['issuer_id'] === 5)) === []);
+
+// --- Кейс 3, устойчивость: один и тот же issuer_id ДВАЖДЫ в missing_in_ours
+// (реальный найденный случай, Эксперт РА, 19 сентября 2026 — "ОЗОН БАНК" и
+// "ОЗОН КАПИТАЛ" в разных категориях сайта агентства сошлись в один
+// issuer_id) — конфликт первичного ключа НЕ должен ронять весь прогон.
+$db->exec("INSERT INTO issuers (id, short_name) VALUES (9, 'Дубль')");
+$duplicateMissing = [
+    ['issuer_id' => 9, 'issuer_name' => 'Дубль (имя 1)', 'rating' => 'ruA', 'outlook' => 'stable', 'last_action_date' => '2026-06-01'],
+    ['issuer_id' => 9, 'issuer_name' => 'Дубль (имя 2)', 'rating' => 'ruA', 'outlook' => 'stable', 'last_action_date' => '2026-06-01'],
+];
+$appliedDuplicate = $reconciler->applyMissingInOurs('nkr', $duplicateMissing);
+check('applyMissingInOurs: дубль issuer_id в списке -- не падает, записывает только первую (вернул 1)', $appliedDuplicate === 1);
 
 // --- outlook null у обеих сторон — не расхождение ---
 $db->exec("INSERT INTO current_ratings (issuer_id, agency, rating, outlook, last_action_date) VALUES (6, 'nkr', 'BB.ru', null, '2026-08-20')");
