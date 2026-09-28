@@ -9,6 +9,7 @@ use BondKeeper\Fns\FnsBlocksImporter;
 use BondKeeper\Fns\NalogBiClient;
 use BondKeeper\Fns\NalogBiClientInterface;
 use BondKeeper\Ratings\IssuerMatcher;
+use BondKeeper\Ratings\NameMatchReviews;
 use BondKeeper\Support\Logger;
 use PDO;
 use PDOException;
@@ -162,6 +163,17 @@ final class BotCommandHandler
         $telegramId = (int) ($from['id'] ?? 0);
         if ($chatId === 0 || $messageId === 0 || $telegramId === 0) {
             $this->telegram->answerCallbackQuery($id);
+            return;
+        }
+
+        // "review:" — подтверждение/отклонение предложений сопоставления
+        // по названию (NameMatchReviews) прямо из Telegram, ТОЛЬКО для
+        // администратора — проверяется ДО обычной регистрации
+        // пользователя, тем же приёмом, что и "Помощь"/relayAdminReplyToUser()
+        // выше: служебный канал, не команда от клиента.
+        if (str_starts_with($data, 'review:')) {
+            $toast = $this->dispatchReviewCallback($telegramId, $chatId, $messageId, $data, (string) ($message['text'] ?? ''));
+            $this->telegram->answerCallbackQuery($id, $toast);
             return;
         }
 
@@ -960,6 +972,55 @@ final class BotCommandHandler
         $this->telegram->editMessageText($chatId, $messageId, $text);
 
         return null;
+    }
+
+    /**
+     * Разбор callback_data вида "review:<действие>:<id>" — кнопки
+     * "Подтвердить"/"Отклонить" под сообщением-предложением
+     * (NameMatchReviews::notifyNewProposals()/proposalKeyboard()).
+     * Только администратор (adminTelegramId) может это нажимать — та же
+     * граница, что у "Помощь"/relayAdminReplyToUser(): служебная кнопка,
+     * не команда обычного пользователя. bin/review_matches.php остаётся
+     * резервным способом (CLI, по SSH) — эта кнопка просто даёт
+     * администратору решить прямо в Telegram, без сервера под рукой.
+     */
+    private function dispatchReviewCallback(int $telegramId, int $chatId, int $messageId, string $data, string $originalText): ?string
+    {
+        $parts = explode(':', $data);
+        if (($parts[0] ?? '') !== 'review') {
+            return null;
+        }
+        if ($this->adminTelegramId === 0 || $telegramId !== $this->adminTelegramId) {
+            return 'Подтверждать может только администратор.';
+        }
+
+        $action = $parts[1] ?? '';
+        $id = (int) ($parts[2] ?? 0);
+        if ($id === 0 || !in_array($action, ['approve', 'reject'], true)) {
+            return null;
+        }
+
+        try {
+            return $this->applyReviewDecision($action, $id, $chatId, $messageId, $originalText);
+        } catch (\Throwable $e) {
+            return "Ошибка: {$e->getMessage()}";
+        }
+    }
+
+    private function applyReviewDecision(string $action, int $id, int $chatId, int $messageId, string $originalText): string
+    {
+        $reviews = new NameMatchReviews($this->db);
+        $row = $action === 'approve' ? $reviews->approve($id) : $reviews->reject($id);
+
+        $note = $action === 'approve'
+            ? "\n\n✅ Подтверждено — «{$row['source_name']}» → {$row['issuer_short_name']} (issuer_id={$row['issuer_id']})."
+            : "\n\n❌ Отклонено — «{$row['source_name']}» НЕ {$row['issuer_short_name']}. Больше предлагаться не будет."
+                . ((int) ($row['removed_current_ratings'] ?? 0) > 0 ? ' Старая запись current_ratings по этому агентству удалена.' : '');
+
+        // Без клавиатуры (editMessageText() с null = убрать) — исключает повторный тап той же кнопки.
+        $this->telegram->editMessageText($chatId, $messageId, $originalText . $note);
+
+        return $action === 'approve' ? 'Подтверждено' : 'Отклонено';
     }
 
     private function formatIssuerStatus(int $issuerId, string $shortName, string $inn): string

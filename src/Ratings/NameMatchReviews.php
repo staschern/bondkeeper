@@ -206,11 +206,14 @@ final class NameMatchReviews
     /**
      * Отправляет администратору каждое ещё не отправленное предложение
      * отдельным сообщением (не больше $maxMessages за вызов — остальные
-     * уйдут следующим прогоном). Если отправка не удалась (не настроен
-     * Telegram) — останавливается, notified_at не ставится, попробуем в
-     * следующий раз.
+     * уйдут следующим прогоном), с кнопками "Подтвердить"/"Отклонить"
+     * (proposalKeyboard()) — администратор решает прямо в Telegram, без
+     * SSH и bin/review_matches.php (тот остаётся резервным способом,
+     * команды в тексте предложения тоже показываются). Если отправка не
+     * удалась (не настроен Telegram) — останавливается, notified_at не
+     * ставится, попробуем в следующий раз.
      *
-     * @param callable(string): bool $send
+     * @param callable(string, ?array=null): bool $send
      * @return int сколько предложений отправлено
      */
     public function notifyNewProposals(callable $send, int $maxMessages = 20): int
@@ -232,14 +235,24 @@ final class NameMatchReviews
                 $send("Ещё предложений на подтверждение: {$left} — придут следующим прогоном. Все ждущие: php bin/review_matches.php --list");
                 break;
             }
-            if (!$send(self::formatProposal($row))) {
+            $id = (int) $row['id'];
+            if (!$send(self::formatProposal($row), self::proposalKeyboard($id))) {
                 break;
             }
-            $mark->execute(['id' => (int) $row['id']]);
+            $mark->execute(['id' => $id]);
             $sent++;
         }
 
         return $sent;
+    }
+
+    /** Кнопки "Подтвердить"/"Отклонить" под сообщением-предложением — обрабатываются BotCommandHandler::dispatchReviewCallback() (только для admin_telegram_id). */
+    public static function proposalKeyboard(int $id): array
+    {
+        return ['inline_keyboard' => [[
+            ['text' => '✅ Подтвердить', 'callback_data' => "review:approve:{$id}"],
+            ['text' => '❌ Отклонить', 'callback_data' => "review:reject:{$id}"],
+        ]]];
     }
 
     /** @param array<string, mixed> $row строка issuer_name_match_reviews + issuer_short_name/issuer_inn */

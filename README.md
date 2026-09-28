@@ -37,10 +37,10 @@ src/Fns/FnsBlocksImporter.php        — fns_blocks, issuers.is_fns_blocked
 src/Iss/OffersImporter.php           — offers: дата — bondization/offers, has_buyback_date/offer_type put/call/unknown — доска-эндпоинт (переписано 14 сентября 2026, см. docs/STAGE1_POSTPROCESSING.md)
 src/Ratings/XlsxReader.php           — минимальный читатель .xlsx (ZIP+XML) без зависимостей
 src/Ratings/IssuerMatcher.php        — сопоставление эмитента агентства с issuers.id по ИНН → явной связке SPV (findIssuerIdBySpvLink(), issuer_spv_links, миграция 023) → ISIN (АКРА) → подтверждённому названию (findIssuerIdByApprovedName(), миграция 024); findIssuerIdByName()/findIssuerIdByRootName() только НАХОДЯТ кандидата — решение принимает NameMatchResolver, см. docs/STAGE3_RATINGS.md
-src/Ratings/NameMatchReviews.php     — предложения "сопоставить по названию" (issuer_name_match_reviews, миграция 024): предложить/подтвердить/отклонить/уведомить администратора, тёзки не предлагаются
+src/Ratings/NameMatchReviews.php     — предложения "сопоставить по названию" (issuer_name_match_reviews, миграция 024): предложить/подтвердить/отклонить/уведомить администратора (с кнопками "Подтвердить"/"Отклонить", proposalKeyboard()), тёзки не предлагаются
 src/Ratings/NameMatchResolver.php    — последний шаг сопоставления во всех 7 импортёрах: подтверждённое название или новое предложение (не пишет в current_ratings/rating_actions)
 src/Ratings/SnapshotRows.php         — снимок "сейчас" от агентства: одна строка на эмитента (latestPerIssuer()), запись в current_ratings (apply(), source='snapshot'), сохранение/чтение JSON-файла снимка (saveToFile()/loadFromFile(), П2)
-src/Telegram/AdminNotifier.php       — служебное сообщение администратору (config/telegram_bot.php: admin_telegram_id) из CLI-скриптов; ошибка отправки не роняет импорт/сверку
+src/Telegram/AdminNotifier.php       — служебное сообщение администратору (config/telegram_bot.php: admin_telegram_id) из CLI-скриптов, опционально с inline-клавиатурой (кнопки предложений); ошибка отправки не роняет импорт/сверку
 src/Ratings/RatingsNormalizer.php    — общие преобразования (прогноз, дата) для рейтинговых выгрузок; isBondIssueRedemptionWithdrawal() — фильтр шума "отозван рейтинг выпуска из-за погашения" (не эмитента), см. docs/STAGE3_RATINGS.md
 src/Ratings/RatingsHttp.php          — HTTP-загрузчик с ретраями для сайтов рейтинговых агентств
 src/Ratings/NkrImporter.php          — current_ratings из Excel-выгрузки НКР (ratings.ru)
@@ -90,11 +90,11 @@ src/Telegram/TelegramClientInterface.php — интерфейс Bot API (sendMes
 src/Telegram/TelegramClient.php      — HTTP-клиент Telegram Bot API (long polling, sendMessage/editMessageText/answerCallbackQuery)
 src/Telegram/TelegramBotConfig.php   — токен бота + admin_telegram_id из config/telegram_bot.php (не коммитится, см. .example рядом)
 src/Telegram/BotFormatting.php       — общие форматтеры (agencyDisplayName/formatDate/formatMoney) для BotCommandHandler и NotificationDispatcher
-src/Telegram/BotCommandHandler.php   — разбор команд/кнопок бота: меню, «Выбор эмитентов» (умный поиск + листалка), «Статус», «Подписка», «О сервисе», чат-релей «Помощь» — см. docs/BOT_UX_SPEC.md
+src/Telegram/BotCommandHandler.php   — разбор команд/кнопок бота: меню, «Выбор эмитентов» (умный поиск + листалка), «Статус» (разбивка "Весь список" на несколько сообщений при превышении лимита Telegram, splitIntoTelegramChunks()), «Подписка», «О сервисе», чат-релей «Помощь», подтверждение/отклонение предложений сопоставления по названию кнопками (dispatchReviewCallback(), только admin_telegram_id) — см. docs/BOT_UX_SPEC.md, docs/STAGE3_RATINGS.md
 src/Telegram/NotificationDispatcher.php — рассылка событий (events) подписчикам из watchlist в Telegram, этап 4 Фаза 3, см. docs/STAGE4_EVENT_ENGINE.md
 bin/daemon_telegram_bot.php          — цикл бота: long-polling команд + рассылка раз в 60 с, один процесс
 config/telegram_bot.example.php      — шаблон конфига токена бота (скопировать в telegram_bot.php, не коммитить)
-tests/test_bot_ux_screens.php        — офлайн-проверка экранов/разделов бота на SQLite (73 проверки)
+tests/test_bot_ux_screens.php        — офлайн-проверка экранов/разделов бота на SQLite (143 проверки: меню/статус/подписка + разбивка "Весь список" на сообщения + кнопки подтверждения предложений)
 tests/test_notification_dispatcher.php — офлайн-проверка рассылки на SQLite (27 проверок, покрыта целиком — без MySQL-диалекта)
 tests/test_no_duplicate_named_params.php — статическая проверка ->prepare(): нет повторов :имени плейсхолдера в одном запросе (PDO::ATTR_EMULATE_PREPARES=false — MySQL это не прощает, в отличие от SQLite)
 tests/test_issuer_name_shortener.php — офлайн-проверка IssuerNameShortener (24 проверки, чистая текстовая логика, БД не нужна)

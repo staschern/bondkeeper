@@ -110,12 +110,23 @@ $db->exec('CREATE TABLE issuers (id INTEGER PRIMARY KEY, inn TEXT, full_name TEX
 // дубле.
 $db->exec('CREATE TABLE watchlist (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, issuer_id INTEGER, security_id INTEGER, UNIQUE(user_id, issuer_id))');
 $db->exec('CREATE TABLE fns_blocks (issuer_id INTEGER PRIMARY KEY, is_fns_blocked INTEGER, block_date TEXT, active_bank_count INTEGER, blocked_amount TEXT, reason TEXT, verification TEXT, date_verification TEXT)');
-$db->exec('CREATE TABLE current_ratings (issuer_id INTEGER, agency TEXT, rating TEXT, outlook TEXT, last_action_date TEXT)');
+$db->exec('CREATE TABLE current_ratings (issuer_id INTEGER, agency TEXT, rating TEXT, outlook TEXT, last_action_date TEXT, matched_by_root_name INTEGER DEFAULT 0, source TEXT)');
 $db->exec('CREATE TABLE subscriptions (id INTEGER PRIMARY KEY, user_id INTEGER, tariff_code TEXT, status TEXT, current_period_end TEXT)');
 $db->exec('CREATE TABLE tariffs (code TEXT PRIMARY KEY, name TEXT, max_tracked_issuers INTEGER, duration_days INTEGER)');
 $db->exec('CREATE TABLE users (id INTEGER PRIMARY KEY, telegram_id INTEGER)');
 $db->exec('CREATE TABLE support_thread_map (admin_chat_id INTEGER, admin_message_id INTEGER, user_id INTEGER, PRIMARY KEY (admin_chat_id, admin_message_id))');
 $db->exec('CREATE TABLE securities (id INTEGER PRIMARY KEY AUTOINCREMENT, isin TEXT, secid TEXT, issuer_id INTEGER)');
+$db->exec('CREATE TABLE issuer_spv_links (spv_inn TEXT PRIMARY KEY, issuer_id INTEGER, spv_name TEXT, note TEXT)');
+$db->exec(
+    "CREATE TABLE issuer_name_match_reviews (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_key_type TEXT NOT NULL, source_key TEXT NOT NULL, issuer_id INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending', match_type TEXT NOT NULL, agency TEXT NOT NULL,
+        source_name TEXT, source_title TEXT, source_url TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP, notified_at TEXT, decided_at TEXT,
+        UNIQUE (source_key_type, source_key, issuer_id)
+    )"
+);
 
 $db->exec("INSERT INTO tariffs (code, name, max_tracked_issuers, duration_days) VALUES ('free', 'Free', 10, 14)");
 
@@ -564,6 +575,49 @@ check(
         return true;
     })()
 );
+
+// --- dispatchReviewCallback(): кнопки "Подтвердить"/"Отклонить" под предложением
+// сопоставления по названию (NameMatchReviews) прямо из Telegram, только для
+// администратора (adminTelegramId=555 у этого $handler) ---
+$db->exec(
+    "INSERT INTO issuer_name_match_reviews (id, source_key_type, source_key, issuer_id, status, match_type, agency, source_name, source_title, source_url)
+     VALUES (1, 'inn', '1234567890', 1, 'pending', 'root_name', 'nkr', 'Тестовая ИНН-Компания', 'Заголовок новости', 'https://example.org/1')"
+);
+$db->exec(
+    "INSERT INTO issuer_name_match_reviews (id, source_key_type, source_key, issuer_id, status, match_type, agency, source_name, source_title, source_url)
+     VALUES (2, 'name', 'ГАЗПРОМ ТЕСТ', 2, 'pending', 'exact_name', 'expert_ra', 'Газпром Тест', NULL, NULL)"
+);
+
+// Не администратор (обычный пользователь 999) — не должен уметь подтверждать.
+$telegram->lastEdit = null;
+$nonAdminToast = callPrivate($ref, $handler, 'dispatchReviewCallback', [999, 5003, 44, 'review:approve:1', 'Предложение #1: ...']);
+check('dispatchReviewCallback(): не-администратор -> отказ, не "Подтверждено"', $nonAdminToast === 'Подтверждать может только администратор.');
+check('dispatchReviewCallback(): не-администратор -> предложение #1 осталось pending', $db->query('SELECT status FROM issuer_name_match_reviews WHERE id = 1')->fetchColumn() === 'pending');
+check('dispatchReviewCallback(): не-администратор -> сообщение не отредактировано', $telegram->lastEdit === null);
+
+// Чужой префикс — сразу null, не пытается парсить как review:.
+check('dispatchReviewCallback(): чужой префикс (не "review:") -> null', callPrivate($ref, $handler, 'dispatchReviewCallback', [555, 5003, 44, 'iss:add_menu', '']) === null);
+
+// Администратор (555) подтверждает предложение #1 (источник с ИНН -> связка issuer_spv_links).
+$adminToast = callPrivate($ref, $handler, 'dispatchReviewCallback', [555, 5003, 44, 'review:approve:1', 'Предложение #1: сопоставить...']);
+check('dispatchReviewCallback(): администратор подтверждает -> тост "Подтверждено"', $adminToast === 'Подтверждено');
+check('dispatchReviewCallback(): подтверждение -> статус approved в БД', $db->query('SELECT status FROM issuer_name_match_reviews WHERE id = 1')->fetchColumn() === 'approved');
+check(
+    'dispatchReviewCallback(): подтверждение источника с ИНН -> заведена связка issuer_spv_links',
+    $db->query("SELECT issuer_id FROM issuer_spv_links WHERE spv_inn = '1234567890'")->fetchColumn() === 1
+);
+check('dispatchReviewCallback(): сообщение отредактировано, исходный текст сохранён + добавлена пометка', str_starts_with((string) $telegram->lastEdit['text'], 'Предложение #1: сопоставить...') && str_contains((string) $telegram->lastEdit['text'], '✅ Подтверждено'));
+check('dispatchReviewCallback(): клавиатура убрана после решения (повторный тап невозможен)', $telegram->lastEdit['keyboard'] === null);
+
+// Администратор отклоняет предложение #2 (источник без ИНН -> просто статус rejected, без связки).
+$telegram->lastEdit = null;
+$rejectToast = callPrivate($ref, $handler, 'dispatchReviewCallback', [555, 5003, 45, 'review:reject:2', 'Предложение #2: сопоставить...']);
+check('dispatchReviewCallback(): администратор отклоняет -> тост "Отклонено"', $rejectToast === 'Отклонено');
+check('dispatchReviewCallback(): отклонение -> статус rejected в БД', $db->query('SELECT status FROM issuer_name_match_reviews WHERE id = 2')->fetchColumn() === 'rejected');
+check('dispatchReviewCallback(): отклонение -> сообщение с пометкой "❌ Отклонено"', str_contains((string) $telegram->lastEdit['text'], '❌ Отклонено'));
+
+// Несуществующий id -> явная ошибка тостом, не падение процесса.
+check('dispatchReviewCallback(): несуществующий id -> тост с "Ошибка:"', str_starts_with((string) callPrivate($ref, $handler, 'dispatchReviewCallback', [555, 5003, 46, 'review:approve:9999', '...']), 'Ошибка:'));
 
 echo "\n";
 if ($failures === 0) {
