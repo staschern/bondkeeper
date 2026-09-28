@@ -35,7 +35,13 @@ use PDO;
  *      названия: наше (issuers.short_name) и у агентства (П14: раньше
  *      печаталось только название агентства, и фармацевтическая «Озон»
  *      выглядела в отчёте как «ОЗОН Банк»), источник нашего значения и,
- *      если оно из новости, — заголовок и ссылка этой новости.
+ *      если оно из новости, — заголовок и ссылка этой новости. Как и у
+ *      missing_in_snapshot, есть 'expected'/'reason' (28 сентября 2026,
+ *      прямой запрос пользователя после разбора первой полной сводки):
+ *      ручной ввод (source='manual') и рейтинг выпуска облигаций из
+ *      новости — тот же смысл, что и у explainMissing() ниже, просто
+ *      применённый к расхождению по полю, а не к полному отсутствию в
+ *      снимке (см. explainFieldMismatch()).
  *   2. missing_in_ours — агентство знает эмитента, у нас в
  *      current_ratings для этой пары (issuer_id, agency) нет строки
  *      вообще.
@@ -74,7 +80,7 @@ final class CurrentRatingsReconciler
      * @param array<int, array{issuer_id: int, issuer_name: string, rating: string, outlook: ?string, last_action_date: string}> $snapshot
      * @return array{
      *     snapshot_count: int,
-     *     field_mismatches: array<int, array{issuer_id: int, our_name: string, agency_name: string, field: string, ours: ?string, theirs: ?string, our_source: ?string, our_action_title: ?string, our_action_url: ?string}>,
+     *     field_mismatches: array<int, array{issuer_id: int, our_name: string, agency_name: string, field: string, ours: ?string, theirs: ?string, our_source: ?string, our_action_title: ?string, our_action_url: ?string, expected: bool, reason: ?string}>,
      *     missing_in_ours: array<int, array{issuer_id: int, our_name: string, agency_name: string, rating: string, outlook: ?string, last_action_date: string}>,
      *     missing_in_snapshot: array<int, array{issuer_id: int, our_name: string, ours: ?string, last_action_date: ?string, source: ?string, expected: bool, reason: ?string, note: ?string}>
      * }
@@ -104,14 +110,20 @@ final class CurrentRatingsReconciler
                 continue;
             }
 
-            $lastAction = null;
-            foreach (['rating', 'outlook', 'last_action_date'] as $field) {
-                if ($ours[$field] === $row[$field]) {
-                    continue;
-                }
-                if ($ours['source'] === 'action' && $lastAction === null) {
-                    $lastAction = $this->fetchLastAction($row['issuer_id'], $agency) ?? ['source_title' => null, 'source_url' => null];
-                }
+            $differingFields = array_values(array_filter(
+                ['rating', 'outlook', 'last_action_date'],
+                static fn (string $field): bool => $ours[$field] !== $row[$field],
+            ));
+            if ($differingFields === []) {
+                continue;
+            }
+
+            $lastAction = $ours['source'] === 'action'
+                ? ($this->fetchLastAction($row['issuer_id'], $agency) ?? ['source_title' => null, 'source_url' => null])
+                : null;
+            [$expected, $reason] = $this->explainFieldMismatch($ours['source'], $lastAction['source_title'] ?? null);
+
+            foreach ($differingFields as $field) {
                 $fieldMismatches[] = [
                     'issuer_id' => $row['issuer_id'],
                     'our_name' => $ours['short_name'],
@@ -122,6 +134,8 @@ final class CurrentRatingsReconciler
                     'our_source' => $ours['source'],
                     'our_action_title' => $lastAction['source_title'] ?? null,
                     'our_action_url' => $lastAction['source_url'] ?? null,
+                    'expected' => $expected,
+                    'reason' => $reason,
                 ];
             }
         }
@@ -259,6 +273,29 @@ final class CurrentRatingsReconciler
         }
 
         return null;
+    }
+
+    /**
+     * Та же логика, что и в explainMissing(), но для расхождения по
+     * ПОЛЮ (снимок эмитента знает, но наше значение отличается) — только
+     * два из пяти признаков explainMissing() тут вообще применимы: спв-
+     * связка и подтверждённое название объясняют ОТСУТСТВИЕ строки в
+     * снимке, а не то, что она есть, но другая; 'отозван' сюда тоже не
+     * подходит буквально (это признак отсутствия в списке действующих,
+     * не конкретного поля).
+     *
+     * @return array{0: bool, 1: ?string}
+     */
+    private function explainFieldMismatch(?string $source, ?string $actionTitle): array
+    {
+        if ($source === 'manual') {
+            return [true, 'внесено вручную из xlsx'];
+        }
+        if ($source === 'action' && $actionTitle !== null && RatingsNormalizer::isBondIssueRatingTitle($actionTitle)) {
+            return [true, 'последнее действие — рейтинг выпуска облигаций, а не самого эмитента'];
+        }
+
+        return [false, null];
     }
 
     /** @return array{rating: ?string, outlook: ?string, last_action_date: ?string, source: ?string, short_name: string}|null */

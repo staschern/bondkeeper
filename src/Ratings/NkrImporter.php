@@ -240,7 +240,7 @@ final class NkrImporter
     private static function describeRow(array $row, string $rating): array
     {
         $pressRelease = trim($row['Press release'] ?? '');
-        $isUrl = (bool) preg_match('~^https?://~i', $pressRelease);
+        $url = self::normalizeUrl($pressRelease);
         $outlook = trim($row['Outlook'] ?? '');
         $date = trim($row['Date'] ?? '');
 
@@ -248,11 +248,35 @@ final class NkrImporter
             . ' — рейтинг ' . ($rating !== '' ? $rating : '?')
             . ', прогноз ' . ($outlook !== '' ? $outlook : '—')
             . ', дата ' . ($date !== '' ? $date : '?');
-        if ($pressRelease !== '' && !$isUrl) {
+        if ($pressRelease !== '' && $url === null) {
             $title .= "; пресс-релиз: {$pressRelease}";
         }
 
-        return [$title, $isUrl ? $pressRelease : self::ISSUERS_PAGE_URL];
+        return [$title, $url ?? self::ISSUERS_PAGE_URL];
+    }
+
+    /**
+     * Найдено вживую (28 сентября 2026, реальный случай — «Группа «ВИС»
+     * (АО)»): колонка "Press release" у НКР иногда отдаёт адрес БЕЗ схемы
+     * ("ratings.ru/ratings/press-releases/VIS-RA-160726/", без
+     * "https://") — старая проверка `^https?://` не признавала такую
+     * строку ссылкой, в предложении подставлялся общий список эмитентов
+     * вместо настоящего пресс-релиза, а сам адрес молча уезжал в текст
+     * заголовка. Теперь распознаём ещё и голый домен+путь без схемы.
+     */
+    private static function normalizeUrl(string $value): ?string
+    {
+        if ($value === '') {
+            return null;
+        }
+        if (preg_match('~^https?://~i', $value)) {
+            return $value;
+        }
+        if (preg_match('~^[a-z0-9.-]+\.[a-z]{2,}(/.*)?$~i', $value)) {
+            return 'https://' . $value;
+        }
+
+        return null;
     }
 
     /** Отчёт о разборе выгрузки — после fetchSnapshot() (import() и сверка). */

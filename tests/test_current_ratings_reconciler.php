@@ -159,6 +159,32 @@ $nullOutlook = $reconciler->reconcile('nkr', [
 ]);
 check('null = null — не расхождение', $nullOutlook['field_mismatches'] === []);
 
+echo "--- field_mismatches: expected/reason (28 сентября 2026, тот же смысл, что у missing_in_snapshot) ---\n";
+$db->exec("INSERT INTO issuers (id, short_name) VALUES (20, 'Ручной эмитент')");
+$db->exec("INSERT INTO issuers (id, short_name) VALUES (21, 'Эмитент с рейтингом выпуска')");
+$addCr(20, 'nkr', 'A-.ru', null, '2026-09-02', 0, 'manual');
+$addCr(21, 'nkr', 'ruAA-', null, '2026-09-10', 0, 'action');
+$db->exec("INSERT INTO rating_actions (issuer_id, agency, action_date, rating_to, source_title, source_url) VALUES (21, 'nkr', '2026-09-10', 'ruAA-', 'НКР присвоило выпуску облигаций ООО «Тест» рейтинг ruAA-', 'https://ratings.ru/news/21')");
+
+$expectedResult = $reconciler->reconcile('nkr', [
+    ['issuer_id' => 20, 'issuer_name' => 'Ручной эмитент (у агентства)', 'rating' => 'A.ru', 'outlook' => 'stable', 'last_action_date' => '2026-09-02'],
+    ['issuer_id' => 21, 'issuer_name' => 'Эмитент с рейтингом выпуска (у агентства)', 'rating' => 'ruAA', 'outlook' => 'stable', 'last_action_date' => '2026-09-10'],
+]);
+check('field_mismatches: 4 расхождения (по 2 поля у каждого из 2 эмитентов)', count($expectedResult['field_mismatches']) === 4);
+foreach ($expectedResult['field_mismatches'] as $m) {
+    if ($m['issuer_id'] === 20) {
+        check("field_mismatches: source=manual (issuer 20, поле {$m['field']}) -> expected=true", $m['expected'] === true);
+        check("field_mismatches: source=manual (issuer 20, поле {$m['field']}) -> reason про ручной ввод", $m['reason'] === 'внесено вручную из xlsx');
+    } elseif ($m['issuer_id'] === 21) {
+        check("field_mismatches: рейтинг выпуска облигаций (issuer 21, поле {$m['field']}) -> expected=true", $m['expected'] === true);
+        check("field_mismatches: рейтинг выпуска облигаций (issuer 21, поле {$m['field']}) -> reason непустой", $m['reason'] !== null);
+    }
+}
+// Контроль: issuer 2 (Газпром, source=action, но заголовок про рейтинг ЭМИТЕНТА, не выпуска) -> НЕ ожидаемо.
+foreach ($result['field_mismatches'] as $m) {
+    check("field_mismatches: обычное действие по эмитенту (issuer 2, поле {$m['field']}) -> expected=false, требует внимания", $m['expected'] === false && $m['reason'] === null);
+}
+
 echo "\n";
 if ($failures === 0) {
     echo "ВСЕ {$checks} ПРОВЕРОК ПРОШЛИ.\n";

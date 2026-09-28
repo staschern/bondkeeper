@@ -101,7 +101,8 @@ tests/test_issuer_name_shortener.php — офлайн-проверка IssuerNam
 bin/backfill_issuer_short_names.php  — разовая пересборка issuers.short_name из full_name для строк, накопленных до появления IssuerNameShortener (идемпотентно, безопасно перезапускать)
 tests/test_offers_importer.php       — офлайн-проверка OffersImporter (20 проверок: выбор даты/типа оферты из bondization/offers, put/call — чистая логика, БД не нужна; даты в тесте считаются от сегодняшнего дня, П9)
 tests/test_ratings_normalizer.php    — офлайн-проверка RatingsNormalizer::isBondIssueRedemptionWithdrawal()/isBondIssueRatingTitle() (15 проверок, чистая текстовая логика, БД не нужна; П10 — формулировки без слова "выпуск")
-tests/test_current_ratings_reconciler.php — офлайн-проверка CurrentRatingsReconciler (25 проверок: сравнение с обоими названиями + applyMissingInOurs()/кейс 3 + explainMissing()/ожидаемые расхождения с причиной — MySQL-диалекта нет)
+tests/test_current_ratings_reconciler.php — офлайн-проверка CurrentRatingsReconciler (36 проверок: сравнение с обоими названиями + applyMissingInOurs()/кейс 3 + explainMissing()/explainFieldMismatch() — ожидаемые расхождения с причиной, и у missing_in_snapshot, и у field_mismatches — MySQL-диалекта нет)
+tests/test_nkr_importer_url.php      — офлайн-проверка NkrImporter::normalizeUrl()/describeRow() (13 проверок: ссылка на пресс-релиз НКР без схемы https:// теперь распознаётся, не теряется в тексте заголовка)
 tests/test_name_match_reviews.php    — офлайн-проверка NameMatchReviews (41 проверка: предложить/подтвердить/отклонить, тёзки не предлагаются)
 tests/test_snapshot_rows.php         — офлайн-проверка SnapshotRows (18 проверок: latestPerIssuer()/apply()/saveToFile()/loadFromFile())
 bin/debug_bond_redemption_ratings.php — диагностика (без записи в БД): находит уже записанные ДО фикса 17 сентября ложные "рейтинг отозван" от отзыва выпуска из-за погашения
