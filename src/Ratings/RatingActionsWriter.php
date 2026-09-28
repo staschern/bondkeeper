@@ -19,14 +19,11 @@ use PDO;
  * аудита. NULL допустим (опциональный параметр) — источник, у которого
  * гипотетически нет текстового заголовка, не должен из-за этого падать.
  *
- * $matchedByRootName (миграция 022, сентябрь 2026) — true, если issuer_id
- * получен третьим, самым неточным уровнем сопоставления
- * (IssuerMatcher::findIssuerIdByRootName() — SPV/материнская компания по
- * "корню" названия после снятия ОПФ и маркерных слов Финанс/Капитал, см.
- * докблок IssuerMatcher). Строка при этом пишется как обычно (по решению
- * пользователя — не терять данные), просто отдельно помечается для
- * последующей выборочной проверки — см. bin/seed_ratings.php, где такие
- * строки собираются в уведомление администратору.
+ * matched_by_root_name (миграция 022) всегда пишется 0: с миграции 024
+ * совпадения по названию в базу без подтверждения не попадают (см.
+ * NameMatchReviews), а подтверждённые сопоставляются уже напрямую.
+ * Запись 0 при каждом апсерте заодно снимает старую пометку, когда
+ * строка переписывается уже подтверждённым путём.
  *
  * === Событийный движок (Этап 4, сентябрь 2026) ===
  *
@@ -59,13 +56,12 @@ final class RatingActionsWriter
         ?string $outlookTo,
         ?string $sourceUrl,
         ?string $sourceTitle = null,
-        bool $matchedByRootName = false,
     ): void {
         $stmt = $this->db->prepare(
             'INSERT INTO rating_actions
                 (issuer_id, agency, action_date, rating_from, rating_to, outlook_from, outlook_to, source_url, source_title, matched_by_root_name)
              VALUES
-                (:issuer_id, :agency, :action_date, :rating_from, :rating_to, :outlook_from, :outlook_to, :source_url, :source_title, :matched_by_root_name)
+                (:issuer_id, :agency, :action_date, :rating_from, :rating_to, :outlook_from, :outlook_to, :source_url, :source_title, 0)
              ON DUPLICATE KEY UPDATE
                 rating_from = VALUES(rating_from),
                 rating_to = VALUES(rating_to),
@@ -73,7 +69,7 @@ final class RatingActionsWriter
                 outlook_to = VALUES(outlook_to),
                 source_url = VALUES(source_url),
                 source_title = VALUES(source_title),
-                matched_by_root_name = VALUES(matched_by_root_name)'
+                matched_by_root_name = 0'
         );
         $stmt->execute([
             'issuer_id' => $issuerId,
@@ -85,7 +81,6 @@ final class RatingActionsWriter
             'outlook_to' => $outlookTo,
             'source_url' => $sourceUrl !== null ? mb_substr($sourceUrl, 0, 500) : null,
             'source_title' => $sourceTitle !== null ? mb_substr($sourceTitle, 0, 500) : null,
-            'matched_by_root_name' => $matchedByRootName ? 1 : 0,
         ]);
 
         $eventId = $this->events->publishRatingAction(

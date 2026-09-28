@@ -54,25 +54,30 @@ function callPrivate(ReflectionClass $ref, object $obj, string $method, array $a
 
 // --- resolveUpcomingOfferDate(): фильтр по типу и по дате ---
 
+// П9 (сентябрь 2026): даты "в будущем" считаются от сегодняшнего дня — с
+// фиксированными датами проверки ломались сами собой, как только дата
+// проходила (одна уже падала 24.09.2026, ещё три сломались бы до конца года).
+$daysFromToday = static fn (int $days): string => (new DateTimeImmutable('today'))->modify("+{$days} days")->format('Y-m-d');
+
 // Живой пример из выборки (14 сентября 2026, iss.moex.com): "Оферта" с
 // будущей датой — берём как есть.
 $rows = [
-    ['offertype' => 'Оферта', 'offerdate' => '2026-12-01'],
+    ['offertype' => 'Оферта', 'offerdate' => $daysFromToday(60)],
 ];
 check(
     'resolveUpcomingOfferDate(): простая предстоящая "Оферта" берётся',
-    callPrivate($ref, $importer, 'resolveUpcomingOfferDate', [$rows]) === '2026-12-01'
+    callPrivate($ref, $importer, 'resolveUpcomingOfferDate', [$rows]) === $daysFromToday(60)
 );
 
 // Живой пример из выборки: "Оферта/Погашение" с реальной будущей датой
-// (RU000A10ENU1, «Банк ВТБ (ПАО) Б-1-232», offerdate=2026-09-24) — по
+// (RU000A10ENU1, «Банк ВТБ (ПАО) Б-1-232», offerdate была 2026-09-24) — по
 // прямому решению (см. докблок класса) тоже считается предстоящей офертой.
 $rows = [
-    ['offertype' => 'Оферта/Погашение', 'offerdate' => '2026-09-24'],
+    ['offertype' => 'Оферта/Погашение', 'offerdate' => $daysFromToday(10)],
 ];
 check(
     'resolveUpcomingOfferDate(): "Оферта/Погашение" с реальной датой тоже берётся',
-    callPrivate($ref, $importer, 'resolveUpcomingOfferDate', [$rows]) === '2026-09-24'
+    callPrivate($ref, $importer, 'resolveUpcomingOfferDate', [$rows]) === $daysFromToday(10)
 );
 
 // Уже состоявшиеся/отменённые/дефолтные — не предстоящие события, не берём
@@ -104,24 +109,24 @@ check(
 // Несколько предстоящих строк — берём БЛИЖАЙШУЮ, не первую по порядку и не
 // последнюю.
 $rows = [
-    ['offertype' => 'Оферта', 'offerdate' => '2027-06-01'],
-    ['offertype' => 'Оферта', 'offerdate' => '2026-11-15'],
-    ['offertype' => 'Оферта/Погашение', 'offerdate' => '2028-01-01'],
+    ['offertype' => 'Оферта', 'offerdate' => $daysFromToday(270)],
+    ['offertype' => 'Оферта', 'offerdate' => $daysFromToday(50)],
+    ['offertype' => 'Оферта/Погашение', 'offerdate' => $daysFromToday(460)],
 ];
 check(
     'resolveUpcomingOfferDate(): из нескольких предстоящих берётся ближайшая',
-    callPrivate($ref, $importer, 'resolveUpcomingOfferDate', [$rows]) === '2026-11-15'
+    callPrivate($ref, $importer, 'resolveUpcomingOfferDate', [$rows]) === $daysFromToday(50)
 );
 
 // Смесь: одна отменённая с ближайшей датой (не должна победить) + одна
 // настоящая предстоящая подальше.
 $rows = [
-    ['offertype' => 'Оферта (отменено)', 'offerdate' => '2026-10-01'],
-    ['offertype' => 'Оферта', 'offerdate' => '2026-12-25'],
+    ['offertype' => 'Оферта (отменено)', 'offerdate' => $daysFromToday(5)],
+    ['offertype' => 'Оферта', 'offerdate' => $daysFromToday(90)],
 ];
 check(
     'resolveUpcomingOfferDate(): отменённая не мешает найти настоящую предстоящую',
-    callPrivate($ref, $importer, 'resolveUpcomingOfferDate', [$rows]) === '2026-12-25'
+    callPrivate($ref, $importer, 'resolveUpcomingOfferDate', [$rows]) === $daysFromToday(90)
 );
 
 // Пустой список строк (у bondization/offers бумаги без оферт вообще) — нет

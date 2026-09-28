@@ -41,82 +41,82 @@ use PDO;
  * тексте пресс-релиза) пишет наш собственный литерал 'отозван', то один
  * и тот же эмитент мог получить РАЗНЫЙ текст в current_ratings.rating в
  * зависимости от того, какой из двух импортёров прогонялся последним
- * (оба пишут в одну и ту же строку через ON DUPLICATE KEY UPDATE) —
- * архитектурная нестыковка, не разовый баг. RatingsNormalizer::
- * normalizeWithdrawnRatingText() сводит любое написание со словом
- * "отозван" к тому же литералу, что и у NkrNewsImporter — оба импортёра
- * теперь согласованы независимо от порядка прогонов.
+ * (оба пишут в одну и ту же строку) — архитектурная нестыковка, не
+ * разовый баг. RatingsNormalizer::normalizeWithdrawnRatingText() сводит
+ * любое написание со словом "отозван" к тому же литералу, что и у
+ * NkrNewsImporter — оба импортёра согласованы независимо от порядка прогонов.
  *
- * === fetchSnapshot() — переиспользуется сверщиком (17 сентября 2026) ===
+ * === fetchSnapshot() / applySnapshot() — сверка и перезапись (сентябрь 2026) ===
  *
- * Скачивание+разбор выгрузки вынесены в отдельный публичный метод
- * fetchSnapshot() — возвращает нормализованный "снимок сейчас" БЕЗ
- * записи в БД. import() сам теперь просто пишет то, что вернул этот
- * метод. Нужно это было CurrentRatingsReconciler (см.
- * docs/STAGE3_RATINGS.md, раздел "Сверка current_ratings") — той же
- * логике скачивания и разбора, но для СРАВНЕНИЯ с current_ratings, а не
- * для слепой перезаписи. Прямой запрос пользователя: НКР — единственное
- * агентство с отдельной страницей "снимок сейчас", поэтому именно здесь
- * сверка переиспользует существующий импортёр буквально, а не
- * пересчитывает что-то заново (в отличие от НРА, см. NraImporter).
+ * fetchSnapshot() скачивает и разбирает выгрузку в нормализованный
+ * "снимок сейчас", current_ratings не трогает. Его использует и сверка
+ * (CurrentRatingsReconciler через bin/reconcile_ratings.php), и
+ * перезапись. applySnapshot() пишет снимок — свежий (import()) или
+ * проверенный на сверке и сохранённый в файл (bin/seed_ratings.php
+ * --agency=nkr --snapshot=ФАЙЛ, П2: сначала сверка, потом перезапись).
  *
- * === Второй уровень сопоставления — "по корню" названия (миграция 022) ===
+ * === Сопоставление по названию — только после подтверждения (миграция 024) ===
  *
- * По прямому запросу пользователя (сентябрь 2026): если в issuers
- * заведена только SPV (или только материнская компания), а строка
- * официальной выгрузки НКР называет ДРУГУЮ сторону — TIN не совпадёт
- * вообще (разные юрлица, разные ИНН). parseRow() пробует
- * IssuerMatcher::findIssuerIdByRootName() как fallback, только если TIN
- * не подошёл (после явной ручной связки issuer_spv_links, миграция 023
- * — приоритет выше root). Строка пишется как обычно, но с флагом
- * matched_by_root_name — собирается в getRootMatchNotices() для
- * уведомления администратора (см. bin/seed_ratings.php). Дефолтному
- * грейду ("D"/"SD") прогноз не положен — см. RatingsNormalizer::isDefaultGrade()
- * (найдено вживую на ООО «ЛКХ»).
+ * TIN → явная связка issuer_spv_links (миграция 023; так подключены
+ * матери, которых нет в issuers, — ВК, ПК «Борец», «Корпоративный центр
+ * ИКС 5», ЕВРАЗ) → NameMatchResolver. Совпадение по названию (точное или
+ * "по корню") в current_ratings без подтверждения администратора не
+ * пишется — это предложение (issuer_name_match_reviews). Живой случай:
+ * ООО «Озон» (фармацевтика) получила "по корню" рейтинг компании группы
+ * Ozon. Дефолтному грейду ("D"/"SD") прогноз не положен — см.
+ * RatingsNormalizer::isDefaultGrade() (найдено вживую на ООО «ЛКХ»).
+ *
+ * Одна строка на эмитента — SnapshotRows::latestPerIssuer() (П1): через
+ * связки несколько строк выгрузки могут прийти в один issuer_id.
  */
 final class NkrImporter
 {
+    private const AGENCY = 'nkr';
     private const EXPORT_URL = 'https://ratings.ru/issuers.php';
+    private const ISSUERS_PAGE_URL = 'https://ratings.ru/ratings/issuers/';
 
     private int $totalRows = 0;
     private int $matched = 0;
-    private int $matchedByRoot = 0;
+    private int $matchedBySpvLink = 0;
+    private int $matchedByApprovedName = 0;
+    private int $proposedByName = 0;
+    private int $collapsedDuplicates = 0;
     private int $unmatchedNoInn = 0;
     private int $unmatchedNoIssuer = 0;
     private int $skippedNoDate = 0;
     /** @var array<int, string> */
     private array $unmatchedNames = [];
-    /** @var array<int, string> заголовки для уведомления администратору о root-совпадениях (см. bin/seed_ratings.php) */
-    private array $rootMatchNotices = [];
-    private int $skippedRootPriorityConflict = 0;
-    /** @var array<int, true> issuer_id => уже сопоставлен НАПРЯМУЮ по ИНН/явной связке в ЭТОМ прогоне (см. resolveIssuerIdWithPriority()) */
+    /** @var array<int, true> issuer_id => уже сопоставлен НАПРЯМУЮ по ИНН/явной связке в ЭТОМ прогоне — по названию его не предлагаем */
     private array $innMatchedIssuerIds = [];
 
     public function __construct(
         private readonly PDO $db,
         private readonly IssuerMatcher $matcher,
+        private readonly NameMatchResolver $nameResolver,
     ) {
     }
 
     public function import(): void
     {
-        $snapshot = $this->fetchSnapshot();
-
-        foreach ($snapshot as $row) {
-            $this->writeCurrentRating($row);
-        }
-
+        $this->applySnapshot($this->fetchSnapshot());
         $this->printReport();
     }
 
     /**
+     * @param array<int, array{issuer_id: int, issuer_name: string, rating: string, outlook: ?string, last_action_date: string, source_url: ?string}> $snapshot
+     */
+    public function applySnapshot(array $snapshot): void
+    {
+        $written = SnapshotRows::apply($this->db, self::AGENCY, $snapshot);
+        Logger::info("НКР: записано строк current_ratings (source='snapshot'): {$written}");
+    }
+
+    /**
      * Скачивает и разбирает выгрузку НКР в нормализованный снимок "сейчас"
-     * — БЕЗ записи в БД. Побочный эффект: заполняет те же счётчики
-     * (matched/unmatchedNoInn/...), что и раньше заполнял import() —
-     * printReport() продолжает работать одинаково что для import(), что
-     * при вызове только этого метода.
+     * — current_ratings не трогает (пишутся только новые предложения
+     * сопоставления по названию). Одна строка на эмитента (П1).
      *
-     * @return array<int, array{issuer_id: int, issuer_name: string, rating: string, outlook: ?string, last_action_date: string, matched_by_root_name: bool}>
+     * @return array<int, array{issuer_id: int, issuer_name: string, rating: string, outlook: ?string, last_action_date: string, source_url: ?string}>
      */
     public function fetchSnapshot(): array
     {
@@ -140,26 +140,24 @@ final class NkrImporter
             }
         }
 
-        return $snapshot;
+        $unique = SnapshotRows::latestPerIssuer($snapshot);
+        $this->collapsedDuplicates = count($snapshot) - count($unique);
+
+        return $unique;
     }
 
     /**
      * @param array<string, string> $row
-     * @return array{issuer_id: int, issuer_name: string, rating: string, outlook: ?string, last_action_date: string, matched_by_root_name: bool}|null
+     * @return array{issuer_id: int, issuer_name: string, rating: string, outlook: ?string, last_action_date: string, source_url: ?string}|null
      */
     private function parseRow(array $row): ?array
     {
         $tin = $row['TIN'] ?? '';
         $issuerName = (string) ($row['Issuer Name'] ?? '');
+        $rating = RatingsNormalizer::normalizeWithdrawnRatingText($row['Rating'] ?? '');
+        [$sourceTitle, $sourceUrl] = self::describeRow($row, $rating);
 
-        ['issuerId' => $issuerId, 'matchedByRoot' => $matchedByRoot, 'skippedPriorityConflict' => $skippedPriorityConflict]
-            = $this->resolveIssuerIdWithPriority($tin, $issuerName);
-
-        if ($skippedPriorityConflict) {
-            $this->skippedRootPriorityConflict++;
-            $this->unmatchedNames[] = "{$issuerName} (TIN={$tin}) — root-совпадение проигнорировано: issuer_id уже сопоставлен напрямую по ИНН в этом же прогоне";
-            return null;
-        }
+        $issuerId = $this->resolveIssuerId($tin, $issuerName, $sourceTitle, $sourceUrl);
         if ($issuerId === null) {
             if (IssuerMatcher::normalizeInn($tin) === null) {
                 $this->unmatchedNoInn++;
@@ -177,12 +175,7 @@ final class NkrImporter
         }
 
         $this->matched++;
-        if ($matchedByRoot) {
-            $this->matchedByRoot++;
-            $this->rootMatchNotices[] = "НКР (полная сверка): «{$issuerName}» (TIN={$tin}) → issuer_id={$issuerId} (сопоставлено по корню названия, проверьте)";
-        }
 
-        $rating = RatingsNormalizer::normalizeWithdrawnRatingText($row['Rating'] ?? '');
         // Дефолтному грейду ("D"/"SD") прогноз не положен в принципе — по
         // прямому запросу пользователя (найдено вживую на ООО «ЛКХ»), см.
         // RatingsNormalizer::isDefaultGrade(). Здесь это скорее защитная
@@ -200,80 +193,76 @@ final class NkrImporter
             'rating' => $rating,
             'outlook' => $outlook,
             'last_action_date' => $lastActionDate,
-            'matched_by_root_name' => $matchedByRoot,
+            'source_url' => $sourceUrl,
         ];
     }
 
     /**
-     * Приоритет прямого сопоставления (ИНН, либо явная ручная связка
-     * issuer_spv_links — миграция 023) НАД корнем (по прямому запросу
-     * пользователя, сентябрь 2026, реальный найденный случай — АО
-     * «Аэрофьюэлз»/ООО «Аэрофьюэлз Групп»): если issuer_id уже сопоставлен
-     * прямым путём где-то раньше в ЭТОМ ЖЕ прогоне, root-совпадение на тот
-     * же issuer_id позже — игнорируется, не перезаписывает более надёжный
-     * результат. Обратный порядок (root первым, прямое совпадение вторым)
-     * безопасен сам по себе — прямое совпадение просто законно
-     * "перезапишет" root-значение позже.
-     *
-     * Вынесено отдельным методом ради офлайн-теста без завязки на
-     * MySQL-диалект INSERT — см. tests/test_root_priority_conflict.php.
-     *
-     * @return array{issuerId: ?int, matchedByRoot: bool, skippedPriorityConflict: bool}
+     * TIN → явная связка issuer_spv_links → NameMatchResolver (только
+     * подтверждённое; иначе — предложение администратору). issuer_id,
+     * уже сопоставленный напрямую в этом прогоне, по названию не
+     * предлагается (реальный случай — АО «Аэрофьюэлз»/ООО «Аэрофьюэлз
+     * Групп»). Вынесено отдельным методом ради офлайн-теста —
+     * см. tests/test_root_priority_conflict.php.
      */
-    private function resolveIssuerIdWithPriority(string $tin, string $issuerName): array
+    private function resolveIssuerId(string $tin, string $issuerName, ?string $sourceTitle, ?string $sourceUrl): ?int
     {
         $issuerId = $this->matcher->findIssuerIdByInn($tin);
         if ($issuerId === null) {
             $issuerId = $this->matcher->findIssuerIdBySpvLink($tin);
+            if ($issuerId !== null) {
+                $this->matchedBySpvLink++;
+            }
         }
         if ($issuerId !== null) {
             $this->innMatchedIssuerIds[$issuerId] = true;
-
-            return ['issuerId' => $issuerId, 'matchedByRoot' => false, 'skippedPriorityConflict' => false];
+            return $issuerId;
         }
 
-        $rootId = $this->matcher->findIssuerIdByRootName($issuerName);
-        if ($rootId !== null && isset($this->innMatchedIssuerIds[$rootId])) {
-            return ['issuerId' => null, 'matchedByRoot' => false, 'skippedPriorityConflict' => true];
+        $result = $this->nameResolver->resolve(self::AGENCY, $tin, [$issuerName], $sourceTitle, $sourceUrl, $this->innMatchedIssuerIds);
+        $this->proposedByName += $result['proposed'];
+        if ($result['issuerId'] !== null) {
+            $this->matchedByApprovedName++;
         }
 
-        return ['issuerId' => $rootId, 'matchedByRoot' => $rootId !== null, 'skippedPriorityConflict' => false];
+        return $result['issuerId'];
     }
 
-    /** @return array<int, string> тексты для админ-уведомления о совпадениях "по корню" в этом прогоне */
-    public function getRootMatchNotices(): array
+    /**
+     * Заголовок и ссылка для предложения сопоставления: у строки выгрузки
+     * нет заголовка новости, поэтому описываем саму строку, а ссылку берём
+     * из колонки "Press release" (если там адрес), иначе — список
+     * эмитентов НКР.
+     *
+     * @param array<string, string> $row
+     * @return array{0: string, 1: string}
+     */
+    private static function describeRow(array $row, string $rating): array
     {
-        return $this->rootMatchNotices;
+        $pressRelease = trim($row['Press release'] ?? '');
+        $isUrl = (bool) preg_match('~^https?://~i', $pressRelease);
+        $outlook = trim($row['Outlook'] ?? '');
+        $date = trim($row['Date'] ?? '');
+
+        $title = 'Полная выгрузка НКР: ' . trim($row['Issuer Name'] ?? '')
+            . ' — рейтинг ' . ($rating !== '' ? $rating : '?')
+            . ', прогноз ' . ($outlook !== '' ? $outlook : '—')
+            . ', дата ' . ($date !== '' ? $date : '?');
+        if ($pressRelease !== '' && !$isUrl) {
+            $title .= "; пресс-релиз: {$pressRelease}";
+        }
+
+        return [$title, $isUrl ? $pressRelease : self::ISSUERS_PAGE_URL];
     }
 
-    /** @param array{issuer_id: int, issuer_name: string, rating: string, outlook: ?string, last_action_date: string, matched_by_root_name: bool} $row */
-    private function writeCurrentRating(array $row): void
+    /** Отчёт о разборе выгрузки — после fetchSnapshot() (import() и сверка). */
+    public function printReport(): void
     {
-        $stmt = $this->db->prepare(
-            'INSERT INTO current_ratings (issuer_id, agency, rating, outlook, last_action_date, matched_by_root_name)
-             VALUES (:issuer_id, :agency, :rating, :outlook, :last_action_date, :matched_by_root_name)
-             ON DUPLICATE KEY UPDATE
-                rating = VALUES(rating),
-                outlook = VALUES(outlook),
-                last_action_date = VALUES(last_action_date),
-                matched_by_root_name = VALUES(matched_by_root_name)'
-        );
-        $stmt->execute([
-            'issuer_id' => $row['issuer_id'],
-            'agency' => 'nkr',
-            'rating' => $row['rating'],
-            'outlook' => $row['outlook'],
-            'last_action_date' => $row['last_action_date'],
-            'matched_by_root_name' => $row['matched_by_root_name'] ? 1 : 0,
-        ]);
-    }
-
-    private function printReport(): void
-    {
-        Logger::info('=== Отчёт по импорту current_ratings (НКР) ===');
+        Logger::info('=== Отчёт по current_ratings (НКР) ===');
         Logger::info("Строк обработано: {$this->totalRows}");
-        Logger::info("Сопоставлено с issuers и записано: {$this->matched} (из них по корню названия SPV/материнская компания: {$this->matchedByRoot})");
-        Logger::info("Root-совпадений проигнорировано из-за приоритета прямого сопоставления в этом же прогоне: {$this->skippedRootPriorityConflict}");
+        Logger::info("Сопоставлено с issuers: {$this->matched} (по связке issuer_spv_links: {$this->matchedBySpvLink}, по подтверждённому названию: {$this->matchedByApprovedName})");
+        Logger::info("Строк свёрнуто в одну на эмитента (самая свежая дата, П1): {$this->collapsedDuplicates}");
+        Logger::info("Новых предложений сопоставления по названию (ждут подтверждения, bin/review_matches.php): {$this->proposedByName}");
         Logger::info("Не сопоставлено (нет валидного ИНН в выгрузке): {$this->unmatchedNoInn}");
         Logger::info("Не сопоставлено (ИНН есть, но такого issuers.inn нет в базе): {$this->unmatchedNoIssuer}");
         Logger::info("Пропущено (не распознана дата): {$this->skippedNoDate}");

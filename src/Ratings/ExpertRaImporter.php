@@ -25,29 +25,31 @@ use Throwable;
  * https://raexpert.ru/ratings/ (чекбоксы с data-path), см. STAGE3_RATINGS.md
  * про то, что осталось за бортом и почему.
  *
- * === fetchSnapshot() — переиспользуется сверщиком (17 сентября 2026) ===
+ * === fetchSnapshot() / applySnapshot() — сверка и перезапись (сентябрь 2026) ===
  *
- * Обход категорий + резолв ИНН вынесены в отдельный публичный метод
- * fetchSnapshot() — возвращает нормализованный "снимок сейчас" БЕЗ
- * записи в БД. import() сам теперь просто пишет то, что вернул этот
- * метод. Как и НКР (в отличие от НРА), у Эксперт РА ЕСТЬ отдельная
- * страница "снимок сейчас" (список действующих рейтингов по категориям,
- * не история с датой начала) — CurrentRatingsReconciler переиспользует
- * этот метод буквально, см. docs/STAGE3_RATINGS.md.
+ * fetchSnapshot() обходит категории и резолвит ИНН, current_ratings не
+ * трогает — его использует и сверка (CurrentRatingsReconciler через
+ * bin/reconcile_ratings.php), и перезапись. applySnapshot() пишет снимок
+ * — свежий (import()) или проверенный на сверке и сохранённый в файл
+ * (bin/seed_ratings.php --agency=expert_ra --snapshot=ФАЙЛ, П2: сначала
+ * сверка, потом перезапись, без второго часового обхода сайта).
  *
- * === Второй уровень сопоставления — "по корню" названия (миграция 022) ===
+ * === Одна строка на эмитента (П1) ===
  *
- * По прямому запросу пользователя (сентябрь 2026): если в issuers
- * заведена только SPV (или только материнская компания), а карточка
- * компании на сайте называет ДРУГУЮ сторону — ИНН не совпадёт вообще
- * (разные юрлица). parseRow() пробует IssuerMatcher::findIssuerIdByRootName()
- * как fallback (после явной ручной связки issuer_spv_links, миграция
- * 023 — приоритет выше root), если ИНН не подошёл или карточка вообще
- * не дала ИНН. Строка пишется как обычно, но с флагом
- * matched_by_root_name — собирается в getRootMatchNotices() для
- * уведомления администратора (см. bin/seed_ratings.php). Дефолтному
- * грейду ("D"/"SD") прогноз не положен — см. RatingsNormalizer::isDefaultGrade()
- * (найдено вживую на ООО «ЛКХ», НКР).
+ * Одна компания встречается в нескольких категориях, в том числе в
+ * архиве старой категории после смены методологии (АФК Система, ПКБ,
+ * Магистраль двух столиц, ТРАНСФИН-М, Ситиматик, Россиум). Раньше
+ * побеждала категория, обработанная последней; теперь —
+ * SnapshotRows::latestPerIssuer(), самая свежая дата.
+ *
+ * === Сопоставление по названию — только после подтверждения (миграция 024) ===
+ *
+ * ИНН с карточки → явная связка issuer_spv_links (миграция 023) →
+ * NameMatchResolver. Совпадение по названию без подтверждения
+ * администратора в current_ratings не пишется — это предложение
+ * (issuer_name_match_reviews). Живой случай: ООО «Озон» (фармацевтика)
+ * получила "по корню" рейтинг ОЗОН Капитала. Дефолтному грейду
+ * ("D"/"SD") прогноз не положен — см. RatingsNormalizer::isDefaultGrade().
  */
 final class ExpertRaImporter
 {
@@ -72,46 +74,52 @@ final class ExpertRaImporter
     private int $noInnOnCard = 0;
     private int $skippedNoDate = 0;
     private int $matched = 0;
-    private int $matchedByRoot = 0;
+    private int $matchedBySpvLink = 0;
+    private int $matchedByApprovedName = 0;
+    private int $proposedByName = 0;
+    private int $collapsedDuplicates = 0;
     private int $unmatchedNoIssuer = 0;
     /** @var array<int, string> */
     private array $unmatchedNames = [];
-    /** @var array<int, string> заголовки для уведомления администратору о root-совпадениях (см. bin/seed_ratings.php) */
-    private array $rootMatchNotices = [];
-    private int $skippedRootPriorityConflict = 0;
-    /** @var array<int, true> issuer_id => уже сопоставлен НАПРЯМУЮ по ИНН/явной связке в ЭТОМ прогоне (см. resolveIssuerIdWithPriority()) */
+    /** @var array<int, true> issuer_id => уже сопоставлен НАПРЯМУЮ по ИНН/явной связке в ЭТОМ прогоне — по названию его не предлагаем */
     private array $innMatchedIssuerIds = [];
 
     /** @var array<string, string|null> card_url => ИНН|null — не ходим на одну и ту же карточку дважды за прогон */
     private array $innCache = [];
+    /** @var array<string, true> card_url, карточка которых не открылась (сеть/HTTP) */
+    private array $failedCards = [];
 
     public function __construct(
         private readonly PDO $db,
         private readonly IssuerMatcher $matcher,
         private readonly ExpertRaClient $client,
+        private readonly NameMatchResolver $nameResolver,
         private readonly int $delayMicroseconds = 400_000,
     ) {
     }
 
     public function import(): void
     {
-        $snapshot = $this->fetchSnapshot();
-
-        foreach ($snapshot as $row) {
-            $this->writeCurrentRating($row);
-        }
-
+        $this->applySnapshot($this->fetchSnapshot());
         $this->printReport();
     }
 
     /**
+     * @param array<int, array{issuer_id: int, issuer_name: string, rating: string, outlook: ?string, last_action_date: string, source_url: ?string}> $snapshot
+     */
+    public function applySnapshot(array $snapshot): void
+    {
+        $written = SnapshotRows::apply($this->db, self::AGENCY, $snapshot);
+        Logger::info("Эксперт РА: записано строк current_ratings (source='snapshot'): {$written}");
+    }
+
+    /**
      * Обходит все категории сайта + резолвит ИНН по карточке каждой
-     * компании, возвращает нормализованный снимок "сейчас" — БЕЗ записи
-     * в БД. Побочный эффект: заполняет те же счётчики, что и раньше
-     * заполнял import() — printReport() работает одинаково что для
-     * import(), что при вызове только этого метода.
+     * компании, возвращает нормализованный снимок "сейчас" — current_ratings
+     * не трогает (пишутся только новые предложения сопоставления по
+     * названию). Одна строка на эмитента (П1).
      *
-     * @return array<int, array{issuer_id: int, issuer_name: string, rating: string, outlook: ?string, last_action_date: string, matched_by_root_name: bool}>
+     * @return array<int, array{issuer_id: int, issuer_name: string, rating: string, outlook: ?string, last_action_date: string, source_url: ?string}>
      */
     public function fetchSnapshot(): array
     {
@@ -122,34 +130,32 @@ final class ExpertRaImporter
             Logger::info('  строк в категории: ' . count($rows));
 
             foreach ($rows as $row) {
-                $parsed = $this->parseRow($row);
+                $parsed = $this->parseRow($row, $label);
                 if ($parsed !== null) {
                     $snapshot[] = $parsed;
                 }
             }
         }
 
-        return $snapshot;
+        $unique = SnapshotRows::latestPerIssuer($snapshot);
+        $this->collapsedDuplicates = count($snapshot) - count($unique);
+
+        return $unique;
     }
 
     /**
      * @param array{name: string, card_url: string, rating: string, outlook: string, date: string} $row
-     * @return array{issuer_id: int, issuer_name: string, rating: string, outlook: ?string, last_action_date: string, matched_by_root_name: bool}|null
+     * @return array{issuer_id: int, issuer_name: string, rating: string, outlook: ?string, last_action_date: string, source_url: ?string}|null
      */
-    private function parseRow(array $row): ?array
+    private function parseRow(array $row, string $categoryLabel): ?array
     {
         $this->totalRows++;
 
         $inn = $this->resolveInn($row['card_url']);
+        $rating = mb_substr(trim($row['rating']), 0, 20);
+        $sourceTitle = self::describeRow($row, $rating, $categoryLabel);
 
-        ['issuerId' => $issuerId, 'matchedByRoot' => $matchedByRoot, 'skippedPriorityConflict' => $skippedPriorityConflict]
-            = $this->resolveIssuerIdWithPriority($inn, $row['name']);
-
-        if ($skippedPriorityConflict) {
-            $this->skippedRootPriorityConflict++;
-            $this->unmatchedNames[] = "{$row['name']} (ИНН=" . ($inn ?? '—') . ') — root-совпадение проигнорировано: issuer_id уже сопоставлен напрямую по ИНН в этом же прогоне';
-            return null;
-        }
+        $issuerId = $this->resolveIssuerId($inn, $row['name'], $sourceTitle, $row['card_url'], isset($this->failedCards[$row['card_url']]));
         if ($issuerId === null) {
             $this->unmatchedNoIssuer++;
             $this->unmatchedNames[] = "{$row['name']} (ИНН=" . ($inn ?? '—') . ')';
@@ -163,12 +169,7 @@ final class ExpertRaImporter
         }
 
         $this->matched++;
-        if ($matchedByRoot) {
-            $this->matchedByRoot++;
-            $this->rootMatchNotices[] = "Эксперт РА (полная сверка): «{$row['name']}» → issuer_id={$issuerId} (сопоставлено по корню названия, проверьте)";
-        }
 
-        $rating = mb_substr(trim($row['rating']), 0, 20);
         // Дефолтному грейду ("D"/"SD") прогноз не положен в принципе — по
         // прямому запросу пользователя (найдено вживую на ООО «ЛКХ», НКР),
         // см. RatingsNormalizer::isDefaultGrade(). Защитная сетка для
@@ -182,65 +183,61 @@ final class ExpertRaImporter
             'rating' => $rating,
             'outlook' => $outlook,
             'last_action_date' => $date,
-            'matched_by_root_name' => $matchedByRoot,
+            'source_url' => $row['card_url'] !== '' ? $row['card_url'] : null,
         ];
     }
 
     /**
-     * Приоритет прямого сопоставления (ИНН, либо явная ручная связка
-     * issuer_spv_links — миграция 023) НАД корнем — см. подробное
-     * объяснение в NkrImporter::resolveIssuerIdWithPriority() (тот же
-     * приём, вынесено отдельным методом ради офлайн-теста без завязки на
-     * MySQL-диалект INSERT, см. tests/test_root_priority_conflict.php).
-     *
-     * @return array{issuerId: ?int, matchedByRoot: bool, skippedPriorityConflict: bool}
+     * ИНН → явная связка issuer_spv_links → NameMatchResolver (только
+     * подтверждённое; иначе — предложение администратору). См.
+     * NkrImporter::resolveIssuerId(). Если карточка не открылась, ИНН мы
+     * просто не увидели — тогда только уже подтверждённое название, без
+     * новых предложений.
      */
-    private function resolveIssuerIdWithPriority(?string $inn, string $companyName): array
+    private function resolveIssuerId(?string $inn, string $companyName, ?string $sourceTitle, ?string $sourceUrl, bool $cardFailed): ?int
     {
         $issuerId = $inn !== null ? $this->matcher->findIssuerIdByInn($inn) : null;
         if ($issuerId === null && $inn !== null) {
             $issuerId = $this->matcher->findIssuerIdBySpvLink($inn);
+            if ($issuerId !== null) {
+                $this->matchedBySpvLink++;
+            }
         }
         if ($issuerId !== null) {
             $this->innMatchedIssuerIds[$issuerId] = true;
-
-            return ['issuerId' => $issuerId, 'matchedByRoot' => false, 'skippedPriorityConflict' => false];
+            return $issuerId;
         }
 
-        $rootId = $this->matcher->findIssuerIdByRootName($companyName);
-        if ($rootId !== null && isset($this->innMatchedIssuerIds[$rootId])) {
-            return ['issuerId' => null, 'matchedByRoot' => false, 'skippedPriorityConflict' => true];
+        if ($cardFailed) {
+            $issuerId = $this->nameResolver->findApproved(null, [$companyName]);
+        } else {
+            $result = $this->nameResolver->resolve(self::AGENCY, $inn, [$companyName], $sourceTitle, $sourceUrl, $this->innMatchedIssuerIds);
+            $this->proposedByName += $result['proposed'];
+            $issuerId = $result['issuerId'];
+        }
+        if ($issuerId !== null) {
+            $this->matchedByApprovedName++;
         }
 
-        return ['issuerId' => $rootId, 'matchedByRoot' => $rootId !== null, 'skippedPriorityConflict' => false];
+        return $issuerId;
     }
 
-    /** @return array<int, string> тексты для админ-уведомления о совпадениях "по корню" в этом прогоне */
-    public function getRootMatchNotices(): array
+    /**
+     * Заголовок для предложения сопоставления: у строки списка нет
+     * заголовка новости, поэтому описываем саму строку; ссылка — карточка
+     * компании на raexpert.ru.
+     *
+     * @param array{name: string, card_url: string, rating: string, outlook: string, date: string} $row
+     */
+    private static function describeRow(array $row, string $rating, string $categoryLabel): string
     {
-        return $this->rootMatchNotices;
-    }
+        $outlook = trim($row['outlook']);
+        $date = trim($row['date']);
 
-    /** @param array{issuer_id: int, issuer_name: string, rating: string, outlook: ?string, last_action_date: string, matched_by_root_name: bool} $row */
-    private function writeCurrentRating(array $row): void
-    {
-        $stmt = $this->db->prepare(
-            'INSERT INTO current_ratings (issuer_id, agency, rating, outlook, last_action_date, matched_by_root_name)
-             VALUES (:issuer_id, :agency, :rating, :outlook, :last_action_date, :matched_by_root_name)
-             ON DUPLICATE KEY UPDATE
-                rating = VALUES(rating),
-                outlook = VALUES(outlook),
-                last_action_date = VALUES(last_action_date),
-                matched_by_root_name = VALUES(matched_by_root_name)'
-        );
-        $stmt->execute([
-            'issuer_id' => $row['issuer_id'],
-            'agency' => self::AGENCY,
-            'rating' => $row['rating'],
-            'outlook' => $row['outlook'],
-            'last_action_date' => $row['last_action_date'],
-            'matched_by_root_name' => $row['matched_by_root_name'] ? 1 : 0,
-        ]);
+        return "Полная выгрузка Эксперт РА (категория «{$categoryLabel}»): {$row['name']}"
+            . ' — рейтинг ' . ($rating !== '' ? $rating : '?')
+            . ', прогноз ' . ($outlook !== '' ? $outlook : '—')
+            . ', дата ' . ($date !== '' ? $date : '?');
     }
 
     private function resolveInn(string $cardUrl): ?string
@@ -255,6 +252,7 @@ final class ExpertRaImporter
             $rawInn = $this->client->fetchCompanyInn($cardUrl);
         } catch (Throwable $e) {
             $this->cardFetchFailed++;
+            $this->failedCards[$cardUrl] = true;
             Logger::warn("Эксперт РА: не удалось получить карточку {$cardUrl}: {$e->getMessage()}");
             $this->innCache[$cardUrl] = null;
             return null;
@@ -269,16 +267,18 @@ final class ExpertRaImporter
         return $inn;
     }
 
-    private function printReport(): void
+    /** Отчёт о разборе сайта — после fetchSnapshot() (import() и сверка). */
+    public function printReport(): void
     {
-        Logger::info('=== Отчёт по импорту current_ratings (Эксперт РА) ===');
+        Logger::info('=== Отчёт по current_ratings (Эксперт РА) ===');
         Logger::info("Строк обработано (по всем категориям): {$this->totalRows}");
         Logger::info('Уникальных карточек компаний запрошено: ' . count($this->innCache));
         Logger::info("  - карточка не открылась (ошибка сети/HTTP): {$this->cardFetchFailed}");
         Logger::info("  - карточка открылась, но ИНН на ней нет (иностранное юрлицо и т.п.): {$this->noInnOnCard}");
-        Logger::info("Сопоставлено с issuers и записано: {$this->matched} (из них по корню названия SPV/материнская компания: {$this->matchedByRoot})");
-        Logger::info("Root-совпадений проигнорировано из-за приоритета прямого сопоставления в этом же прогоне: {$this->skippedRootPriorityConflict}");
-        Logger::info("Не сопоставлено (ИНН есть, но такого issuers.inn нет в базе): {$this->unmatchedNoIssuer}");
+        Logger::info("Сопоставлено с issuers: {$this->matched} (по связке issuer_spv_links: {$this->matchedBySpvLink}, по подтверждённому названию: {$this->matchedByApprovedName})");
+        Logger::info("Строк свёрнуто в одну на эмитента (дубли по категориям, самая свежая дата, П1): {$this->collapsedDuplicates}");
+        Logger::info("Новых предложений сопоставления по названию (ждут подтверждения, bin/review_matches.php): {$this->proposedByName}");
+        Logger::info("Не сопоставлено: {$this->unmatchedNoIssuer}");
         Logger::info("Пропущено (не распознана дата): {$this->skippedNoDate}");
         if ($this->unmatchedNames !== []) {
             Logger::info('Не сопоставленные эмитенты: ' . implode('; ', array_slice($this->unmatchedNames, 0, 30)));

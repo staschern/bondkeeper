@@ -99,6 +99,48 @@ check(
     ) === true
 );
 
+// --- П10 (сентябрь 2026): формулировки БЕЗ слова "выпуск" ---
+check(
+    'П10: "рейтинг облигаций ... погашением" без слова "выпуск" -> true',
+    RatingsNormalizer::isBondIssueRedemptionWithdrawal(
+        'НКР отозвало кредитный рейтинг облигаций ООО «Y» серии 001P-01 в связи с их погашением'
+    ) === true
+);
+check(
+    'П10: "рейтинги биржевых облигаций" + "погашены" -> true',
+    RatingsNormalizer::isBondIssueRedemptionWithdrawal(
+        '«Эксперт РА» отозвал рейтинги биржевых облигаций ПАО «Х», так как они погашены'
+    ) === true
+);
+check(
+    'П10: "рейтинг по облигациям" + "погашением" -> true',
+    RatingsNormalizer::isBondIssueRedemptionWithdrawal(
+        'АКРА отозвало рейтинг по облигациям АО «Z» в связи с погашением'
+    ) === true
+);
+
+// --- isBondIssueRatingTitle(): рейтинг выпуска/облигаций, а не эмитента (П3, сверка) ---
+check(
+    'isBondIssueRatingTitle: "присвоил рейтинги облигациям серий" (ВСК, Эксперт РА) -> true',
+    RatingsNormalizer::isBondIssueRatingTitle(
+        '«Эксперт РА» присвоил рейтинги облигациям САО «ВСК» серий 001Р-02R, 001Р-03R, 001Р-04R'
+    ) === true
+);
+check(
+    'isBondIssueRatingTitle: "рейтинг выпуску облигаций" (Мэйл.Ру Финанс, НКР) -> true',
+    RatingsNormalizer::isBondIssueRatingTitle(
+        'НКР присвоило выпуску облигаций ООО «Мэйл.Ру Финанс» серии 001P-04 кредитный рейтинг AA.ru'
+    ) === true
+);
+check(
+    'isBondIssueRatingTitle: рейтинг эмитента -> false',
+    RatingsNormalizer::isBondIssueRatingTitle('НКР повысило кредитный рейтинг ПАО «Х» до AA.ru, прогноз стабильный') === false
+);
+check(
+    'isBondIssueRatingTitle: "эмитент облигаций" в названии компании не делает рейтинг рейтингом выпуска -> false',
+    RatingsNormalizer::isBondIssueRatingTitle('АКРА подтвердило кредитный рейтинг ООО «Специализированный финансовый эмитент облигаций» на уровне A(RU)') === false
+);
+
 echo "\n";
 if ($failures === 0) {
     echo "ВСЕ {$checks} ПРОВЕРОК ПРОШЛИ.\n";

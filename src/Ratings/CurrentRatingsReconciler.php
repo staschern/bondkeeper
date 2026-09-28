@@ -18,67 +18,50 @@ use PDO;
  * СРАВНЕНИЕ уже готового нормализованного "снимка сейчас" (агентство-
  * независимый формат) с тем, что лежит в `current_ratings`. Получение
  * снимка — забота вызывающего кода (bin/reconcile_ratings.php):
- *   - НКР — единственное агентство с отдельной страницей "снимок
- *     сейчас" (issuers.php) — переиспользует NkrImporter::fetchSnapshot()
- *     буквально, только БЕЗ записи в БД.
+ *   - НКР, Эксперт РА — fetchSnapshot() соответствующего импортёра.
+ *   - АКРА — AcraImporter::readSnapshotFromFile() (П7, JSON-файл).
  *   - НРА — истории с 2020 года, отдельного снимка нет — "сейчас"
  *     пересчитывается как последняя по дате строка НА КАЖДОГО ЭМИТЕНТА
  *     среди строк NraImporter::fetchCreditRatingCandidates().
  *
- * Расхождение НЕ чинится автоматически, даже когда однозначно понятно,
- * какое значение "правильное" — решение пользователя: расхождение почти
- * всегда сигнал реальной проблемы выше по цепочке (пропущенное или
- * неправильно разобранное действие в *NewsImporter), а не просто
- * "устаревшие данные" — молчаливая перезапись замаскировала бы саму
- * проблему, а не только её симптом. Отчёт — первый шаг, автоматическое
- * исправление осознанно не реализовано.
+ * Расхождение НЕ чинится автоматически — решение пользователя:
+ * расхождение почти всегда сигнал реальной проблемы выше по цепочке.
+ * Сначала человек смотрит отчёт, потом сам запускает перезапись
+ * сохранённым снимком (П2, см. bin/reconcile_ratings.php).
  *
  * Три вида расхождений в отчёте:
  *   1. field_mismatches — эмитент есть и там, и там, но какое-то поле
- *      (rating/outlook/last_action_date) отличается.
+ *      (rating/outlook/last_action_date) отличается. В строке — оба
+ *      названия: наше (issuers.short_name) и у агентства (П14: раньше
+ *      печаталось только название агентства, и фармацевтическая «Озон»
+ *      выглядела в отчёте как «ОЗОН Банк»), источник нашего значения и,
+ *      если оно из новости, — заголовок и ссылка этой новости.
  *   2. missing_in_ours — агентство знает эмитента, у нас в
  *      current_ratings для этой пары (issuer_id, agency) нет строки
- *      вообще (ни разу не сихронизировался, или ошибка сопоставления).
+ *      вообще.
  *   3. missing_in_snapshot — у нас есть строка current_ratings для этой
- *      пары, но свежий снимок агентства этого эмитента не содержит —
- *      либо агентство сняло рейтинг и убрало из списка целиком (у НКР
- *      возможно: полное отсутствие в issuers.php), либо сбой самого
- *      снимка (не стоит принимать этот вид расхождения за чистую монету
- *      без проверки — источник мог просто не отдать часть строк).
+ *      пары, но свежий снимок агентства этого эмитента не содержит.
+ *      Делится на "ожидаемые" (с причиной) и "требуют внимания".
  *
- * === Кейс 3 — автодобавление missing_in_ours (сентябрь 2026) ===
+ * === Ожидаемые missing_in_snapshot (П3, сентябрь 2026) ===
  *
- * По прямому запросу пользователя (реальный найденный случай: ПАО «МТС»,
- * issuer_id=62, nkr — запись была удалена более ранним скриптом чистки
- * шумных "отзывов рейтинга выпуска облигаций", см. bin/
- * fix_bond_redemption_ratings.php): "если появился новый эмитент у
- * агентства, которого ранее не было в БД, то добавить" — в отличие от
- * field_mismatches (реальный сигнал проблемы выше по цепочке, чинить не
- * пытаемся), отсутствие строки ЦЕЛИКОМ — как раз тот случай, где нечего
- * терять: применяется через applyMissingInOurs() ниже, ОТДЕЛЬНЫМ явным
- * вызовом (не автоматически внутри reconcile()), см. bin/
- * reconcile_ratings.php --apply-missing.
- *
- * === Кейс 5b — "ожидаемые" missing_in_snapshot (сентябрь 2026) ===
- *
- * Реальный найденный случай: АО «Аэрофьюэлз» (issuer_id=1561) — у нас
- * есть рейтинг, полученный когда-то из СТАРОЙ новости, называвшей SPV
- * (ООО «Аэрофьюэлз Групп»), а не саму материнскую компанию — актуальный
- * снимок агентства эту SPV-строку не содержит (агентство рейтингует
- * именно SPV, не материнскую компанию, под её собственным именем). По
- * решению пользователя: "менять не нужно ничего... ввести два уровня
- * проверки. Первый как сейчас, а второй по новостям (откуда мы его и
- * взяли)" — вторым уровнем здесь служит ДОСТУПНЫЙ уже сейчас сигнал:
- * matched_by_root_name=1 (строка получена через третий/четвёртый уровень
- * сопоставления, миграция 022) ИЛИ issuer_id — цель явной ручной связки
- * issuer_spv_links (миграция 023). Оба сигнала помечают строку как
- * 'expected' => true в missing_in_snapshot — ожидаемое расхождение,
- * а не сбой снимка. ИЗВЕСТНЫЙ пробел: строки, полученные СТАРЫМ
- * механизмом (составное действие в заголовке + точное имя в кавычках, до
- * появления root-сопоставления вообще — реальный случай самого
- * Аэрофьюэлз) не подхватываются этим флагом задним числом
- * (matched_by_root_name=0 для них) — сознательно не переписываем старые
- * флаги ради этого, см. docs/STAGE3_RATINGS.md.
+ * Разбор сверки от 20.09 показал: все 12 "нет в снимке" были ожидаемыми
+ * — 7 внесены вручную из xlsx, 5 — рейтинги выпусков облигаций из
+ * новостей (агентство рейтингует облигации компании или её мать, а не
+ * саму компанию). Причины, по которым строка считается ожидаемой
+ * (explainMissing()):
+ *   - source='manual' — внесено вручную (миграция 025);
+ *   - рейтинг 'отозван' — отозванных нет в списке действующих
+ *     (решение пользователя: храним, ограничений по времени нет, П6);
+ *   - issuer_id — цель связки issuer_spv_links (рейтинг приходит через
+ *     ИНН другой компании);
+ *   - issuer_id — цель подтверждённого сопоставления по названию
+ *     (issuer_name_match_reviews, источник без ИНН);
+ *   - последнее рейтинговое действие по этой паре — рейтинг выпуска
+ *     облигаций (RatingsNormalizer::isBondIssueRatingTitle()).
+ * Строка со старым флагом matched_by_root_name=1 больше НЕ считается
+ * ожидаемой — сопоставление "по корню" дало ложные совпадения (Озон,
+ * Прогресс), такие строки выводятся в "требуют внимания" с пометкой.
  */
 final class CurrentRatingsReconciler
 {
@@ -91,9 +74,9 @@ final class CurrentRatingsReconciler
      * @param array<int, array{issuer_id: int, issuer_name: string, rating: string, outlook: ?string, last_action_date: string}> $snapshot
      * @return array{
      *     snapshot_count: int,
-     *     field_mismatches: array<int, array{issuer_id: int, issuer_name: string, field: string, ours: ?string, theirs: ?string}>,
-     *     missing_in_ours: array<int, array{issuer_id: int, issuer_name: string, rating: string, outlook: ?string, last_action_date: string}>,
-     *     missing_in_snapshot: array<int, array{issuer_id: int, issuer_name: string, ours: ?string, expected: bool}>
+     *     field_mismatches: array<int, array{issuer_id: int, our_name: string, agency_name: string, field: string, ours: ?string, theirs: ?string, our_source: ?string, our_action_title: ?string, our_action_url: ?string}>,
+     *     missing_in_ours: array<int, array{issuer_id: int, our_name: string, agency_name: string, rating: string, outlook: ?string, last_action_date: string}>,
+     *     missing_in_snapshot: array<int, array{issuer_id: int, our_name: string, ours: ?string, last_action_date: ?string, source: ?string, expected: bool, reason: ?string, note: ?string}>
      * }
      */
     public function reconcile(string $agency, array $snapshot): array
@@ -106,16 +89,14 @@ final class CurrentRatingsReconciler
             $snapshotIssuerIds[$row['issuer_id']] = true;
             $ours = $this->fetchOurs($row['issuer_id'], $agency);
 
-            if ($ours['rating'] === null && $ours['last_action_date'] === null) {
-                // current_ratings.rating — NOT NULL в схеме: обе NULL
-                // одновременно возможны ТОЛЬКО когда строки для этой пары
-                // нет вообще, не как значение реальной строки. Сохраняем
-                // готовые значения из снимка целиком (не только issuer_id/
-                // issuer_name) — ради applyMissingInOurs() ниже (кейс 3),
-                // чтобы не запрашивать снимок заново.
+            if ($ours === null) {
+                // Сохраняем готовые значения из снимка целиком — ради
+                // applyMissingInOurs() (кейс 3), чтобы не запрашивать
+                // снимок заново.
                 $missingInOurs[] = [
                     'issuer_id' => $row['issuer_id'],
-                    'issuer_name' => $row['issuer_name'],
+                    'our_name' => $this->issuerName($row['issuer_id']),
+                    'agency_name' => $row['issuer_name'],
                     'rating' => $row['rating'],
                     'outlook' => $row['outlook'],
                     'last_action_date' => $row['last_action_date'],
@@ -123,42 +104,56 @@ final class CurrentRatingsReconciler
                 continue;
             }
 
+            $lastAction = null;
             foreach (['rating', 'outlook', 'last_action_date'] as $field) {
-                if ($ours[$field] !== $row[$field]) {
-                    $fieldMismatches[] = [
-                        'issuer_id' => $row['issuer_id'],
-                        'issuer_name' => $row['issuer_name'],
-                        'field' => $field,
-                        'ours' => $ours[$field],
-                        'theirs' => $row[$field],
-                    ];
+                if ($ours[$field] === $row[$field]) {
+                    continue;
                 }
+                if ($ours['source'] === 'action' && $lastAction === null) {
+                    $lastAction = $this->fetchLastAction($row['issuer_id'], $agency) ?? ['source_title' => null, 'source_url' => null];
+                }
+                $fieldMismatches[] = [
+                    'issuer_id' => $row['issuer_id'],
+                    'our_name' => $ours['short_name'],
+                    'agency_name' => $row['issuer_name'],
+                    'field' => $field,
+                    'ours' => $ours[$field],
+                    'theirs' => $row[$field],
+                    'our_source' => $ours['source'],
+                    'our_action_title' => $lastAction['source_title'] ?? null,
+                    'our_action_url' => $lastAction['source_url'] ?? null,
+                ];
             }
         }
 
         $missingInSnapshot = [];
-        // matched_by_root_name (миграция 022) и присутствие в
-        // issuer_spv_links (миграция 023) — оба сигнала "эта строка была
-        // получена через SPV/материнскую замену сопоставления, а не
-        // напрямую" — см. докблок класса, кейс 5b.
         $stmt = $this->db->prepare(
-            'SELECT cr.issuer_id, i.short_name, cr.rating, cr.matched_by_root_name,
-                    EXISTS(SELECT 1 FROM issuer_spv_links l WHERE l.issuer_id = cr.issuer_id) AS has_spv_link
+            'SELECT cr.issuer_id, i.short_name, cr.rating, cr.last_action_date, cr.source, cr.matched_by_root_name
              FROM current_ratings cr
              JOIN issuers i ON i.id = cr.issuer_id
-             WHERE cr.agency = :agency'
+             WHERE cr.agency = :agency
+             ORDER BY cr.issuer_id'
         );
         $stmt->execute(['agency' => $agency]);
         foreach ($stmt->fetchAll() as $row) {
             $issuerId = (int) $row['issuer_id'];
-            if (!isset($snapshotIssuerIds[$issuerId])) {
-                $missingInSnapshot[] = [
-                    'issuer_id' => $issuerId,
-                    'issuer_name' => (string) $row['short_name'],
-                    'ours' => $row['rating'],
-                    'expected' => (bool) $row['matched_by_root_name'] || (bool) $row['has_spv_link'],
-                ];
+            if (isset($snapshotIssuerIds[$issuerId])) {
+                continue;
             }
+
+            $reason = $this->explainMissing($issuerId, $agency, $row);
+            $missingInSnapshot[] = [
+                'issuer_id' => $issuerId,
+                'our_name' => (string) $row['short_name'],
+                'ours' => $row['rating'],
+                'last_action_date' => $row['last_action_date'],
+                'source' => $row['source'],
+                'expected' => $reason !== null,
+                'reason' => $reason,
+                'note' => (bool) $row['matched_by_root_name']
+                    ? 'строка получена старым сопоставлением «по корню» названия — проверьте, та ли это компания'
+                    : null,
+            ];
         }
 
         return [
@@ -179,31 +174,25 @@ final class CurrentRatingsReconciler
      * (issuer_id, agency), для которых строки ЕЩЁ не существует;
      * конфликт первичного ключа тут означал бы гонку с параллельным
      * прогоном импортёра — пусть тогда упадёт явной ошибкой, а не молча
-     * перезапишет чужую более свежую запись. НЕ покрывает случай
-     * "эмитента вообще нет в issuers" — такие строки никогда не попадают
-     * в снимок (см. докблок класса), отдельная более сложная задача.
+     * перезапишет чужую более свежую запись.
      *
-     * ИСКЛЮЧЕНИЕ (найдено вживую 19 сентября 2026, Эксперт РА, ООО «Озон
-     * Капитал»/issuer_id=1442): одна и та же пара (issuer_id, agency)
-     * может встретиться в $missingInOurs НЕСКОЛЬКО РАЗ — сайт агентства
-     * отдал ОДНУ компанию под РАЗНЫМИ именами в разных категориях (после
-     * переименования юрлица старая категорийная карточка не убрана, либо
-     * баг самого сайта), root/ИНН-сопоставление резолвит оба варианта в
-     * один issuer_id. Конфликт ПЕРВИЧНОГО КЛЮЧА (SQLSTATE 23000) в этом
-     * случае — не гонка, а ожидаемое повторение: пропускаем повторную
-     * строку (первая с этим issuer_id уже записана), не роняем весь
-     * прогон и продолжаем со следующими строками missing_in_ours. Любая
-     * ДРУГАЯ ошибка БД (обрыв соединения и т.п.) пробрасывается дальше,
-     * не глотается.
+     * source='reconcile', matched_by_root_name=0 (П8): снимок больше не
+     * содержит строк, сопоставленных "по корню" (только ИНН, связка и
+     * подтверждённое название), терять флаг нечего.
      *
-     * @param array<int, array{issuer_id: int, issuer_name: string, rating: string, outlook: ?string, last_action_date: string}> $missingInOurs
-     * @return int сколько строк реально записано (может быть меньше count($missingInOurs) — см. выше)
+     * Конфликт первичного ключа (SQLSTATE 23000) при повторе одного
+     * issuer_id в списке не роняет прогон — повтор пропускается. Снимки
+     * теперь сами сворачиваются до одной строки на эмитента
+     * (SnapshotRows::latestPerIssuer()), так что это страховка.
+     *
+     * @param array<int, array{issuer_id: int, rating: string, outlook: ?string, last_action_date: string}> $missingInOurs
+     * @return int сколько строк реально записано
      */
     public function applyMissingInOurs(string $agency, array $missingInOurs): int
     {
         $stmt = $this->db->prepare(
-            'INSERT INTO current_ratings (issuer_id, agency, rating, outlook, last_action_date)
-             VALUES (:issuer_id, :agency, :rating, :outlook, :last_action_date)'
+            "INSERT INTO current_ratings (issuer_id, agency, rating, outlook, last_action_date, matched_by_root_name, source)
+             VALUES (:issuer_id, :agency, :rating, :outlook, :last_action_date, 0, 'reconcile')"
         );
 
         $count = 0;
@@ -227,17 +216,96 @@ final class CurrentRatingsReconciler
         return $count;
     }
 
-    /** @return array{rating: ?string, outlook: ?string, last_action_date: ?string} */
-    private function fetchOurs(int $issuerId, string $agency): array
+    /**
+     * @param array{rating: ?string, source: ?string} $row
+     * @return string|null причина, по которой отсутствие в снимке ожидаемо; null — требует внимания
+     */
+    private function explainMissing(int $issuerId, string $agency, array $row): ?string
+    {
+        if ($row['source'] === 'manual') {
+            return 'внесено вручную из xlsx — агентство рейтингует облигации компании или её мать, а не саму компанию';
+        }
+        if ($row['rating'] === 'отозван') {
+            return 'рейтинг отозван — в списке действующих его и не должно быть';
+        }
+
+        $link = $this->db->prepare('SELECT spv_inn, spv_name FROM issuer_spv_links WHERE issuer_id = :issuer_id ORDER BY spv_inn');
+        $link->execute(['issuer_id' => $issuerId]);
+        $links = $link->fetchAll();
+        if ($links !== []) {
+            $names = array_map(
+                static fn (array $l): string => trim(($l['spv_name'] ?? '') . ' (ИНН ' . $l['spv_inn'] . ')'),
+                $links,
+            );
+            return 'рейтинг приходит через ИНН связанной компании: ' . implode(', ', $names)
+                . ' — её нет в текущем списке агентства';
+        }
+
+        $approved = $this->db->prepare(
+            "SELECT source_name FROM issuer_name_match_reviews
+             WHERE issuer_id = :issuer_id AND source_key_type = 'name' AND status = 'approved'
+             ORDER BY id LIMIT 1"
+        );
+        $approved->execute(['issuer_id' => $issuerId]);
+        $approvedName = $approved->fetchColumn();
+        if ($approvedName !== false) {
+            return "подтверждённое сопоставление по названию «{$approvedName}» (источник без ИНН)";
+        }
+
+        $lastAction = $this->fetchLastAction($issuerId, $agency);
+        if ($lastAction !== null && RatingsNormalizer::isBondIssueRatingTitle((string) $lastAction['source_title'])) {
+            return 'последнее действие — рейтинг выпуска облигаций: «' . $lastAction['source_title'] . '»'
+                . (($lastAction['source_url'] ?? '') !== '' ? ' ' . $lastAction['source_url'] : '');
+        }
+
+        return null;
+    }
+
+    /** @return array{rating: ?string, outlook: ?string, last_action_date: ?string, source: ?string, short_name: string}|null */
+    private function fetchOurs(int $issuerId, string $agency): ?array
     {
         $stmt = $this->db->prepare(
-            'SELECT rating, outlook, last_action_date FROM current_ratings WHERE issuer_id = :issuer_id AND agency = :agency'
+            'SELECT cr.rating, cr.outlook, cr.last_action_date, cr.source, i.short_name
+             FROM current_ratings cr
+             LEFT JOIN issuers i ON i.id = cr.issuer_id
+             WHERE cr.issuer_id = :issuer_id AND cr.agency = :agency'
+        );
+        $stmt->execute(['issuer_id' => $issuerId, 'agency' => $agency]);
+        $row = $stmt->fetch();
+        if ($row === false) {
+            return null;
+        }
+
+        return [
+            'rating' => $row['rating'],
+            'outlook' => $row['outlook'],
+            'last_action_date' => $row['last_action_date'],
+            'source' => $row['source'],
+            'short_name' => (string) ($row['short_name'] ?? ''),
+        ];
+    }
+
+    /** @return array{source_title: ?string, source_url: ?string}|null */
+    private function fetchLastAction(int $issuerId, string $agency): ?array
+    {
+        $stmt = $this->db->prepare(
+            'SELECT source_title, source_url FROM rating_actions
+             WHERE issuer_id = :issuer_id AND agency = :agency
+             ORDER BY action_date DESC
+             LIMIT 1'
         );
         $stmt->execute(['issuer_id' => $issuerId, 'agency' => $agency]);
         $row = $stmt->fetch();
 
-        return $row !== false
-            ? ['rating' => $row['rating'], 'outlook' => $row['outlook'], 'last_action_date' => $row['last_action_date']]
-            : ['rating' => null, 'outlook' => null, 'last_action_date' => null];
+        return $row !== false ? ['source_title' => $row['source_title'], 'source_url' => $row['source_url']] : null;
+    }
+
+    private function issuerName(int $issuerId): string
+    {
+        $stmt = $this->db->prepare('SELECT short_name FROM issuers WHERE id = :id');
+        $stmt->execute(['id' => $issuerId]);
+        $name = $stmt->fetchColumn();
+
+        return $name !== false ? (string) $name : '';
     }
 }

@@ -98,30 +98,25 @@ use PDO;
  *
  * НКР в заголовке часто явно называет и операционную компанию, и её
  * SPV/облигации в одном действии ("НКР подтвердило кредитные рейтинги
- * ООО «ПК Борец» и облигаций ООО «Борец Капитал» на уровне A-.ru») —
- * первичное лицо сопоставляется по ИНН со страницы пресс-релиза
- * (надёжно), остальные названия в кавычках заголовка — запасным путём,
- * по точному совпадению имени (IssuerMatcher::findIssuerIdByName).
- * Строка в rating_actions пишется на КАЖДЫЙ различный сопоставившийся
- * issuer_id, для которого нашёлся rating_to (см. выше про "изменило") —
- * оба есть в БД → 2 строки с одинаковым rating_to/outlook_to; только
- * один (любой) → 1 строка; ни одного (или ни для одного не нашёлся
- * rating_to) → в rating_news_log со статусом skipped_unmatched/
- * skipped_no_grade (см. resolveIssuerIds()).
+ * ООО «ПК Борец» и облигаций ООО «Борец Капитал» на уровне A-.ru") —
+ * первичное лицо сопоставляется по ИНН со страницы пресс-релиза (или
+ * через явную связку issuer_spv_links, миграция 023), остальные названия
+ * в кавычках — через NameMatchResolver. Строка в rating_actions пишется
+ * на КАЖДЫЙ различный сопоставившийся issuer_id, для которого нашёлся
+ * rating_to (см. выше про "изменило"); ни одного → rating_news_log со
+ * статусом skipped_unmatched/skipped_no_grade (см. resolveIssuerIds()).
  *
- * === Третий уровень — "по корню" названия, для SPV (миграция 022) ===
+ * === Сопоставление по названию — только после подтверждения (миграция 024) ===
  *
- * Составные действия выше решают только случай "агентство САМО назвало
- * обе стороны в одном заголовке". По прямому запросу пользователя
- * (сентябрь 2026) добавлен более общий случай: в issuers заведена только
- * ОДНА сторона (например, только SPV «Х Финанс»), а заголовок называет
- * ТОЛЬКО ДРУГУЮ («Х») — ни ИНН, ни точное имя не находят такую строку.
- * Если ни один candidate не сопоставился выше вообще — пробуем явную
- * ручную связку issuer_spv_links (миграция 023), а если и она не
- * подошла — IssuerMatcher::findIssuerIdByRootName() для каждого названия
- * в кавычках. Строка пишется как обычно, но с флагом matched_by_root_name
- * — самый неточный из уровней, отдельно собирается в уведомление
- * администратору (getRootMatchNotices(), см. bin/seed_ratings.php).
+ * Решение пользователя (сентябрь 2026): совпадение по названию (точное
+ * имя или "по корню") в базу без его подтверждения не пишется — оно
+ * становится предложением (NameMatchReviews), которое уходит
+ * администратору с заголовком и ссылкой на пресс-релиз. ИНН со страницы
+ * релиза принадлежит ПЕРВОЙ названной компании, поэтому для однозначной
+ * привязки он передаётся в предложение, только если в заголовке одно
+ * название; в составном действии названия предлагаются без ИНН (ключ —
+ * название). После подтверждения новость подхватывается следующим
+ * прогоном, пока она в окне --days.
  */
 final class NkrNewsImporter
 {
@@ -141,12 +136,8 @@ final class NkrNewsImporter
     /** Штук составных действий (2+ разных issuer_id сопоставилось на одно действие). */
     private int $compositeActions = 0;
     private int $skippedNoIssuerResolved = 0;
-    /** Штук действий, сопоставленных ТОЛЬКО третьим, самым неточным уровнем (см. resolveIssuerIds()). */
-    private int $matchedByRoot = 0;
-    /** @var array<int, true> issuer_id => сопоставлен по корню в ТЕКУЩЕМ вызове resolveIssuerIds() */
-    private array $lastRootMatchedIds = [];
-    /** @var array<int, string> заголовки для уведомления администратору о root-совпадениях (см. bin/seed_ratings.php) */
-    private array $rootMatchNotices = [];
+    /** Новых предложений сопоставления по названию (ждут подтверждения администратора). */
+    private int $proposedByName = 0;
     /** @var array<int, string> */
     private array $unmatchedTitles = [];
     /** @var array<int, string> */
@@ -158,6 +149,7 @@ final class NkrNewsImporter
         private readonly PDO $db,
         private readonly IssuerMatcher $matcher,
         private readonly RatingActionsWriter $writer,
+        private readonly NameMatchResolver $nameResolver,
     ) {
     }
 
@@ -283,7 +275,7 @@ final class NkrNewsImporter
             ?? RatingsNormalizer::mapOutlookFromProse($row['title']);
 
         $inn = $this->fetchInnFromDetailPage($row['url']);
-        $issuerIds = $this->resolveIssuerIds($inn, $row['title']);
+        $issuerIds = $this->resolveIssuerIds($inn, $row['title'], $row['url']);
 
         if ($issuerIds === []) {
             RatingNewsLog::log($this->db, self::AGENCY, $row['url'], $row['date'], 'skipped_unmatched');
@@ -293,7 +285,6 @@ final class NkrNewsImporter
             return;
         }
 
-        $rootMatchedIds = $this->lastRootMatchedIds;
         $writtenCount = 0;
         foreach ($issuerIds as $issuerId) {
             $cached = CurrentRatingsSync::fetch($this->db, $issuerId, self::AGENCY);
@@ -308,7 +299,6 @@ final class NkrNewsImporter
                 continue;
             }
 
-            $matchedByRoot = isset($rootMatchedIds[$issuerId]);
             $this->writer->upsert(
                 $issuerId,
                 self::AGENCY,
@@ -319,13 +309,8 @@ final class NkrNewsImporter
                 $outlookTo,
                 $row['url'],
                 $row['title'],
-                $matchedByRoot,
             );
-            CurrentRatingsSync::sync($this->db, $issuerId, self::AGENCY, $row['date'], $ratingTo, $outlookTo, $cached, $matchedByRoot);
-            if ($matchedByRoot) {
-                $this->matchedByRoot++;
-                $this->rootMatchNotices[] = "НКР: «{$row['title']}» → issuer_id={$issuerId} (сопоставлено по корню названия, проверьте) — {$row['url']}";
-            }
+            CurrentRatingsSync::sync($this->db, $issuerId, self::AGENCY, $row['date'], $ratingTo, $outlookTo, $cached);
             $writtenCount++;
         }
 
@@ -345,19 +330,18 @@ final class NkrNewsImporter
     }
 
     /**
-     * Первичное лицо — по ИНН со страницы пресс-релиза (надёжно). Любые
-     * другие названия в кавычках заголовка — запасным путём, по точному
-     * совпадению имени (см. IssuerMatcher::findIssuerIdByName). Если
-     * название в кавычках резолвится в тот же issuer_id, что и первичное
-     * лицо — array_unique просто уберёт дубль, вторая строка на того же
-     * issuer_id не пишется.
+     * Первичное лицо — по ИНН со страницы пресс-релиза (надёжно) или через
+     * явную связку issuer_spv_links. Названия в кавычках заголовка — через
+     * NameMatchResolver: записываются только уже подтверждённые
+     * администратором названия, остальные совпадения по названию уходят
+     * в предложения (см. докблок класса). Если название резолвится в тот
+     * же issuer_id, что и первичное лицо — array_unique уберёт дубль.
      *
      * @return array<int, int> уникальные issuer_id, первичный (по ИНН) первым, если сопоставился
      */
-    private function resolveIssuerIds(?string $inn, string $title): array
+    private function resolveIssuerIds(?string $inn, string $title, string $url): array
     {
         $issuerIds = [];
-        $this->lastRootMatchedIds = [];
 
         $primaryId = $inn !== null ? $this->matcher->findIssuerIdByInn($inn) : null;
         if ($primaryId === null && $inn !== null) {
@@ -382,37 +366,20 @@ final class NkrNewsImporter
         }
 
         $candidates = RatingsNormalizer::extractQuotedNames($title);
+        // ИНН со страницы — ИНН ПЕРВОЙ названной компании; однозначно
+        // приписать его названию можно, только если название одно.
+        $innForNames = count($candidates) === 1 ? $inn : null;
+        $skip = $primaryId !== null ? [$primaryId => true] : [];
 
         foreach ($candidates as $candidate) {
-            $id = $this->matcher->findIssuerIdByName($candidate);
-            if ($id !== null) {
-                $issuerIds[] = $id;
-            }
-        }
-
-        // Третий, самый неточный уровень — по "корню" названия (без ОПФ
-        // и маркерных слов SPV "Финанс"/"Капитал", см. IssuerMatcher::
-        // rootCompanyName()) — только когда ИНН и точное имя выше не дали
-        // НИЧЕГО (по прямому указанию пользователя, сентябрь 2026): кейс
-        // "в issuers заведена только SPV/только материнская компания, а
-        // заголовок называет другую сторону".
-        if ($issuerIds === []) {
-            foreach ($candidates as $candidate) {
-                $id = $this->matcher->findIssuerIdByRootName($candidate);
-                if ($id !== null) {
-                    $issuerIds[] = $id;
-                    $this->lastRootMatchedIds[$id] = true;
-                }
+            $result = $this->nameResolver->resolve(self::AGENCY, $innForNames, [$candidate], $title, $url, $skip);
+            $this->proposedByName += $result['proposed'];
+            if ($result['issuerId'] !== null) {
+                $issuerIds[] = $result['issuerId'];
             }
         }
 
         return array_values(array_unique($issuerIds));
-    }
-
-    /** @return array<int, string> тексты для админ-уведомления о совпадениях "по корню" в этом прогоне */
-    public function getRootMatchNotices(): array
-    {
-        return $this->rootMatchNotices;
     }
 
     private function fetchInnFromDetailPage(string $url): ?string
@@ -434,7 +401,7 @@ final class NkrNewsImporter
         Logger::info("Действий записано (matchedActions): {$this->matchedActions}");
         Logger::info("Строк rating_actions записано (matchedRows): {$this->matchedRows}");
         Logger::info("Из них составных действий (2+ юрлица сопоставились): {$this->compositeActions}");
-        Logger::info("Из них сопоставлено третьим уровнем, 'по корню' названия (SPV/материнская компания, требует выборочной проверки): {$this->matchedByRoot}");
+        Logger::info("Новых предложений сопоставления по названию (ждут подтверждения, bin/review_matches.php): {$this->proposedByName}");
         Logger::info("Не сопоставлено ни с одним issuer_id (попробуем снова на следующем прогоне): {$this->skippedNoIssuerResolved}");
         if ($this->unmatchedTitles !== []) {
             Logger::info('Не сопоставленные: ' . implode('; ', array_slice($this->unmatchedTitles, 0, 20)));

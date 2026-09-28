@@ -19,9 +19,12 @@ require __DIR__ . '/bootstrap.php';
 use BondKeeper\Database;
 use BondKeeper\Events\EventPublisher;
 use BondKeeper\Ratings\IssuerMatcher;
+use BondKeeper\Ratings\NameMatchResolver;
+use BondKeeper\Ratings\NameMatchReviews;
 use BondKeeper\Ratings\NraImporter;
 use BondKeeper\Ratings\RatingActionsWriter;
 use BondKeeper\Support\Logger;
+use BondKeeper\Telegram\AdminNotifier;
 
 const INTERVAL_SECONDS = 1800; // 30 минут
 
@@ -32,7 +35,11 @@ while (true) {
     try {
         $db = Database::connection();
         $matcher = new IssuerMatcher($db);
-        (new NraImporter($db, $matcher, new RatingActionsWriter($db, new EventPublisher($db))))->import();
+        $reviews = new NameMatchReviews($db);
+        (new NraImporter($db, $matcher, new RatingActionsWriter($db, new EventPublisher($db)), new NameMatchResolver($matcher, $reviews)))->import();
+        // Новые предложения сопоставления по названию — администратору
+        // (заголовок + ссылка на пресс-релиз, миграция 024).
+        $reviews->notifyNewProposals([AdminNotifier::class, 'send']);
     } catch (\Throwable $e) {
         // Одна неудачная попытка не должна убивать весь процесс —
         // следующий прогон через обычный интервал попробует снова.

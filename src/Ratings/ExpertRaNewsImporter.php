@@ -25,12 +25,11 @@ use PDO;
  *
  * Теперь сопоставление — как у НКР: ПЕРВИЧНО по ИНН со страницы
  * пресс-релиза (один доп. запрос на строку, см. resolveIssuer()),
- * запасным путём — по точному названию в кавычках
- * (IssuerMatcher::findIssuerIdByName() + RatingsNormalizer::
- * extractQuotedNames(), тот же общий метод, что у НКР). Заголовок
- * нередко содержит несколько названий в кавычках сразу («Эксперт РА» —
- * само название агентства — тоже в кавычках первым) — в запасном пути
- * пробуем каждое по порядку, первое совпадение с issuers побеждает. В
+ * запасным путём — по названиям в кавычках через NameMatchResolver
+ * (с миграции 024 — только подтверждённые названия пишутся, остальное —
+ * предложения администратору). Заголовок нередко содержит несколько
+ * названий в кавычках сразу («Эксперт РА» — само название агентства —
+ * тоже в кавычках первым). В
  * отличие от НКР — составных действий (компания-поручитель + её SPV в
  * ОДНОМ действии) на живых данных Эксперт РА НЕ встретилось (проверено
  * на 200 реальных новостях) — поэтому здесь только один issuer_id на
@@ -82,17 +81,13 @@ use PDO;
  * извлёк бы "ruAAA" (останавливается на точке перед "sf"), молча теряя
  * суффикс — действие целиком пропускается (см. importItem()).
  *
- * === Третий уровень сопоставления — "по корню" названия (миграция 022) ===
+ * === Сопоставление по названию — только после подтверждения (миграция 024) ===
  *
- * По прямому запросу пользователя (сентябрь 2026): если в issuers
- * заведена только SPV (или только материнская компания), а заголовок
- * называет ДРУГУЮ сторону — ни ИНН, ни точное имя её не найдут.
- * resolveIssuer() пробует явную ручную связку (issuer_spv_links,
- * миграция 023), а затем IssuerMatcher::findIssuerIdByRootName() как
- * ПОСЛЕДНИЙ fallback, только если ИНН и точное имя не дали ничего.
- * Строка пишется как обычно, но с флагом matched_by_root_name —
- * собирается в getRootMatchNotices() для уведомления администратора
- * (см. bin/seed_ratings.php).
+ * resolveIssuer(): ИНН со страницы релиза → явная связка issuer_spv_links
+ * (миграция 023) → NameMatchResolver. Совпадение по названию (точное имя
+ * или "по корню") без подтверждения администратора в базу не пишется —
+ * это предложение с заголовком и ссылкой на пресс-релиз (решение
+ * пользователя, сентябрь 2026, см. докблок NameMatchReviews).
  */
 final class ExpertRaNewsImporter
 {
@@ -108,13 +103,10 @@ final class ExpertRaNewsImporter
     private int $skippedNoEntityFound = 0;
     private int $matched = 0;
     private int $matchedByInn = 0;
-    private int $matchedByName = 0;
-    private int $matchedByRoot = 0;
     private int $matchedBySpvLink = 0;
-    /** true, если ПОСЛЕДНИЙ вызов resolveIssuer() вернул issuer_id именно третьим, "по корню" уровнем. */
-    private bool $lastMatchWasByRoot = false;
-    /** @var array<int, string> заголовки для уведомления администратору о root-совпадениях (см. bin/seed_ratings.php) */
-    private array $rootMatchNotices = [];
+    private int $matchedByApprovedName = 0;
+    /** Новых предложений сопоставления по названию (ждут подтверждения администратора). */
+    private int $proposedByName = 0;
     /** @var array<int, string> */
     private array $unmatchedTitles = [];
     /** @var array<int, string> */
@@ -125,6 +117,7 @@ final class ExpertRaNewsImporter
         private readonly IssuerMatcher $matcher,
         private readonly RatingActionsWriter $writer,
         private readonly ExpertRaClient $client,
+        private readonly NameMatchResolver $nameResolver,
         private readonly int $delayMicroseconds = 400_000,
     ) {
     }
@@ -233,7 +226,6 @@ final class ExpertRaNewsImporter
             return;
         }
 
-        $matchedByRoot = $this->lastMatchWasByRoot;
         $this->writer->upsert(
             $issuerId,
             self::AGENCY,
@@ -244,12 +236,8 @@ final class ExpertRaNewsImporter
             $outlookTo,
             $item['url'],
             $item['title'],
-            $matchedByRoot,
         );
-        CurrentRatingsSync::sync($this->db, $issuerId, self::AGENCY, $item['_date'], $ratingTo, $outlookTo, $cached, $matchedByRoot);
-        if ($matchedByRoot) {
-            $this->rootMatchNotices[] = "Эксперт РА: «{$item['title']}» → issuer_id={$issuerId} (сопоставлено по корню названия, проверьте) — {$item['url']}";
-        }
+        CurrentRatingsSync::sync($this->db, $issuerId, self::AGENCY, $item['_date'], $ratingTo, $outlookTo, $cached);
         RatingNewsLog::log($this->db, self::AGENCY, $item['url'], $item['_date'], 'matched');
         $this->matched++;
     }
@@ -327,18 +315,16 @@ final class ExpertRaNewsImporter
      * переходим к запасному пути (тот же принцип, что уже применяет
      * ExpertRaImporter::resolveInn() для карточек компаний).
      *
-     * ЗАПАСНЫМ путём — по точному названию в кавычках, каждое по порядку
-     * появления, первое совпадение с issuers побеждает. «Эксперт РА»
-     * (само название агентства) тоже попадает в кандидаты первым —
-     * безвредно, просто один неудачный lookup перед реальным кандидатом
-     * (RatingsNormalizer::extractQuotedNames() не отфильтрует его —
-     * начинается с заглавной, не содержит рейтинговых слов; агентство
-     * само по себе не заведено как issuer).
+     * Дальше — явная связка issuer_spv_links и NameMatchResolver по
+     * названиям в кавычках: записывается только уже подтверждённое
+     * название, остальные совпадения по названию уходят в предложения.
+     * «Эксперт РА» (само название агентства) тоже попадает в кандидаты —
+     * безвредно, агентство не заведено как issuer. ИНН со страницы релиза
+     * — ИНН рейтингуемого лица, поэтому передаётся в предложение (по нему
+     * отсекаются тёзки и сохраняется подтверждение).
      */
     private function resolveIssuer(string $releaseUrl, string $title): ?int
     {
-        $this->lastMatchWasByRoot = false;
-
         usleep($this->delayMicroseconds);
         try {
             $inn = $this->client->fetchReleaseInn($releaseUrl);
@@ -363,36 +349,19 @@ final class ExpertRaNewsImporter
             }
         }
 
-        $candidates = RatingsNormalizer::extractQuotedNames($title);
-
-        foreach ($candidates as $candidate) {
-            $issuerId = $this->matcher->findIssuerIdByName($candidate);
-            if ($issuerId !== null) {
-                $this->matchedByName++;
-                return $issuerId;
-            }
+        $result = $this->nameResolver->resolve(
+            self::AGENCY,
+            $inn,
+            RatingsNormalizer::extractQuotedNames($title),
+            $title,
+            $releaseUrl,
+        );
+        $this->proposedByName += $result['proposed'];
+        if ($result['issuerId'] !== null) {
+            $this->matchedByApprovedName++;
         }
 
-        // Третий, самый неточный уровень — "по корню" названия (без ОПФ
-        // и маркерных слов SPV "Финанс"/"Капитал"), только если ИНН и
-        // точное имя выше не дали НИЧЕГО — см. IssuerMatcher::
-        // findIssuerIdByRootName() и запрос пользователя (сентябрь 2026).
-        foreach ($candidates as $candidate) {
-            $issuerId = $this->matcher->findIssuerIdByRootName($candidate);
-            if ($issuerId !== null) {
-                $this->matchedByRoot++;
-                $this->lastMatchWasByRoot = true;
-                return $issuerId;
-            }
-        }
-
-        return null;
-    }
-
-    /** @return array<int, string> тексты для админ-уведомления о совпадениях "по корню" в этом прогоне */
-    public function getRootMatchNotices(): array
-    {
-        return $this->rootMatchNotices;
+        return $result['issuerId'];
     }
 
     private function printReport(): void
@@ -403,9 +372,8 @@ final class ExpertRaNewsImporter
         Logger::info("Пропущено (не похоже на кредитное рейтинговое действие): {$this->skippedNotRatingAction}");
         Logger::info("Пропущено (отзыв рейтинга выпуска облигаций из-за погашения — шум, не эмитентское действие): {$this->skippedBondRedemption}");
         Logger::info("Пропущено (нестандартная шкала, напр. '.sf'): {$this->skippedNonStandardRating}");
-        Logger::info("Сопоставлено с issuers и записано: {$this->matched} (по ИНН: {$this->matchedByInn}, по имени запасным путём: {$this->matchedByName})");
-        Logger::info("Из них по явной ручной связке SPV (issuer_spv_links): {$this->matchedBySpvLink}");
-        Logger::info("Из них сопоставлено третьим уровнем, 'по корню' названия (SPV/материнская компания, требует выборочной проверки): {$this->matchedByRoot}");
+        Logger::info("Сопоставлено с issuers и записано: {$this->matched} (по ИНН: {$this->matchedByInn}, по связке issuer_spv_links: {$this->matchedBySpvLink}, по подтверждённому названию: {$this->matchedByApprovedName})");
+        Logger::info("Новых предложений сопоставления по названию (ждут подтверждения, bin/review_matches.php): {$this->proposedByName}");
         Logger::info("Не сопоставлено (ни одно название в кавычках не нашлось в issuers, попробуем снова на следующем прогоне): {$this->skippedNoEntityFound}");
         Logger::info("Пропущено (не удалось разобрать уровень рейтинга и нет данных в current_ratings): {$this->skippedNoRatingParsed}");
         if ($this->unmatchedTitles !== []) {

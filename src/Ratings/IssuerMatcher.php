@@ -45,6 +45,19 @@ use PDO;
  * одному и тому же "корню". Самый неточный из трёх — те же гарантии
  * "не угадываем" (неоднозначность, минимальная длина корня), что и у
  * findIssuerIdByName().
+ *
+ * === Сопоставление по названию — только после подтверждения (миграция 024) ===
+ *
+ * Разбор сверки (сентябрь 2026) показал, что "по корню" ошибается: ООО
+ * «Озон» (фармацевтика) получила рейтинги ОЗОН Банка и ОЗОН Капитала,
+ * ЗАО «Прогресс» (Курская обл.) — рейтинг АО «ПРОГРЕСС» (Липецк). Решение
+ * пользователя: там, где сопоставление идёт по названию (точное имя или
+ * корень), без его подтверждения ничего не пишется. findIssuerIdByName()/
+ * findIssuerIdByRootName() теперь только НАХОДЯТ КАНДИДАТА — решение
+ * принимает NameMatchResolver (предложение в NameMatchReviews). Сами
+ * записывающие уровни теперь только такие:
+ *   ИНН → явная связка issuer_spv_links → (ISIN у АКРА) → подтверждённое
+ *   название (findIssuerIdByApprovedName()).
  */
 final class IssuerMatcher
 {
@@ -192,6 +205,38 @@ final class IssuerMatcher
         $id = $stmt->fetchColumn();
 
         return $id !== false ? (int) $id : null;
+    }
+
+    /**
+     * Название, которое администратор уже подтвердил для конкретного
+     * эмитента (issuer_name_match_reviews, source_key_type='name',
+     * status='approved', миграция 024). Нужно для источников БЕЗ ИНН —
+     * например, вторая компания в составном действии НКР. Для источников
+     * с ИНН подтверждение хранится связкой issuer_spv_links и срабатывает
+     * раньше, на уровне ИНН.
+     */
+    public function findIssuerIdByApprovedName(string $rawName): ?int
+    {
+        $key = self::nameKey($rawName);
+        if ($key === '') {
+            return null;
+        }
+
+        $stmt = $this->db->prepare(
+            "SELECT issuer_id FROM issuer_name_match_reviews
+             WHERE source_key_type = 'name' AND source_key = :source_key AND status = 'approved'
+             ORDER BY id LIMIT 1"
+        );
+        $stmt->execute(['source_key' => $key]);
+        $id = $stmt->fetchColumn();
+
+        return $id !== false ? (int) $id : null;
+    }
+
+    /** Ключ названия для issuer_name_match_reviews: normalizeCompanyName(), не длиннее колонки source_key. */
+    public static function nameKey(string $rawName): string
+    {
+        return mb_substr(self::normalizeCompanyName($rawName), 0, 255);
     }
 
     /**

@@ -56,8 +56,8 @@ use PDO;
  * муниципалитета пустое) И не дают названия в кавычках (регион не
  * цитируется) — без ISIN такая строка осталась бы полностью
  * несопоставленной, как у Эксперт РА с регионами. ЗАПАСНОЙ путь 2 —
- * точное название в кавычках (как у НКР/Эксперт РА), на случай если ни
- * ИНН, ни ISIN не подошли.
+ * название в кавычках, если ни ИНН, ни ISIN не подошли (с миграции 024
+ * — только уже подтверждённое администратором, см. ниже).
  *
  * === Составные действия — НЕ реализованы, в отличие от НКР ===
  *
@@ -70,17 +70,13 @@ use PDO;
  * "компания + отдельная SPV" — по аналогии с NkrNewsImporter::
  * resolveIssuerIds(), но без реального примера сейчас так не делаем.
  *
- * === Четвёртый уровень сопоставления — "по корню" названия (миграция 022) ===
+ * === Сопоставление по названию — только после подтверждения (миграция 024) ===
  *
- * Отдельно от составных действий выше: по прямому запросу пользователя
- * (сентябрь 2026), если в issuers заведена только SPV (или только
- * материнская компания), а заголовок называет ДРУГУЮ сторону — ни ИНН,
- * ни ISIN, ни точное имя её не найдут. resolveIssuer() пробует явную
- * ручную связку (issuer_spv_links, миграция 023), а затем
- * IssuerMatcher::findIssuerIdByRootName() ПОСЛЕДНИМ, только если все
- * предыдущие пути не дали ничего. Строка пишется как обычно, но с
- * флагом matched_by_root_name — собирается в getRootMatchNotices() для
- * уведомления администратора (см. bin/seed_ratings.php).
+ * resolveIssuer(): ИНН → явная связка issuer_spv_links (миграция 023) →
+ * ISIN → NameMatchResolver. Совпадение по названию (точное имя или "по
+ * корню") без подтверждения администратора в базу не пишется — это
+ * предложение с заголовком и ссылкой на пресс-релиз (решение
+ * пользователя, сентябрь 2026, см. докблок NameMatchReviews).
  */
 final class AcraNewsImporter
 {
@@ -96,13 +92,10 @@ final class AcraNewsImporter
     private int $matched = 0;
     private int $matchedByInn = 0;
     private int $matchedByIsin = 0;
-    private int $matchedByName = 0;
-    private int $matchedByRoot = 0;
     private int $matchedBySpvLink = 0;
-    /** true, если ПОСЛЕДНИЙ вызов resolveIssuer() вернул issuer_id именно четвёртым, "по корню" уровнем. */
-    private bool $lastMatchWasByRoot = false;
-    /** @var array<int, string> заголовки для уведомления администратору о root-совпадениях (см. bin/seed_ratings.php) */
-    private array $rootMatchNotices = [];
+    private int $matchedByApprovedName = 0;
+    /** Новых предложений сопоставления по названию (ждут подтверждения администратора). */
+    private int $proposedByName = 0;
     private int $skippedNoIssuerResolved = 0;
     /** @var array<int, string> */
     private array $unmatchedTitles = [];
@@ -113,6 +106,7 @@ final class AcraNewsImporter
         private readonly PDO $db,
         private readonly IssuerMatcher $matcher,
         private readonly RatingActionsWriter $writer,
+        private readonly NameMatchResolver $nameResolver,
         private readonly int $delayMicroseconds = 2_000_000,
     ) {
     }
@@ -193,7 +187,7 @@ final class AcraNewsImporter
 
         usleep($this->delayMicroseconds);
         $inn = $this->fetchInnFromDetailPage($row['url']);
-        $issuerId = $this->resolveIssuer($inn, $row['title']);
+        $issuerId = $this->resolveIssuer($inn, $row['title'], $row['url']);
 
         if ($issuerId === null) {
             RatingNewsLog::log($this->db, self::AGENCY, $row['url'], $row['date'], 'skipped_unmatched');
@@ -207,7 +201,6 @@ final class AcraNewsImporter
         $ratingFrom = $cached['rating'];
         $outlookFrom = $cached['outlook'];
 
-        $matchedByRoot = $this->lastMatchWasByRoot;
         $this->writer->upsert(
             $issuerId,
             self::AGENCY,
@@ -218,25 +211,21 @@ final class AcraNewsImporter
             $outlookTo,
             $row['url'],
             $row['title'],
-            $matchedByRoot,
         );
-        CurrentRatingsSync::sync($this->db, $issuerId, self::AGENCY, $row['date'], $ratingTo, $outlookTo, $cached, $matchedByRoot);
-        if ($matchedByRoot) {
-            $this->rootMatchNotices[] = "АКРА: «{$row['title']}» → issuer_id={$issuerId} (сопоставлено по корню названия, проверьте) — {$row['url']}";
-        }
+        CurrentRatingsSync::sync($this->db, $issuerId, self::AGENCY, $row['date'], $ratingTo, $outlookTo, $cached);
         RatingNewsLog::log($this->db, self::AGENCY, $row['url'], $row['date'], 'matched');
         $this->matched++;
     }
 
     /**
-     * ПЕРВИЧНО — ИНН со страницы релиза. Запасной путь 1 — ISIN выпуска
-     * прямо в заголовке (регионы/облигации без ИНН на детальной
-     * странице). Запасной путь 2 — точное название в кавычках.
+     * ПЕРВИЧНО — ИНН со страницы релиза, затем явная связка
+     * issuer_spv_links. Запасной путь — ISIN выпуска прямо в заголовке
+     * (регионы/облигации без ИНН на детальной странице). Последний —
+     * NameMatchResolver по названиям в кавычках: записывается только уже
+     * подтверждённое название, остальное — предложения администратору.
      */
-    private function resolveIssuer(?string $inn, string $title): ?int
+    private function resolveIssuer(?string $inn, string $title, string $url): ?int
     {
-        $this->lastMatchWasByRoot = false;
-
         if ($inn !== null) {
             $issuerId = $this->matcher->findIssuerIdByInn($inn);
             if ($issuerId !== null) {
@@ -263,36 +252,19 @@ final class AcraNewsImporter
             }
         }
 
-        $candidates = AcraNewsTitleParser::extractQuotedNames($title);
-
-        foreach ($candidates as $candidate) {
-            $issuerId = $this->matcher->findIssuerIdByName($candidate);
-            if ($issuerId !== null) {
-                $this->matchedByName++;
-                return $issuerId;
-            }
+        $result = $this->nameResolver->resolve(
+            self::AGENCY,
+            $inn,
+            AcraNewsTitleParser::extractQuotedNames($title),
+            $title,
+            $url,
+        );
+        $this->proposedByName += $result['proposed'];
+        if ($result['issuerId'] !== null) {
+            $this->matchedByApprovedName++;
         }
 
-        // Четвёртый, самый неточный уровень — "по корню" названия (без
-        // ОПФ и маркерных слов SPV "Финанс"/"Капитал"), только если ИНН/
-        // ISIN/точное имя выше не дали НИЧЕГО — см. IssuerMatcher::
-        // findIssuerIdByRootName() и запрос пользователя (сентябрь 2026).
-        foreach ($candidates as $candidate) {
-            $issuerId = $this->matcher->findIssuerIdByRootName($candidate);
-            if ($issuerId !== null) {
-                $this->matchedByRoot++;
-                $this->lastMatchWasByRoot = true;
-                return $issuerId;
-            }
-        }
-
-        return null;
-    }
-
-    /** @return array<int, string> тексты для админ-уведомления о совпадениях "по корню" в этом прогоне */
-    public function getRootMatchNotices(): array
-    {
-        return $this->rootMatchNotices;
+        return $result['issuerId'];
     }
 
     /** @return array<int, array{title: string, url: string, date: string}> */
@@ -377,7 +349,8 @@ final class AcraNewsImporter
         Logger::info("Пропущено (не похоже на кредитное рейтинговое действие): {$this->skippedNotRatingAction}");
         Logger::info("Пропущено (отзыв рейтинга выпуска облигаций из-за погашения — шум, не эмитентское действие): {$this->skippedBondRedemption}");
         Logger::info("Пропущено (не удалось разобрать уровень рейтинга): {$this->skippedNoRatingParsed}");
-        Logger::info("Сопоставлено с issuers и записано: {$this->matched} (по ИНН: {$this->matchedByInn}, по ручной связке SPV: {$this->matchedBySpvLink}, по ISIN: {$this->matchedByIsin}, по имени запасным путём: {$this->matchedByName}, по корню названия SPV/материнская компания: {$this->matchedByRoot})");
+        Logger::info("Сопоставлено с issuers и записано: {$this->matched} (по ИНН: {$this->matchedByInn}, по связке issuer_spv_links: {$this->matchedBySpvLink}, по ISIN: {$this->matchedByIsin}, по подтверждённому названию: {$this->matchedByApprovedName})");
+        Logger::info("Новых предложений сопоставления по названию (ждут подтверждения, bin/review_matches.php): {$this->proposedByName}");
         Logger::info("Не сопоставлено ни с одним issuer_id (попробуем снова на следующем прогоне): {$this->skippedNoIssuerResolved}");
         if ($this->unmatchedTitles !== []) {
             Logger::info('Не сопоставленные: ' . implode('; ', array_slice($this->unmatchedTitles, 0, 20)));

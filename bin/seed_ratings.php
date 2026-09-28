@@ -28,6 +28,13 @@ declare(strict_types=1);
  *   php bin/seed_ratings.php --agency=acra --file=/path/to/acra_issuers.json
  *   php bin/seed_ratings.php --agency=manual --file=/path/to/ratings.xlsx
  *
+ * Перезапись проверенным снимком (П2, сентябрь 2026) — основной способ
+ * ежемесячной перезаписи НКР / Эксперт РА / АКРА, см. ниже:
+ *   php bin/seed_ratings.php --agency=nkr|expert_ra|acra --snapshot=var/snapshots/<файл>.json [--force]
+ * Файл снимка сохраняет bin/reconcile_ratings.php. Снимок старше 7 дней
+ * без --force не применяется: за это время новостные импортёры могли
+ * записать более свежие действия, а перезапись их затрёт.
+ *
  * Запуск (rating_actions — история рейтинговых действий из новостей):
  *   php bin/seed_ratings.php --agency=nkr-news [--days=2] [--full]
  *   php bin/seed_ratings.php --agency=expert_ra-news [--delay-ms=400] [--full]
@@ -106,25 +113,22 @@ declare(strict_types=1);
  * По расписанию — по одному агентству за раз, не одновременно
  * (вежливость к чужим серверам, та же логика, что и у check_fns_blocks.php).
  *
- * Ежемесячный ПОЛНЫЙ пересбор current_ratings (по решению пользователя,
- * сентябрь 2026) — не путать с частыми *-news/nra прогонами ниже: это
- * разовая полная переустановка снимка с нуля, а не инкремент.
- * --agency=nkr (читает единый Excel-экспорт целиком, вживую занимает
- * несколько секунд) и --agency=expert_ra (ПОЛНЫЙ обход сайта по всем
- * категориям + по карточке на каждую компанию — не путать с
- * expert_ra-news; вживую ~30-50 минут, см. выше). --agency=nra здесь
- * НЕ нужна: она уже гоняется каждые 30 минут (см. ниже) и сама
- * инкрементально ловит все изменения — отдельный ежемесячный прогон
- * был бы просто дублирующим повтором той же самой команды. Время —
- * ночью, вне окна 5:00-17:00 (когда крутятся *-news/nra), чтобы
- * гарантированно не пересекаться с ними независимо от того, на какой
- * день недели попадёт 1-е число, и с разносом между собой (та же
- * вежливость "по одному агентству за раз"):
- *   0 1 1 * *  /usr/bin/php /path/to/bondkeeper/bin/seed_ratings.php --agency=nkr        >> /var/log/bondkeeper/seed_ratings_nkr.log 2>&1
- *   15 1 1 * * /usr/bin/php /path/to/bondkeeper/bin/seed_ratings.php --agency=expert_ra  >> /var/log/bondkeeper/seed_ratings_expert_ra.log 2>&1
- * (день месяца = 1, день недели = '*' — обычная ежемесячная семантика;
- * если бы оба поля были ограничены одновременно, cron трактовал бы их
- * через "ИЛИ", а не "И" — здесь этой ловушки нет).
+ * Ежемесячный ПОЛНЫЙ пересбор current_ratings — теперь в два шага (П2,
+ * решение пользователя, сентябрь 2026). Раньше в комментариях стояли
+ * перезапись НКР в 01:00 и Эксперт РА в 01:15 1-го числа, а сверка — в
+ * 02:00, то есть сверка сравнивала базу с только что записанным в неё же
+ * снимком и ничего не находила. Теперь:
+ *   1. По расписанию — только сверка (bin/reconcile_ratings.php, 1-го
+ *      числа ночью): отчёт в лог, короткая сводка администратору в
+ *      Telegram, снимок каждого агентства сохраняется в var/snapshots/.
+ *   2. Администратор смотрит отчёт и, если всё в порядке, сам запускает
+ *      перезапись ровно проверенным снимком:
+ *        php bin/seed_ratings.php --agency=nkr --snapshot=var/snapshots/nkr-....json
+ *        php bin/seed_ratings.php --agency=expert_ra --snapshot=var/snapshots/expert_ra-....json
+ *      (команды с точными путями печатает сама сверка).
+ * Строки crontab для --agency=nkr / --agency=expert_ra из расписания
+ * убрать. --agency=nra здесь по-прежнему не нужна: она гоняется каждые
+ * 30 минут (см. ниже) и сама инкрементально ловит все изменения.
  *
  * nkr-news, nra, expert_ra-news, acra-news — ЕСЛИ на сервере есть обычный OS cron:
  *   * /30 * * * *  /usr/bin/php /path/to/bondkeeper/bin/seed_ratings.php --agency=nkr-news --days=2       >> /var/log/bondkeeper/seed_ratings_nkr_news.log 2>&1
@@ -158,19 +162,21 @@ declare(strict_types=1);
  * задвоился бы событием от новостного импортёра и ещё раз от следующего
  * планового полного прогона. Подробности — docs/STAGE4_EVENT_ENGINE.md.
  *
- * === Сопоставление "по корню" названия — SPV/материнская компания (миграция 022) ===
+ * === Сопоставление по названию — только после подтверждения (миграция 024) ===
  *
  * Все 7 импортёров current_ratings/rating_actions (--agency=nkr/expert_ra/
- * acra/nra/nkr-news/expert_ra-news/acra-news) теперь, если не помогли ИНН
- * (и точное имя, где оно есть), пробуют последним IssuerMatcher::
- * findIssuerIdByRootName() — по прямому запросу пользователя, кейс "в
- * issuers заведена только SPV, а источник называет материнскую компанию"
- * (и наоборот). Такая строка пишется как обычно, но с флагом
- * matched_by_root_name — после прогона notifyAdminOfRootMatches() (см.
- * выше) отправляет администратору короткое уведомление в Telegram для
- * выборочной ручной проверки (config/telegram_bot.php должен быть
- * настроен — при его отсутствии/ошибке отправки прогон импорта не падает,
- * только пишет предупреждение в лог).
+ * acra/nra/nkr-news/expert_ra-news/acra-news): ИНН → связка
+ * issuer_spv_links → (у АКРА-новостей ещё ISIN) → NameMatchResolver.
+ * Совпадение по названию (точное или "по корню") без подтверждения
+ * администратора в базу НЕ пишется (решение пользователя, сентябрь 2026:
+ * "по корню" фармацевтическая ООО «Озон» получила рейтинги ОЗОН Банка,
+ * курское ЗАО «Прогресс» — рейтинг липецкого АО «ПРОГРЕСС»). Вместо этого
+ * — предложение в issuer_name_match_reviews; после прогона
+ * notifyNewProposals() отправляет администратору по сообщению на
+ * предложение: название у агентства и у нас, ИНН, заголовок новости,
+ * ссылка на пресс-релиз и готовые команды bin/review_matches.php
+ * --approve=ID / --reject=ID. Если Telegram не настроен — прогон не
+ * падает, предложения ждут (php bin/review_matches.php --list).
  */
 
 require __DIR__ . '/bootstrap.php';
@@ -184,52 +190,24 @@ use BondKeeper\Ratings\ExpertRaImporter;
 use BondKeeper\Ratings\ExpertRaNewsImporter;
 use BondKeeper\Ratings\IssuerMatcher;
 use BondKeeper\Ratings\ManualRatingsImporter;
+use BondKeeper\Ratings\NameMatchResolver;
+use BondKeeper\Ratings\NameMatchReviews;
 use BondKeeper\Ratings\NkrImporter;
 use BondKeeper\Ratings\NkrNewsImporter;
 use BondKeeper\Ratings\NraImporter;
 use BondKeeper\Ratings\RatingActionsWriter;
+use BondKeeper\Ratings\SnapshotRows;
 use BondKeeper\Support\Logger;
-use BondKeeper\Telegram\TelegramBotConfig;
-use BondKeeper\Telegram\TelegramClient;
+use BondKeeper\Telegram\AdminNotifier;
 
-/**
- * Уведомление администратору о совпадениях "по корню" названия (SPV/
- * материнская компания, миграция 022, см. докблок IssuerMatcher::
- * findIssuerIdByRootName()) — самый неточный из уровней сопоставления в
- * проекте. По решению пользователя (сентябрь 2026) такая строка
- * пишется в БД как обычно (не теряем данные), но с отдельной пометкой
- * matched_by_root_name — и коротким уведомлением в Telegram
- * администратору для выборочной ручной проверки. Ошибка отправки
- * (сломанный/отсутствующий config/telegram_bot.php, сетевой сбой) не
- * должна ронять сам прогон импорта — это вспомогательное уведомление,
- * а не критичная часть пайплайна.
- *
- * @param array<int, string> $notices
- */
-function notifyAdminOfRootMatches(array $notices, string $agency): void
-{
-    if ($notices === []) {
-        return;
-    }
-
-    try {
-        $config = TelegramBotConfig::fromFile(__DIR__ . '/../config/telegram_bot.php');
-        if ($config->adminTelegramId === 0) {
-            Logger::warn('Есть совпадения "по корню" названия, но admin_telegram_id не настроен — уведомление не отправлено, см. лог выше.');
-            return;
-        }
-
-        $text = "⚠️ Сопоставление \"по корню\" названия ({$agency}), проверьте вручную:\n\n"
-            . implode("\n\n", $notices);
-        (new TelegramClient($config->botToken))->sendMessage($config->adminTelegramId, mb_substr($text, 0, 4000));
-    } catch (\Throwable $e) {
-        Logger::warn("Не удалось отправить администратору уведомление о root-совпадениях: {$e->getMessage()}");
-    }
-}
+/** Снимок старше этого без --force не применяется — см. докблок выше. */
+const SNAPSHOT_MAX_AGE_DAYS = 7;
 
 $agency = null;
 $delayMs = 400;
 $file = null;
+$snapshotFile = null;
+$force = false;
 $full = false;
 $days = null; // null => используем дефолт конкретного импортёра (разный для nkr-news/expert_ra-news)
 foreach ($argv as $arg) {
@@ -242,16 +220,26 @@ foreach ($argv as $arg) {
     if (str_starts_with($arg, '--file=')) {
         $file = substr($arg, strlen('--file='));
     }
+    if (str_starts_with($arg, '--snapshot=')) {
+        $snapshotFile = substr($arg, strlen('--snapshot='));
+    }
     if (str_starts_with($arg, '--days=')) {
         $days = (int) substr($arg, strlen('--days='));
     }
     if ($arg === '--full') {
         $full = true;
     }
+    if ($arg === '--force') {
+        $force = true;
+    }
 }
 
 if ($agency === null) {
-    fwrite(STDERR, "Использование: php bin/seed_ratings.php --agency=nkr|nra|expert_ra|acra|manual|nkr-news|expert_ra-news|acra-news [--delay-ms=400] [--file=...] [--full] [--days=2]\n");
+    fwrite(STDERR, "Использование: php bin/seed_ratings.php --agency=nkr|nra|expert_ra|acra|manual|nkr-news|expert_ra-news|acra-news [--delay-ms=400] [--file=...] [--snapshot=... [--force]] [--full] [--days=2]\n");
+    exit(1);
+}
+if ($snapshotFile !== null && !in_array($agency, ['nkr', 'expert_ra', 'acra'], true)) {
+    fwrite(STDERR, "--snapshot поддерживается только для --agency=nkr|expert_ra|acra (снимок сохраняет bin/reconcile_ratings.php).\n");
     exit(1);
 }
 
@@ -276,34 +264,56 @@ if ($lockHandle === false || !flock($lockHandle, LOCK_EX | LOCK_NB)) {
 
 $db = Database::connection();
 $matcher = new IssuerMatcher($db);
+$reviews = new NameMatchReviews($db);
+$nameResolver = new NameMatchResolver($matcher, $reviews);
 
 Logger::info("Старт: сидирование рейтингов ({$agency})");
 
-// Ссылка на импортёр этого прогона сохраняется отдельно от switch — нужна
-// ПОСЛЕ import()/importFromFile(), чтобы забрать getRootMatchNotices()
-// (миграция 022) и уведомить администратора. ManualRatingsImporter в
-// список не входит — ручная загрузка уже прошла проверку человеком.
-$importer = null;
+/**
+ * Проверенный на сверке снимок (П2). Возраст считаем от момента, когда
+ * сверка его сохранила.
+ *
+ * @return array<int, array{issuer_id: int, issuer_name: string, rating: string, outlook: ?string, last_action_date: string, source_url: ?string}>
+ */
+function loadCheckedSnapshot(string $path, string $agency, bool $force): array
+{
+    $snapshot = SnapshotRows::loadFromFile($path, $agency);
+    $ageDays = (time() - (int) strtotime($snapshot['created_at'])) / 86400;
+    Logger::info(sprintf('Снимок %s: сохранён %s (%.1f дн. назад), строк: %d', $path, $snapshot['created_at'], $ageDays, count($snapshot['rows'])));
+    if ($ageDays > SNAPSHOT_MAX_AGE_DAYS && !$force) {
+        fwrite(STDERR, 'Снимок старше ' . SNAPSHOT_MAX_AGE_DAYS . " дней — перезапись затрёт более свежие данные из новостей. Запустите сверку заново или добавьте --force.\n");
+        exit(1);
+    }
+
+    return $snapshot['rows'];
+}
 
 switch ($agency) {
     case 'nkr':
-        $importer = new NkrImporter($db, $matcher);
-        $importer->import();
+        $importer = new NkrImporter($db, $matcher, $nameResolver);
+        $snapshotFile !== null
+            ? $importer->applySnapshot(loadCheckedSnapshot($snapshotFile, $agency, $force))
+            : $importer->import();
         break;
     case 'nra':
-        $importer = new NraImporter($db, $matcher, new RatingActionsWriter($db, new EventPublisher($db)));
-        $importer->import();
+        (new NraImporter($db, $matcher, new RatingActionsWriter($db, new EventPublisher($db)), $nameResolver))->import();
         break;
     case 'expert_ra':
-        $importer = new ExpertRaImporter($db, $matcher, new ExpertRaClient(), $delayMs * 1000);
-        $importer->import();
+        $importer = new ExpertRaImporter($db, $matcher, new ExpertRaClient(), $nameResolver, $delayMs * 1000);
+        $snapshotFile !== null
+            ? $importer->applySnapshot(loadCheckedSnapshot($snapshotFile, $agency, $force))
+            : $importer->import();
         break;
     case 'acra':
+        $importer = new AcraImporter($db, $matcher, $nameResolver);
+        if ($snapshotFile !== null) {
+            $importer->applySnapshot(loadCheckedSnapshot($snapshotFile, $agency, $force));
+            break;
+        }
         if ($file === null) {
-            fwrite(STDERR, "Для --agency=acra обязателен --file=/path/to/acra_issuers.json (см. docs/STAGE3_RATINGS.md — этот импортёр никогда не обращается к acra-ratings.ru сам)\n");
+            fwrite(STDERR, "Для --agency=acra обязателен --file=/path/to/acra_issuers.json или --snapshot=... (см. docs/STAGE3_RATINGS.md — этот импортёр никогда не обращается к acra-ratings.ru сам)\n");
             exit(1);
         }
-        $importer = new AcraImporter($db, $matcher);
         $importer->importFromFile($file);
         break;
     case 'manual':
@@ -314,24 +324,25 @@ switch ($agency) {
         (new ManualRatingsImporter($db, $matcher))->importFromFile($file);
         break;
     case 'nkr-news':
-        $importer = new NkrNewsImporter($db, $matcher, new RatingActionsWriter($db, new EventPublisher($db)));
-        $importer->import($full, $days ?? 2);
+        (new NkrNewsImporter($db, $matcher, new RatingActionsWriter($db, new EventPublisher($db)), $nameResolver))->import($full, $days ?? 2);
         break;
     case 'expert_ra-news':
-        $importer = new ExpertRaNewsImporter($db, $matcher, new RatingActionsWriter($db, new EventPublisher($db)), new ExpertRaClient(), $delayMs * 1000);
-        $importer->import($full, $days ?? 2);
+        (new ExpertRaNewsImporter($db, $matcher, new RatingActionsWriter($db, new EventPublisher($db)), new ExpertRaClient(), $nameResolver, $delayMs * 1000))->import($full, $days ?? 2);
         break;
     case 'acra-news':
-        $importer = new AcraNewsImporter($db, $matcher, new RatingActionsWriter($db, new EventPublisher($db)));
-        $importer->import($full, $days ?? 2);
+        (new AcraNewsImporter($db, $matcher, new RatingActionsWriter($db, new EventPublisher($db)), $nameResolver))->import($full, $days ?? 2);
         break;
     default:
         fwrite(STDERR, "Неизвестное агентство: {$agency}. Поддерживаются: nkr, nra, expert_ra, acra, manual, nkr-news, expert_ra-news, acra-news.\n");
         exit(1);
 }
 
-if ($importer !== null) {
-    notifyAdminOfRootMatches($importer->getRootMatchNotices(), $agency);
+// Новые предложения сопоставления по названию (миграция 024) — каждое
+// отдельным сообщением администратору: название у агентства и у нас,
+// ИНН, заголовок новости, ссылка на пресс-релиз, команды подтверждения.
+$sent = $reviews->notifyNewProposals([AdminNotifier::class, 'send']);
+if ($sent > 0) {
+    Logger::info("Отправлено администратору предложений сопоставления по названию: {$sent}");
 }
 
 Logger::info('Готово.');

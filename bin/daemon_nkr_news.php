@@ -38,9 +38,12 @@ require __DIR__ . '/bootstrap.php';
 use BondKeeper\Database;
 use BondKeeper\Events\EventPublisher;
 use BondKeeper\Ratings\IssuerMatcher;
+use BondKeeper\Ratings\NameMatchResolver;
+use BondKeeper\Ratings\NameMatchReviews;
 use BondKeeper\Ratings\NkrNewsImporter;
 use BondKeeper\Ratings\RatingActionsWriter;
 use BondKeeper\Support\Logger;
+use BondKeeper\Telegram\AdminNotifier;
 
 const FAST_INTERVAL_SECONDS = 1800; // 30 минут
 const DEEP_INTERVAL_SECONDS = 86400; // 24 часа
@@ -59,7 +62,11 @@ while (true) {
     try {
         $db = Database::connection();
         $matcher = new IssuerMatcher($db);
-        (new NkrNewsImporter($db, $matcher, new RatingActionsWriter($db, new EventPublisher($db))))->import(false, $days);
+        $reviews = new NameMatchReviews($db);
+        (new NkrNewsImporter($db, $matcher, new RatingActionsWriter($db, new EventPublisher($db)), new NameMatchResolver($matcher, $reviews)))->import(false, $days);
+        // Новые предложения сопоставления по названию — администратору
+        // (заголовок + ссылка на пресс-релиз, миграция 024).
+        $reviews->notifyNewProposals([AdminNotifier::class, 'send']);
     } catch (\Throwable $e) {
         // Одна неудачная попытка (сеть, временная ошибка сайта агентства)
         // не должна убивать весь процесс — тот же принцип, что и у

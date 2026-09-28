@@ -26,8 +26,11 @@ use BondKeeper\Events\EventPublisher;
 use BondKeeper\Ratings\ExpertRaClient;
 use BondKeeper\Ratings\ExpertRaNewsImporter;
 use BondKeeper\Ratings\IssuerMatcher;
+use BondKeeper\Ratings\NameMatchResolver;
+use BondKeeper\Ratings\NameMatchReviews;
 use BondKeeper\Ratings\RatingActionsWriter;
 use BondKeeper\Support\Logger;
+use BondKeeper\Telegram\AdminNotifier;
 
 const FAST_INTERVAL_SECONDS = 1800; // 30 минут
 const DEEP_INTERVAL_SECONDS = 86400; // 24 часа
@@ -47,7 +50,11 @@ while (true) {
     try {
         $db = Database::connection();
         $matcher = new IssuerMatcher($db);
-        (new ExpertRaNewsImporter($db, $matcher, new RatingActionsWriter($db, new EventPublisher($db)), new ExpertRaClient(), DELAY_MICROSECONDS))->import(false, $days);
+        $reviews = new NameMatchReviews($db);
+        (new ExpertRaNewsImporter($db, $matcher, new RatingActionsWriter($db, new EventPublisher($db)), new ExpertRaClient(), new NameMatchResolver($matcher, $reviews), DELAY_MICROSECONDS))->import(false, $days);
+        // Новые предложения сопоставления по названию — администратору
+        // (заголовок + ссылка на пресс-релиз, миграция 024).
+        $reviews->notifyNewProposals([AdminNotifier::class, 'send']);
     } catch (\Throwable $e) {
         // Одна неудачная попытка не должна убивать весь процесс —
         // следующий прогон через обычный интервал попробует снова.

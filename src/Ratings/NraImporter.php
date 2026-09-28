@@ -107,17 +107,15 @@ use RuntimeException;
  * как последняя по дате строка НА КАЖДОГО ЭМИТЕНТА среди возвращённых
  * этим методом кандидатов, а не берётся из отдельного источника.
  *
- * === Третий уровень сопоставления — "по корню" названия (миграция 022) ===
+ * === Сопоставление по названию — только после подтверждения (миграция 024) ===
  *
- * По прямому запросу пользователя (сентябрь 2026): если в issuers
- * заведена только SPV (или только материнская компания), а строка
- * выгрузки называет ДРУГУЮ сторону — ИНН не совпадёт вообще (это разные
- * юрлица с разными ИНН). importRow() пробует явную ручную связку
- * (issuer_spv_links, миграция 023), а если и она не подошла —
- * IssuerMatcher::findIssuerIdByRootName() как ПОСЛЕДНИЙ fallback. Строка
- * пишется как обычно, но с флагом matched_by_root_name — собирается в
- * getRootMatchNotices() для уведомления администратора (см.
- * bin/seed_ratings.php).
+ * resolveIssuerId(): ИНН → явная связка issuer_spv_links (миграция 023)
+ * → NameMatchResolver. Совпадение по названию без подтверждения
+ * администратора в базу не пишется — это предложение с названием
+ * пресс-релиза и ссылкой на него (решение пользователя, сентябрь 2026).
+ * Живой случай, из-за которого это понадобилось: курское ЗАО «Прогресс»
+ * получило "по корню" рейтинг липецкого АО «ПРОГРЕСС» («ФрутоНяня»), а
+ * фармацевтическая ООО «Озон» — рейтинг ООО «ОЗОН Банк».
  */
 final class NraImporter
 {
@@ -147,10 +145,9 @@ final class NraImporter
     private int $actionsWritten = 0;
     private int $actionsUnmatchedIssuer = 0;
     private int $actionsSameDayCollisions = 0;
-    private int $actionsMatchedByRoot = 0;
     private int $actionsMatchedBySpvLink = 0;
-    /** @var array<int, string> заголовки для уведомления администратору о root-совпадениях (см. bin/seed_ratings.php) */
-    private array $rootMatchNotices = [];
+    /** Новых предложений сопоставления по названию (ждут подтверждения администратора). */
+    private int $proposedByName = 0;
     /** @var array<int, string> issuer_id => дата последнего обработанного в ЭТОМ прогоне действия (только для счётчика коллизий выше) */
     private array $lastActionDatePerIssuerThisRun = [];
     /** @var array<int, true> issuer_id => затронут (для отчёта "current_ratings обновлён для N эмитентов") */
@@ -163,6 +160,7 @@ final class NraImporter
         private readonly PDO $db,
         private readonly IssuerMatcher $matcher,
         private readonly RatingActionsWriter $writer,
+        private readonly NameMatchResolver $nameResolver,
     ) {
     }
 
@@ -248,31 +246,9 @@ final class NraImporter
         }
 
         $issuerName = (string) ($row['Название организации'] ?? '');
+        $sourceTitle = mb_substr(trim($row['Название пресс-релиза'] ?? ''), 0, 500) ?: null;
 
-        $issuerId = $this->matcher->findIssuerIdByInn($row['_inn']);
-        if ($issuerId === null) {
-            // Явная ручная связка SPV → материнская компания (миграция
-            // 023) — приоритет выше root, см. NkrNewsImporter::
-            // resolveIssuerIds() за подробным объяснением реального
-            // случая («ЕВА»/«ФСК Активы»).
-            $issuerId = $this->matcher->findIssuerIdBySpvLink($row['_inn']);
-            if ($issuerId !== null) {
-                $this->actionsMatchedBySpvLink++;
-            }
-        }
-
-        $matchedByRoot = false;
-        if ($issuerId === null) {
-            // Третий, самый неточный уровень — "по корню" названия (без
-            // ОПФ и маркерных слов SPV "Финанс"/"Капитал"), только если
-            // ИНН и явная связка не подошли — см. IssuerMatcher::
-            // findIssuerIdByRootName() и запрос пользователя (сентябрь
-            // 2026): кейс "в issuers заведена только SPV/только
-            // материнская компания".
-            $issuerId = $this->matcher->findIssuerIdByRootName($issuerName);
-            $matchedByRoot = $issuerId !== null;
-        }
-
+        $issuerId = $this->resolveIssuerId($row['_inn'], $issuerName, $sourceTitle, $url);
         if ($issuerId === null) {
             $this->actionsUnmatchedIssuer++;
             $this->unmatchedNames[] = "{$issuerName} (ИНН={$row['_inn']})";
@@ -280,10 +256,6 @@ final class NraImporter
                 RatingNewsLog::log($this->db, self::AGENCY, $url, $row['_date'], 'skipped_unmatched');
             }
             return;
-        }
-        if ($matchedByRoot) {
-            $this->actionsMatchedByRoot++;
-            $this->rootMatchNotices[] = "НРА: «{$issuerName}» → issuer_id={$issuerId} (сопоставлено по корню названия, проверьте)" . ($url !== '' ? " — {$url}" : '');
         }
 
         if (($this->lastActionDatePerIssuerThisRun[$issuerId] ?? null) === $row['_date']) {
@@ -305,7 +277,6 @@ final class NraImporter
         $ratingFrom = $cached['rating'];
         $outlookFrom = $cached['outlook'];
 
-        $sourceTitle = mb_substr(trim($row['Название пресс-релиза'] ?? ''), 0, 500) ?: null;
         $sourceUrl = mb_substr($url, 0, 500) ?: null;
 
         $this->writer->upsert(
@@ -318,11 +289,10 @@ final class NraImporter
             $outlookTo,
             $sourceUrl,
             $sourceTitle,
-            $matchedByRoot,
         );
         $this->actionsWritten++;
 
-        CurrentRatingsSync::sync($this->db, $issuerId, self::AGENCY, $row['_date'], $ratingTo, $outlookTo, $cached, $matchedByRoot);
+        CurrentRatingsSync::sync($this->db, $issuerId, self::AGENCY, $row['_date'], $ratingTo, $outlookTo, $cached);
         $this->currentRatingsIssuersTouched[$issuerId] = true;
 
         if ($url !== '') {
@@ -330,10 +300,28 @@ final class NraImporter
         }
     }
 
-    /** @return array<int, string> тексты для админ-уведомления о совпадениях "по корню" в этом прогоне */
-    public function getRootMatchNotices(): array
+    /**
+     * ИНН → явная связка issuer_spv_links → NameMatchResolver (только
+     * подтверждённое название пишется, остальное — предложение с
+     * заголовком и ссылкой на пресс-релиз НРА).
+     */
+    private function resolveIssuerId(string $inn, string $issuerName, ?string $sourceTitle, string $url): ?int
     {
-        return $this->rootMatchNotices;
+        $issuerId = $this->matcher->findIssuerIdByInn($inn);
+        if ($issuerId !== null) {
+            return $issuerId;
+        }
+
+        $issuerId = $this->matcher->findIssuerIdBySpvLink($inn);
+        if ($issuerId !== null) {
+            $this->actionsMatchedBySpvLink++;
+            return $issuerId;
+        }
+
+        $result = $this->nameResolver->resolve(self::AGENCY, $inn, [$issuerName], $sourceTitle, $url !== '' ? $url : null);
+        $this->proposedByName += $result['proposed'];
+
+        return $result['issuerId'];
     }
 
     private function discoverExportUrl(): string
@@ -357,8 +345,8 @@ final class NraImporter
         Logger::info("rating_actions строк записано в этом прогоне: {$this->actionsWritten}");
         Logger::info("current_ratings затронуто эмитентов в этом прогоне: " . count($this->currentRatingsIssuersTouched));
         Logger::info("Пропущено из-за несопоставленного эмитента (попробуем снова на следующем прогоне): {$this->actionsUnmatchedIssuer}");
-        Logger::info("Из них сопоставлено по ручной связке SPV (issuer_spv_links): {$this->actionsMatchedBySpvLink}");
-        Logger::info("Из них сопоставлено 'по корню' названия (SPV/материнская компания, требует выборочной проверки): {$this->actionsMatchedByRoot}");
+        Logger::info("Сопоставлено по ручной связке SPV (issuer_spv_links): {$this->actionsMatchedBySpvLink}");
+        Logger::info("Новых предложений сопоставления по названию (ждут подтверждения, bin/review_matches.php): {$this->proposedByName}");
         Logger::info("Совпадений по дате внутри одного эмитента в этом прогоне (вторая запись тихо перезаписала первую): {$this->actionsSameDayCollisions}");
         if ($this->unmatchedNames !== []) {
             Logger::info('Не сопоставленные эмитенты: ' . implode('; ', array_slice($this->unmatchedNames, 0, 30)));

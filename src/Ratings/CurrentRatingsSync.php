@@ -46,9 +46,8 @@ final class CurrentRatingsSync
 
     /**
      * @param array{rating: ?string, outlook: ?string, last_action_date: ?string} $cached
-     * $matchedByRootName (миграция 022) — см. RatingActionsWriter::upsert():
-     * та же строка, если issuer_id этого действия получен третьим,
-     * "по корню" уровнем сопоставления (IssuerMatcher::findIssuerIdByRootName()).
+     * source='action' (миграция 025) — значение из рейтингового действия.
+     * matched_by_root_name всегда 0 — см. докблок RatingActionsWriter.
      */
     public static function sync(
         PDO $db,
@@ -58,7 +57,6 @@ final class CurrentRatingsSync
         string $ratingTo,
         ?string $outlookTo,
         array $cached,
-        bool $matchedByRootName = false,
     ): void {
         if ($cached['last_action_date'] !== null && $cached['last_action_date'] > $actionDate) {
             return;
@@ -66,13 +64,14 @@ final class CurrentRatingsSync
 
         $outlook = self::resolveOutlook($ratingTo, $outlookTo, $cached['outlook']);
         $stmt = $db->prepare(
-            'INSERT INTO current_ratings (issuer_id, agency, rating, outlook, last_action_date, matched_by_root_name)
-             VALUES (:issuer_id, :agency, :rating, :outlook, :last_action_date, :matched_by_root_name)
+            "INSERT INTO current_ratings (issuer_id, agency, rating, outlook, last_action_date, matched_by_root_name, source)
+             VALUES (:issuer_id, :agency, :rating, :outlook, :last_action_date, 0, 'action')
              ON DUPLICATE KEY UPDATE
                 rating = VALUES(rating),
                 outlook = VALUES(outlook),
                 last_action_date = VALUES(last_action_date),
-                matched_by_root_name = VALUES(matched_by_root_name)'
+                matched_by_root_name = 0,
+                source = 'action'"
         );
         $stmt->execute([
             'issuer_id' => $issuerId,
@@ -80,7 +79,6 @@ final class CurrentRatingsSync
             'rating' => mb_substr($ratingTo, 0, 20),
             'outlook' => $outlook,
             'last_action_date' => $actionDate,
-            'matched_by_root_name' => $matchedByRootName ? 1 : 0,
         ]);
     }
 

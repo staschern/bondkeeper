@@ -126,13 +126,18 @@ final class ManualRatingsImporter
             return;
         }
 
+        // source='manual' (миграция 025, П3) — сверка по этой метке
+        // понимает, что рейтинга может не быть в снимке агентства
+        // (ожидаемое расхождение, а не сбой).
         $stmt = $this->db->prepare(
-            'INSERT INTO current_ratings (issuer_id, agency, rating, outlook, last_action_date)
-             VALUES (:issuer_id, :agency, :rating, :outlook, :last_action_date)
+            "INSERT INTO current_ratings (issuer_id, agency, rating, outlook, last_action_date, matched_by_root_name, source)
+             VALUES (:issuer_id, :agency, :rating, :outlook, :last_action_date, 0, 'manual')
              ON DUPLICATE KEY UPDATE
                 rating = VALUES(rating),
                 outlook = VALUES(outlook),
-                last_action_date = VALUES(last_action_date)'
+                last_action_date = VALUES(last_action_date),
+                matched_by_root_name = 0,
+                source = 'manual'"
         );
         $stmt->execute([
             'issuer_id' => $issuerId,
