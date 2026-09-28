@@ -874,11 +874,66 @@ final class BotCommandHandler
         return null;
     }
 
+    /**
+     * Найдено вживую (16 и 28 сентября 2026, WARN в логе: "Telegram:
+     * editMessageText ... не удалось: Bad Request: MESSAGE_TOO_LONG"):
+     * у пользователя с большим списком отслеживания statusAllText()
+     * легко превышает лимит Telegram 4096 символов на сообщение —
+     * editMessageText() тогда молча возвращает false, ничего не
+     * меняется, а пользователь видит "ничего не произошло" (return
+     * этого метода — null, ошибка нигде не всплывала). Текст режется на
+     * части по границам блоков (splitIntoTelegramChunks()) — первая
+     * часть заменяет "Что показать?", остальные уходят отдельными
+     * сообщениями.
+     */
     private function showStatusAll(int $userId, int $chatId, int $messageId): ?string
     {
-        $this->telegram->editMessageText($chatId, $messageId, $this->statusAllText($userId));
+        $chunks = self::splitIntoTelegramChunks($this->statusAllText($userId));
+
+        $this->telegram->editMessageText($chatId, $messageId, $chunks[0] ?? '');
+        foreach (array_slice($chunks, 1) as $chunk) {
+            $this->telegram->sendMessage($chatId, $chunk);
+        }
 
         return null;
+    }
+
+    /**
+     * Разбивает текст, собранный из блоков через "\n\n" (см.
+     * statusAllText()), на части не длиннее $maxLen символов — с запасом
+     * ниже настоящего лимита Telegram 4096 (он считает в UTF-16 code
+     * units, не в mb_strlen()-символах — запас закрывает разницу для
+     * редких многобайтовых символов вроде эмодзи). Разрыв — только по
+     * границе блока, не внутри него, поэтому статус одной компании
+     * никогда не режется пополам (сам по себе блок одной компании — ФНС-
+     * строка + несколько строк агентств — на практике всегда далеко
+     * меньше $maxLen).
+     *
+     * @return array<int, string>
+     */
+    private static function splitIntoTelegramChunks(string $text, int $maxLen = 3500): array
+    {
+        if ($text === '') {
+            return [''];
+        }
+
+        $blocks = explode("\n\n", $text);
+        $chunks = [];
+        $current = '';
+        foreach ($blocks as $block) {
+            $candidate = $current === '' ? $block : $current . "\n\n" . $block;
+            if (mb_strlen($candidate) > $maxLen && $current !== '') {
+                $chunks[] = $current;
+                $current = $block;
+            } else {
+                $current = $candidate;
+            }
+        }
+        if ($current !== '') {
+            $chunks[] = $current;
+        }
+
+        return $chunks;
     }
 
     /**

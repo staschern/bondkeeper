@@ -29,9 +29,13 @@ final class FakeTelegramClient implements TelegramClientInterface
 {
     /** @var array{chat_id: int, message_id: int, text: string, keyboard: ?array}|null последний вызов editMessageText() — для проверок содержимого/кнопок */
     public ?array $lastEdit = null;
+    /** @var array<int, string> тексты всех вызовов sendMessage() по порядку — для проверки разбивки "Весь список" на несколько сообщений */
+    public array $sentMessages = [];
 
     public function sendMessage(int $chatId, string $text, ?array $replyMarkup = null, ?string $parseMode = null): bool
     {
+        $this->sentMessages[] = $text;
+
         return true;
     }
 
@@ -207,6 +211,35 @@ check(
 
 callPrivate($ref, $handler, 'dispatchStatusCallback', [1, 5001, 42, 'stat:all']);
 check('dispatchStatusCallback("all"): оба эмитента в отредактированном тексте', str_contains($telegram->lastEdit['text'], 'Роснефть') && str_contains($telegram->lastEdit['text'], 'Газпром'));
+check('dispatchStatusCallback("all"): короткий список — ровно одно редактирование, без лишних sendMessage()', $telegram->sentMessages === []);
+
+// --- splitIntoTelegramChunks() (найдено вживую 16 и 28 сентября 2026: "Весь
+// список" у пользователя с большим вотчлистом падал в Telegram с "Bad
+// Request: MESSAGE_TOO_LONG", editMessageText() тихо возвращал false, и
+// showStatusAll() не проверяла результат — пользователь видел "ничего не
+// произошло") — чистая логика разбивки на части по границам блоков "\n\n" ---
+check('splitIntoTelegramChunks(): пустой текст -> одна пустая часть', callPrivate($ref, $handler, 'splitIntoTelegramChunks', ['', 3500]) === ['']);
+check(
+    'splitIntoTelegramChunks(): всё помещается в лимит -> одна часть без изменений',
+    callPrivate($ref, $handler, 'splitIntoTelegramChunks', ["AAA\n\nBBB", 3500]) === ["AAA\n\nBBB"]
+);
+
+$fourBlocks = "AAAAAAAAAA\n\nBBBBBBBBBB\n\nCCCCCCCCCC\n\nDDDDDDDDDD";
+$split = callPrivate($ref, $handler, 'splitIntoTelegramChunks', [$fourBlocks, 25]);
+check('splitIntoTelegramChunks(): режет ровно по границе блока, не внутри него', $split === ["AAAAAAAAAA\n\nBBBBBBBBBB", "CCCCCCCCCC\n\nDDDDDDDDDD"]);
+check('splitIntoTelegramChunks(): ни одна часть не превышает maxLen', max(array_map('mb_strlen', $split)) <= 25);
+check(
+    'splitIntoTelegramChunks(): все исходные блоки сохранены (ничего не потерялось при разбивке)',
+    implode("\n\n", $split) === $fourBlocks
+);
+
+// Крупный синтетический случай (20 блоков по ~100 символов, как реальный
+// statusAllText() у пользователя с большим списком отслеживания) — ни
+// одна часть не должна превышать реальный лимит Telegram.
+$manyBlocks = implode("\n\n", array_fill(0, 20, str_repeat('Й', 100)));
+$manySplit = callPrivate($ref, $handler, 'splitIntoTelegramChunks', [$manyBlocks, 1000]);
+check('splitIntoTelegramChunks(): крупный список -> несколько частей', count($manySplit) > 1);
+check('splitIntoTelegramChunks(): крупный список -> ни одна часть не превышает лимит', max(array_map('mb_strlen', $manySplit)) <= 1000);
 
 callPrivate($ref, $handler, 'dispatchStatusCallback', [1, 5001, 42, 'stat:one:1']);
 check('dispatchStatusCallback("one"): только выбранный эмитент в тексте', str_contains($telegram->lastEdit['text'], 'Роснефть') && !str_contains($telegram->lastEdit['text'], 'Газпром'));
@@ -499,6 +532,38 @@ check('Меню: "Подписка" — style=success (зелёная)', $rows[0
 check('Меню: "Статус" — без style (серая по умолчанию)', !isset($rows[1][0]['style']));
 check('Меню: "О сервисе" — style=danger (красная)', $rows[1][1]['style'] === 'danger');
 check('Меню: "Помощь" — без style (серая по умолчанию)', !isset($rows[2][0]['style']));
+
+// --- Сквозная проверка через реальный маршрут: showStatusAll() у пользователя 777
+// (большой вотчлист) — фикстуры заводятся в самом конце файла, ПОСЛЕ
+// showIssuerBrowsePage() выше: та сканирует ВСЮ таблицу issuers для "Выбор
+// компаний", и лишние 20 строк раньше сдвинули бы её пагинацию. ---
+for ($i = 100; $i < 120; $i++) {
+    $db->exec("INSERT INTO issuers (id, inn, full_name, short_name) VALUES ({$i}, '00000{$i}0000', 'Эмитент №{$i} ПАО', 'Эмитент №{$i}')");
+    $db->exec("INSERT INTO current_ratings (issuer_id, agency, rating, outlook, last_action_date) VALUES ({$i}, 'nkr', 'AAA.ru', 'stable', '2026-07-01')");
+    $db->exec("INSERT INTO current_ratings (issuer_id, agency, rating, outlook, last_action_date) VALUES ({$i}, 'acra', 'AAA(RU)', 'positive', '2026-06-20')");
+    $db->exec("INSERT INTO watchlist (user_id, issuer_id) VALUES (777, {$i})");
+}
+$telegram->lastEdit = null;
+$telegram->sentMessages = [];
+callPrivate($ref, $handler, 'dispatchStatusCallback', [777, 5002, 43, 'stat:all']);
+check('dispatchStatusCallback("all"), большой список: первая часть -- редактирование, не превышает лимит', mb_strlen($telegram->lastEdit['text']) <= 3500);
+check('dispatchStatusCallback("all"), большой список: реально разбито на несколько сообщений (баг MESSAGE_TOO_LONG исправлен)', $telegram->sentMessages !== []);
+check(
+    'dispatchStatusCallback("all"), большой список: ни у edit, ни у одного sendMessage() текст не превышает лимит',
+    mb_strlen($telegram->lastEdit['text']) <= 3500 && max(array_map('mb_strlen', $telegram->sentMessages)) <= 3500
+);
+check(
+    'dispatchStatusCallback("all"), большой список: все 20 эмитентов присутствуют суммарно (edit + все sendMessage)',
+    (function () use ($telegram): bool {
+        $combined = $telegram->lastEdit['text'] . "\n\n" . implode("\n\n", $telegram->sentMessages);
+        for ($i = 100; $i < 120; $i++) {
+            if (!str_contains($combined, "Эмитент №{$i}")) {
+                return false;
+            }
+        }
+        return true;
+    })()
+);
 
 echo "\n";
 if ($failures === 0) {
