@@ -21,6 +21,16 @@ namespace BondKeeper\Ratings;
  *     ожидаемо, если наше значение пришло из новости о рейтинге выпуска
  *     облигаций (у выпуска нет прогноза, а дата новее даты рейтинга
  *     компании — ИКС 5 ФИНАНС, Мэйл.Ру Финанс, Синара-ТМ).
+ *
+ * Сверка Эксперт РА 29.09.2026:
+ *   - если наша новость — из тех, что теперь не влияют на рейтинг
+ *     компании (погашение/неразмещение выпуска, субординированные,
+ *     ожидаемый рейтинг — RatingsNormalizer::bondNewsSkipStatus()), это не
+ *     ожидаемое расхождение, а значение, записанное до обновления правил
+ *     (ПетроИнжиниринг и Автодор "отозван", Альфа-Банк ruA+), —
+ *     "требуют внимания";
+ *   - расхождение только из-за нашего статуса наблюдения, которого нет в
+ *     списке агентства (watch_kept, см. SnapshotRows), — ожидаемое.
  */
 final class ReconcileSummary
 {
@@ -49,7 +59,7 @@ final class ReconcileSummary
     /**
      * @param array{
      *     snapshot_count: int,
-     *     field_mismatches: array<int, array{issuer_id: int, our_name: string, agency_name: string, field: string, ours: ?string, theirs: ?string, our_source: ?string, our_action_title: ?string, our_action_url: ?string}>,
+     *     field_mismatches: array<int, array{issuer_id: int, our_name: string, agency_name: string, field: string, ours: ?string, theirs: ?string, our_source: ?string, our_action_title: ?string, our_action_url: ?string, watch_kept?: bool}>,
      *     missing_in_ours: array<int, array{issuer_id: int, our_name: string, agency_name: string, rating: string, outlook: ?string, last_action_date: string}>,
      *     missing_in_snapshot: array<int, array{issuer_id: int, our_name: string, ours: ?string, last_action_date: ?string, source: ?string, expected: bool, reason: ?string, note: ?string}>
      * } $result
@@ -67,8 +77,22 @@ final class ReconcileSummary
                 $group,
             );
             $line = '• ' . self::issuer($first['issuer_id'], $first['our_name'], $first['agency_name']) . ': ' . implode('; ', $changes);
+            $title = (string) $first['our_action_title'];
 
-            if ($first['our_source'] === 'action' && RatingsNormalizer::isBondIssueRatingTitle((string) $first['our_action_title'])) {
+            if ($first['our_source'] === 'action' && $title !== '') {
+                $skip = RatingsNormalizer::bondNewsSkipStatusForStoredTitle($title);
+                if ($skip !== null) {
+                    $attention[] = $line . ' · наше: ' . self::source('action', $first['our_action_title'], $first['our_action_url'])
+                        . ' — такие новости теперь не влияют на рейтинг компании (' . RatingsNormalizer::bondNewsSkipLabel($skip)
+                        . '); записано до обновления правил, исправит перезапись';
+                    continue;
+                }
+            }
+            if ($first['watch_kept'] ?? false) {
+                $expected[] = $line . ' · статус «под наблюдением» агентство в своём списке не показывает — оставляем наш, перезапись его не сотрёт';
+                continue;
+            }
+            if ($first['our_source'] === 'action' && RatingsNormalizer::isBondIssueRatingTitle($title)) {
                 $expected[] = $line . ' · наше — из новости о рейтинге выпуска облигаций';
                 continue;
             }

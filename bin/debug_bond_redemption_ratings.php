@@ -7,22 +7,19 @@ declare(strict_types=1);
  * "отзыв рейтинга ВЫПУСКА из-за погашения писался как отзыв рейтинга
  * ЭМИТЕНТА" (см. docs/STAGE3_RATINGS.md, раздел от 17 сентября 2026, и
  * RatingsNormalizer::isBondIssueRedemptionWithdrawal()). Сам фикс
- * защищает только БУДУЩИЕ прогоны — уже записанные до фикса строки
- * rating_actions/current_ratings он не трогает, эта диагностика находит
- * их для ручного решения, что с ними делать дальше.
+ * защищает только БУДУЩИЕ прогоны — уже записанные строки
+ * rating_actions/current_ratings он не трогает; их удаляет
+ * bin/fix_bond_redemption_ratings.php, а этот скрипт показывает ровно его
+ * план (BondRedemptionCleanup::plan()).
  *
- * Логика: берём все rating_actions, где rating_to = 'отозван' (литерал,
- * которым всегда записывался отзыв), прогоняем их source_title (сырой
- * заголовок пресс-релиза, сохранённый на момент импорта) через ТОТ ЖЕ
- * самый метод, что теперь фильтрует такие строки на входе. Совпало —
- * значит эта строка ЛОЖНАЯ (отзыв выпуска, не эмитента). Дополнительно
- * сверяем с текущим значением current_ratings.rating для той же пары
- * (issuer_id, agency) — если оно тоже 'отозван' и его last_action_date
- * совпадает с датой этой самой строки, это АКТИВНОЕ заражение (прямо
- * сейчас показывается пользователям как "рейтинг отозван"); если
- * current_ratings уже другое (более позднее реальное действие
- * перезаписало) — это исторический след, никак не влияющий на
- * отображаемый статус сейчас.
+ * По каждой паре (компания, агентство):
+ *   - АКТИВНОЕ заражение — текущий рейтинг 'отозван' с датой одной из
+ *     ложных строк (прямо сейчас показывается "рейтинг отозван"); скрипт
+ *     исправления заменит его последней оставшейся новостью или удалит
+ *     строку, если новостей не осталось;
+ *   - историческое — текущий рейтинг уже другой (перезапись снимком,
+ *     ручной ввод, более поздняя новость); удаляется только строка
+ *     истории, текущий рейтинг не трогается (правка 29.09.2026).
  *
  * Запуск:
  *   php bin/debug_bond_redemption_ratings.php
@@ -31,57 +28,41 @@ declare(strict_types=1);
 require __DIR__ . '/bootstrap.php';
 
 use BondKeeper\Database;
-use BondKeeper\Ratings\RatingsNormalizer;
+use BondKeeper\Ratings\BondRedemptionCleanup;
 
-$db = Database::connection();
+$plan = (new BondRedemptionCleanup(Database::connection()))->plan();
 
-$stmt = $db->query(
-    "SELECT ra.id, ra.issuer_id, i.short_name, i.inn, ra.agency, ra.action_date,
-            ra.source_title, ra.source_url,
-            cr.rating AS current_rating, cr.last_action_date AS current_last_action_date
-     FROM rating_actions ra
-     JOIN issuers i ON i.id = ra.issuer_id
-     LEFT JOIN current_ratings cr ON cr.issuer_id = ra.issuer_id AND cr.agency = ra.agency
-     WHERE ra.rating_to = 'отозван'
-     ORDER BY ra.issuer_id, ra.agency, ra.action_date"
-);
-$rows = $stmt->fetchAll();
-
-echo 'Всего строк rating_actions с rating_to=\'отозван\': ' . count($rows) . "\n\n";
-
-$falsePositives = [];
-foreach ($rows as $row) {
-    $title = (string) ($row['source_title'] ?? '');
-    if ($title === '' || !RatingsNormalizer::isBondIssueRedemptionWithdrawal($title)) {
-        continue;
-    }
-    $falsePositives[] = $row;
-}
-
-echo 'Из них ложных (отзыв ВЫПУСКА из-за погашения, не эмитента): ' . count($falsePositives) . "\n";
+echo 'Ложных строк rating_actions (отзыв ВЫПУСКА из-за погашения, не эмитента): ' . count($plan['actions']) . "\n";
 echo str_repeat('=', 100) . "\n\n";
 
-$activeCount = 0;
-foreach ($falsePositives as $row) {
-    $isActive = $row['current_rating'] === 'отозван' && $row['current_last_action_date'] === $row['action_date'];
-    if ($isActive) {
-        $activeCount++;
-    }
-
+foreach ($plan['actions'] as $action) {
     printf(
-        "%s issuer_id=%d %s (ИНН %s) | агентство: %s | дата действия: %s\n  Заголовок: %s\n  Ссылка: %s\n  current_ratings сейчас: %s (last_action_date=%s)%s\n\n",
-        $isActive ? '⚠️  АКТИВНОЕ ЗАРАЖЕНИЕ' : '   (историческое, уже перекрыто)',
-        (int) $row['issuer_id'],
-        (string) $row['short_name'],
-        (string) $row['inn'],
-        (string) $row['agency'],
-        (string) $row['action_date'],
-        (string) $row['source_title'],
-        (string) $row['source_url'],
-        $row['current_rating'] !== null ? (string) $row['current_rating'] : '—',
-        $row['current_last_action_date'] !== null ? (string) $row['current_last_action_date'] : '—',
-        $isActive ? "\n  rating_actions.id=" . (int) $row['id'] : ''
+        "rating_actions.id=%d | issuer_id=%d %s | %s | %s\n  Заголовок: %s\n  Ссылка: %s\n\n",
+        $action['id'],
+        $action['issuer_id'],
+        $action['short_name'],
+        $action['agency'],
+        $action['action_date'],
+        $action['source_title'],
+        $action['source_url'] ?? '—'
     );
+}
+
+echo str_repeat('=', 100) . "\nТекущий рейтинг по затронутым парам:\n\n";
+$activeCount = 0;
+foreach ($plan['pairs'] as $pair) {
+    $current = $pair['current'] !== null
+        ? "{$pair['current']['rating']} от {$pair['current']['last_action_date']} (источник: " . ($pair['current']['source'] ?? 'не указан') . ')'
+        : 'строки нет';
+    if ($pair['active']) {
+        $activeCount++;
+        $after = $pair['replacement'] !== null
+            ? "станет {$pair['replacement']['rating']} от {$pair['replacement']['action_date']} по новости «{$pair['replacement']['source_title']}»"
+            : 'других новостей нет — строка current_ratings будет удалена';
+        echo "⚠️  АКТИВНОЕ ЗАРАЖЕНИЕ issuer_id={$pair['issuer_id']} {$pair['short_name']} | {$pair['agency']}\n  сейчас: {$current}\n  {$after}\n\n";
+    } else {
+        echo "   (историческое) issuer_id={$pair['issuer_id']} {$pair['short_name']} | {$pair['agency']}\n  сейчас: {$current} — не трогаем\n\n";
+    }
 }
 
 echo str_repeat('=', 100) . "\n";

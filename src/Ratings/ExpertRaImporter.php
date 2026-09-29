@@ -109,8 +109,13 @@ final class ExpertRaImporter
      */
     public function applySnapshot(array $snapshot): void
     {
-        $written = SnapshotRows::apply($this->db, self::AGENCY, $snapshot);
+        $written = SnapshotRows::apply($this->db, self::AGENCY, $snapshot, $keptWatch);
         Logger::info("Эксперт РА: записано строк current_ratings (source='snapshot'): {$written}");
+        if ($keptWatch !== []) {
+            // В списке Эксперт РА нет статуса «под наблюдением» — см. SnapshotRows.
+            Logger::info('Эксперт РА: оставлен наш статус «под наблюдением» (в списке агентства его нет): ' . count($keptWatch)
+                . ' — issuer_id ' . implode(', ', $keptWatch));
+        }
     }
 
     /**

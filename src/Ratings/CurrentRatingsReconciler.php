@@ -35,13 +35,7 @@ use PDO;
  *      названия: наше (issuers.short_name) и у агентства (П14: раньше
  *      печаталось только название агентства, и фармацевтическая «Озон»
  *      выглядела в отчёте как «ОЗОН Банк»), источник нашего значения и,
- *      если оно из новости, — заголовок и ссылка этой новости. Как и у
- *      missing_in_snapshot, есть 'expected'/'reason' (28 сентября 2026,
- *      прямой запрос пользователя после разбора первой полной сводки):
- *      ручной ввод (source='manual') и рейтинг выпуска облигаций из
- *      новости — тот же смысл, что и у explainMissing() ниже, просто
- *      применённый к расхождению по полю, а не к полному отсутствию в
- *      снимке (см. explainFieldMismatch()).
+ *      если оно из новости, — заголовок и ссылка этой новости.
  *   2. missing_in_ours — агентство знает эмитента, у нас в
  *      current_ratings для этой пары (issuer_id, agency) нет строки
  *      вообще.
@@ -57,8 +51,11 @@ use PDO;
  * саму компанию). Причины, по которым строка считается ожидаемой
  * (explainMissing()):
  *   - source='manual' — внесено вручную (миграция 025);
- *   - рейтинг 'отозван' — отозванных нет в списке действующих
- *     (решение пользователя: храним, ограничений по времени нет, П6);
+ *   - рейтинг 'отозван' (решение пользователя: храним, ограничений по
+ *     времени нет, П6). В причине — последнее действие: отозванные
+ *     рейтинги в списках агентств бывают (у Эксперт РА 407 из 657 строк
+ *     трёх категорий, 29.09.2026), так что "нет в снимке" значит, что
+ *     агентство не рейтингует саму компанию;
  *   - issuer_id — цель связки issuer_spv_links (рейтинг приходит через
  *     ИНН другой компании);
  *   - issuer_id — цель подтверждённого сопоставления по названию
@@ -68,6 +65,24 @@ use PDO;
  * Строка со старым флагом matched_by_root_name=1 больше НЕ считается
  * ожидаемой — сопоставление "по корню" дало ложные совпадения (Озон,
  * Прогресс), такие строки выводятся в "требуют внимания" с пометкой.
+ *
+ * === Значение из новости, которую теперь пропускаем (29.09.2026) ===
+ *
+ * Сверка Эксперт РА 29.09: СОПФ ДОМ.РФ "отозван" из новости о погашении
+ * выпуска попал в ожидаемые ("рейтинг отозван"), хотя это ошибка
+ * старого разбора — такие новости (погашение, неразмещение,
+ * субординированные, ожидаемый рейтинг) больше не влияют на рейтинг
+ * компании (RatingsNormalizer::bondNewsSkipStatus()). Если наше значение
+ * пришло из новости (source='action') и последняя новость такая — строка
+ * "требует внимания" с пометкой (note), а не ожидаемая. Для расхождений
+ * по полям это решает ReconcileSummary по заголовку our_action_title.
+ *
+ * === Статус наблюдения (29.09.2026) ===
+ *
+ * Если наше "под наблюдением" остаётся при перезаписи
+ * (SnapshotRows::keepsOurWatchStatus() — в списке Эксперт РА статуса нет),
+ * расхождение по прогнозу/дате помечается watch_kept=true, и сводка
+ * относит его к ожидаемым.
  */
 final class CurrentRatingsReconciler
 {
@@ -80,7 +95,7 @@ final class CurrentRatingsReconciler
      * @param array<int, array{issuer_id: int, issuer_name: string, rating: string, outlook: ?string, last_action_date: string}> $snapshot
      * @return array{
      *     snapshot_count: int,
-     *     field_mismatches: array<int, array{issuer_id: int, our_name: string, agency_name: string, field: string, ours: ?string, theirs: ?string, our_source: ?string, our_action_title: ?string, our_action_url: ?string, expected: bool, reason: ?string}>,
+     *     field_mismatches: array<int, array{issuer_id: int, our_name: string, agency_name: string, field: string, ours: ?string, theirs: ?string, our_source: ?string, our_action_title: ?string, our_action_url: ?string, watch_kept: bool}>,
      *     missing_in_ours: array<int, array{issuer_id: int, our_name: string, agency_name: string, rating: string, outlook: ?string, last_action_date: string}>,
      *     missing_in_snapshot: array<int, array{issuer_id: int, our_name: string, ours: ?string, last_action_date: ?string, source: ?string, expected: bool, reason: ?string, note: ?string}>
      * }
@@ -110,20 +125,15 @@ final class CurrentRatingsReconciler
                 continue;
             }
 
-            $differingFields = array_values(array_filter(
-                ['rating', 'outlook', 'last_action_date'],
-                static fn (string $field): bool => $ours[$field] !== $row[$field],
-            ));
-            if ($differingFields === []) {
-                continue;
-            }
-
-            $lastAction = $ours['source'] === 'action'
-                ? ($this->fetchLastAction($row['issuer_id'], $agency) ?? ['source_title' => null, 'source_url' => null])
-                : null;
-            [$expected, $reason] = $this->explainFieldMismatch($ours['source'], $lastAction['source_title'] ?? null);
-
-            foreach ($differingFields as $field) {
+            $lastAction = null;
+            $watchKept = SnapshotRows::keepsOurWatchStatus($agency, $ours, $row);
+            foreach (['rating', 'outlook', 'last_action_date'] as $field) {
+                if ($ours[$field] === $row[$field]) {
+                    continue;
+                }
+                if ($ours['source'] === 'action' && $lastAction === null) {
+                    $lastAction = $this->fetchLastAction($row['issuer_id'], $agency) ?? ['source_title' => null, 'source_url' => null];
+                }
                 $fieldMismatches[] = [
                     'issuer_id' => $row['issuer_id'],
                     'our_name' => $ours['short_name'],
@@ -134,8 +144,7 @@ final class CurrentRatingsReconciler
                     'our_source' => $ours['source'],
                     'our_action_title' => $lastAction['source_title'] ?? null,
                     'our_action_url' => $lastAction['source_url'] ?? null,
-                    'expected' => $expected,
-                    'reason' => $reason,
+                    'watch_kept' => $watchKept,
                 ];
             }
         }
@@ -155,7 +164,13 @@ final class CurrentRatingsReconciler
                 continue;
             }
 
-            $reason = $this->explainMissing($issuerId, $agency, $row);
+            $lastAction = $this->fetchLastAction($issuerId, $agency);
+            $skippedNote = $this->skippedNewsNote($row, $lastAction);
+            $reason = $skippedNote === null ? $this->explainMissing($issuerId, $row, $lastAction) : null;
+            $notes = array_filter([
+                (bool) $row['matched_by_root_name'] ? 'строка получена старым сопоставлением «по корню» названия — проверьте, та ли это компания' : null,
+                $skippedNote,
+            ]);
             $missingInSnapshot[] = [
                 'issuer_id' => $issuerId,
                 'our_name' => (string) $row['short_name'],
@@ -164,9 +179,7 @@ final class CurrentRatingsReconciler
                 'source' => $row['source'],
                 'expected' => $reason !== null,
                 'reason' => $reason,
-                'note' => (bool) $row['matched_by_root_name']
-                    ? 'строка получена старым сопоставлением «по корню» названия — проверьте, та ли это компания'
-                    : null,
+                'note' => $notes !== [] ? implode(' · ', $notes) : null,
             ];
         }
 
@@ -232,15 +245,18 @@ final class CurrentRatingsReconciler
 
     /**
      * @param array{rating: ?string, source: ?string} $row
+     * @param array{source_title: ?string, source_url: ?string}|null $lastAction
      * @return string|null причина, по которой отсутствие в снимке ожидаемо; null — требует внимания
      */
-    private function explainMissing(int $issuerId, string $agency, array $row): ?string
+    private function explainMissing(int $issuerId, array $row, ?array $lastAction): ?string
     {
         if ($row['source'] === 'manual') {
             return 'внесено вручную из xlsx — агентство рейтингует облигации компании или её мать, а не саму компанию';
         }
         if ($row['rating'] === 'отозван') {
-            return 'рейтинг отозван — в списке действующих его и не должно быть';
+            return 'рейтинг отозван' . ($lastAction !== null && (string) $lastAction['source_title'] !== ''
+                ? ', последнее действие: ' . self::quoteAction($lastAction)
+                : '');
         }
 
         $link = $this->db->prepare('SELECT spv_inn, spv_name FROM issuer_spv_links WHERE issuer_id = :issuer_id ORDER BY spv_inn');
@@ -266,36 +282,39 @@ final class CurrentRatingsReconciler
             return "подтверждённое сопоставление по названию «{$approvedName}» (источник без ИНН)";
         }
 
-        $lastAction = $this->fetchLastAction($issuerId, $agency);
         if ($lastAction !== null && RatingsNormalizer::isBondIssueRatingTitle((string) $lastAction['source_title'])) {
-            return 'последнее действие — рейтинг выпуска облигаций: «' . $lastAction['source_title'] . '»'
-                . (($lastAction['source_url'] ?? '') !== '' ? ' ' . $lastAction['source_url'] : '');
+            return 'последнее действие — рейтинг выпуска облигаций: ' . self::quoteAction($lastAction);
         }
 
         return null;
     }
 
     /**
-     * Та же логика, что и в explainMissing(), но для расхождения по
-     * ПОЛЮ (снимок эмитента знает, но наше значение отличается) — только
-     * два из пяти признаков explainMissing() тут вообще применимы: спв-
-     * связка и подтверждённое название объясняют ОТСУТСТВИЕ строки в
-     * снимке, а не то, что она есть, но другая; 'отозван' сюда тоже не
-     * подходит буквально (это признак отсутствия в списке действующих,
-     * не конкретного поля).
+     * Пометка "значение из новости, которую теперь пропускаем" — см.
+     * докблок класса. NULL — значение не из такой новости.
      *
-     * @return array{0: bool, 1: ?string}
+     * @param array{source: ?string} $row
+     * @param array{source_title: ?string, source_url: ?string}|null $lastAction
      */
-    private function explainFieldMismatch(?string $source, ?string $actionTitle): array
+    private function skippedNewsNote(array $row, ?array $lastAction): ?string
     {
-        if ($source === 'manual') {
-            return [true, 'внесено вручную из xlsx'];
+        if ($row['source'] !== 'action' || $lastAction === null) {
+            return null;
         }
-        if ($source === 'action' && $actionTitle !== null && RatingsNormalizer::isBondIssueRatingTitle($actionTitle)) {
-            return [true, 'последнее действие — рейтинг выпуска облигаций, а не самого эмитента'];
+        $status = RatingsNormalizer::bondNewsSkipStatusForStoredTitle((string) $lastAction['source_title']);
+        if ($status === null) {
+            return null;
         }
 
-        return [false, null];
+        return 'наше — из новости ' . self::quoteAction($lastAction) . ', такие новости теперь не влияют на рейтинг компании ('
+            . RatingsNormalizer::bondNewsSkipLabel($status) . '); записано до обновления правил. Перезапись это не исправит — компании нет в списке агентства'
+            . ($status === 'skipped_bond_redemption' ? '; исправит bin/fix_bond_redemption_ratings.php' : '');
+    }
+
+    /** @param array{source_title: ?string, source_url: ?string} $action */
+    private static function quoteAction(array $action): string
+    {
+        return '«' . $action['source_title'] . '»' . (($action['source_url'] ?? '') !== '' ? ' ' . $action['source_url'] : '');
     }
 
     /** @return array{rating: ?string, outlook: ?string, last_action_date: ?string, source: ?string, short_name: string}|null */
@@ -328,7 +347,7 @@ final class CurrentRatingsReconciler
         $stmt = $this->db->prepare(
             'SELECT source_title, source_url FROM rating_actions
              WHERE issuer_id = :issuer_id AND agency = :agency
-             ORDER BY action_date DESC
+             ORDER BY action_date DESC, id DESC
              LIMIT 1'
         );
         $stmt->execute(['issuer_id' => $issuerId, 'agency' => $agency]);

@@ -15,7 +15,14 @@ use PDO;
  *   2. отзыв НРА, записанный прочерком "—", → 'отозван' (как у остальных
  *      агентств) — RatingsNormalizer::ratingFromNraColumn();
  *   3. у отозванного рейтинга в current_ratings прогноз пустой (решение
- *      пользователя: "если рейтинг отозван, то прогноз пустой").
+ *      пользователя: "если рейтинг отозван, то прогноз пустой");
+ *   4. у дефолтного рейтинга (D/SD в написании любого агентства —
+ *      RatingsNormalizer::isDefaultGrade()) в current_ratings прогноз
+ *      пустой (29.09.2026, сверка НРА): правило действует при записи с
+ *      18–19.09 (случай ЛКХ), а строки, записанные раньше, остались —
+ *      «Антерра» (НРА) с 07.09 хранила D|ru| + review_concluded; по
+ *      выгрузке пользователя от 18.09 таких строк было 4 (НРА, АКРА, две
+ *      НКР).
  * История rating_actions по прогнозу не меняется. Ключи таблиц не
  * меняются. Переносимый SQL — ради офлайн-теста на SQLite, см.
  * tests/test_stored_ratings_normalizer.php.
@@ -38,12 +45,13 @@ final class StoredRatingsNormalizer
      * @return array{
      *     grades: array<int, array{table: string, column: string, from: string, to: string, rows: int}>,
      *     nra_withdrawn: array<int, array{table: string, column: string, rows: int}>,
-     *     withdrawn_outlook: array<int, array{issuer_id: int, agency: string, outlook: string}>
+     *     withdrawn_outlook: array<int, array{issuer_id: int, agency: string, outlook: string}>,
+     *     default_outlook: array<int, array{issuer_id: int, agency: string, rating: string, outlook: string}>
      * } что изменено (при $apply) или будет изменено (без $apply)
      */
     public function run(bool $apply): array
     {
-        $report = ['grades' => [], 'nra_withdrawn' => [], 'withdrawn_outlook' => []];
+        $report = ['grades' => [], 'nra_withdrawn' => [], 'withdrawn_outlook' => [], 'default_outlook' => []];
 
         // 1. Кириллица в рейтингах.
         foreach (self::GRADE_COLUMNS as [$table, $column]) {
@@ -88,6 +96,27 @@ final class StoredRatingsNormalizer
         }
         if ($apply && $rows !== []) {
             $this->db->exec("UPDATE current_ratings SET outlook = NULL WHERE rating = 'отозван' AND outlook IS NOT NULL");
+        }
+
+        // 4. Дефолтный рейтинг → прогноз пустой. Декорации грейда у агентств
+        // разные (D, D(RU), ruD, D|ru|, SD…) — проверка в PHP, запись по ключу.
+        $rows = $this->db->query(
+            "SELECT issuer_id, agency, rating, outlook FROM current_ratings WHERE outlook IS NOT NULL AND rating <> 'отозван' ORDER BY agency, issuer_id"
+        )->fetchAll(PDO::FETCH_ASSOC);
+        $clear = $this->db->prepare('UPDATE current_ratings SET outlook = NULL WHERE issuer_id = :issuer_id AND agency = :agency');
+        foreach ($rows as $row) {
+            if (!RatingsNormalizer::isDefaultGrade((string) $row['rating'])) {
+                continue;
+            }
+            $report['default_outlook'][] = [
+                'issuer_id' => (int) $row['issuer_id'],
+                'agency' => (string) $row['agency'],
+                'rating' => (string) $row['rating'],
+                'outlook' => (string) $row['outlook'],
+            ];
+            if ($apply) {
+                $clear->execute(['issuer_id' => (int) $row['issuer_id'], 'agency' => (string) $row['agency']]);
+            }
         }
 
         return $report;

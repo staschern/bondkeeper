@@ -159,31 +159,50 @@ $nullOutlook = $reconciler->reconcile('nkr', [
 ]);
 check('null = null — не расхождение', $nullOutlook['field_mismatches'] === []);
 
-echo "--- field_mismatches: expected/reason (28 сентября 2026, тот же смысл, что у missing_in_snapshot) ---\n";
-$db->exec("INSERT INTO issuers (id, short_name) VALUES (20, 'Ручной эмитент')");
-$db->exec("INSERT INTO issuers (id, short_name) VALUES (21, 'Эмитент с рейтингом выпуска')");
-$addCr(20, 'nkr', 'A-.ru', null, '2026-09-02', 0, 'manual');
-$addCr(21, 'nkr', 'ruAA-', null, '2026-09-10', 0, 'action');
-$db->exec("INSERT INTO rating_actions (issuer_id, agency, action_date, rating_to, source_title, source_url) VALUES (21, 'nkr', '2026-09-10', 'ruAA-', 'НКР присвоило выпуску облигаций ООО «Тест» рейтинг ruAA-', 'https://ratings.ru/news/21')");
+echo "--- Сверка Эксперт РА 29.09.2026: отозван из новости о погашении, статус наблюдения ---\n";
+foreach ([20 => 'СОПФ ДОМ.РФ', 21 => 'Селектел', 22 => 'ТрансКонтейнер', 23 => 'ДелоПортс', 24 => 'УК Дело', 25 => 'Без новостей'] as $id => $name) {
+    $db->prepare('INSERT INTO issuers (id, short_name) VALUES (:id, :name)')->execute(['id' => $id, 'name' => $name]);
+}
+$addAction = static fn (int $id, string $date, string $rating, string $title, string $url) => $db->prepare(
+    "INSERT INTO rating_actions (issuer_id, agency, action_date, rating_to, source_title, source_url) VALUES (:id, 'expert_ra', :dt, :rating, :title, :url)"
+)->execute(['id' => $id, 'dt' => $date, 'rating' => $rating, 'title' => $title, 'url' => $url]);
 
-$expectedResult = $reconciler->reconcile('nkr', [
-    ['issuer_id' => 20, 'issuer_name' => 'Ручной эмитент (у агентства)', 'rating' => 'A.ru', 'outlook' => 'stable', 'last_action_date' => '2026-09-02'],
-    ['issuer_id' => 21, 'issuer_name' => 'Эмитент с рейтингом выпуска (у агентства)', 'rating' => 'ruAA', 'outlook' => 'stable', 'last_action_date' => '2026-09-10'],
+// 20: только рейтинги облигаций; последнее — отзыв из-за погашения (записан до обновления правил).
+$addCr(20, 'expert_ra', 'отозван', null, '2026-09-28', 0, 'action');
+$addAction(20, '2026-09-22', 'ruAAA', '«Эксперт РА» присвоил кредитный рейтинг облигациям ООО «СОПФ ДОМ.РФ» (RU000A10G643) на уровне ruAAA', 'https://raexpert.ru/releases/2026/sep22b');
+$addAction(20, '2026-09-28', 'отозван', '«Эксперт РА» отозвал без подтверждения кредитный рейтинг облигаций ООО «СОПФ ДОМ.РФ» (RU000A109N54) в связи с их полным погашением', 'https://raexpert.ru/releases/2026/sep28');
+// 21: отзыв облигаций по договору — настоящий отзыв, ожидаемо.
+$addCr(21, 'expert_ra', 'отозван', null, '2026-09-23', 0, 'action');
+$addAction(21, '2026-09-23', 'отозван', '«Эксперт РА» отозвал без подтверждения кредитные рейтинги облигаций АО «Селектел» серий 001P-05R, 001Р-06R, 001Р-07R', 'https://raexpert.ru/releases/2026/sep23a');
+// 22–24: наш статус наблюдения против списка без статуса.
+$addCr(22, 'expert_ra', 'ruAA-', 'under_review_stable', '2026-09-16', 0, 'action');
+$addCr(23, 'expert_ra', 'ruAA-', 'under_review_stable', '2026-06-18', 0, 'action');
+$addCr(24, 'expert_ra', 'ruAA-', 'under_review_stable', '2026-09-16', 0, 'action');
+$addCr(25, 'expert_ra', 'отозван', null, '2025-01-10', 0, 'action');
+
+$eraResult = $reconciler->reconcile('expert_ra', [
+    ['issuer_id' => 22, 'issuer_name' => 'ПАО "ТРАНСКОНТЕЙНЕР"', 'rating' => 'ruAA-', 'outlook' => 'stable', 'last_action_date' => '2026-09-16'],
+    ['issuer_id' => 23, 'issuer_name' => 'ООО "ДЕЛОПОРТС"', 'rating' => 'ruAA-', 'outlook' => 'stable', 'last_action_date' => '2026-09-16'],
+    ['issuer_id' => 24, 'issuer_name' => 'ООО "УК "ДЕЛО"', 'rating' => 'ruAA-', 'outlook' => 'developing', 'last_action_date' => '2026-09-16'],
 ]);
-check('field_mismatches: 4 расхождения (по 2 поля у каждого из 2 эмитентов)', count($expectedResult['field_mismatches']) === 4);
-foreach ($expectedResult['field_mismatches'] as $m) {
-    if ($m['issuer_id'] === 20) {
-        check("field_mismatches: source=manual (issuer 20, поле {$m['field']}) -> expected=true", $m['expected'] === true);
-        check("field_mismatches: source=manual (issuer 20, поле {$m['field']}) -> reason про ручной ввод", $m['reason'] === 'внесено вручную из xlsx');
-    } elseif ($m['issuer_id'] === 21) {
-        check("field_mismatches: рейтинг выпуска облигаций (issuer 21, поле {$m['field']}) -> expected=true", $m['expected'] === true);
-        check("field_mismatches: рейтинг выпуска облигаций (issuer 21, поле {$m['field']}) -> reason непустой", $m['reason'] !== null);
-    }
+$eraMissing = [];
+foreach ($eraResult['missing_in_snapshot'] as $m) {
+    $eraMissing[$m['issuer_id']] = $m;
 }
-// Контроль: issuer 2 (Газпром, source=action, но заголовок про рейтинг ЭМИТЕНТА, не выпуска) -> НЕ ожидаемо.
-foreach ($result['field_mismatches'] as $m) {
-    check("field_mismatches: обычное действие по эмитенту (issuer 2, поле {$m['field']}) -> expected=false, требует внимания", $m['expected'] === false && $m['reason'] === null);
+check('20 СОПФ ДОМ.РФ (отозван из новости о погашении) — требует внимания, не ожидаемое', $eraMissing[20]['expected'] === false && $eraMissing[20]['reason'] === null);
+check('…пометка: заголовок, ссылка, причина и чем исправить', str_contains((string) $eraMissing[20]['note'], 'sep28')
+    && str_contains((string) $eraMissing[20]['note'], 'из-за погашения') && str_contains((string) $eraMissing[20]['note'], 'fix_bond_redemption_ratings'));
+check('21 Селектел (отзыв облигаций по договору) — ожидаемо, в причине последнее действие', $eraMissing[21]['expected'] === true
+    && str_contains((string) $eraMissing[21]['reason'], 'рейтинг отозван, последнее действие: ««Эксперт РА» отозвал без подтверждения кредитные рейтинги облигаций АО «Селектел»'));
+check('25 отозван без новостей в истории — ожидаемо, причина просто «рейтинг отозван»', $eraMissing[25]['expected'] === true && $eraMissing[25]['reason'] === 'рейтинг отозван');
+$eraByIssuer = [];
+foreach ($eraResult['field_mismatches'] as $m) {
+    $eraByIssuer[$m['issuer_id']][$m['field']] = $m;
 }
+check('22 ТрансКонтейнер: та же дата, прогноз совпадает — watch_kept', ($eraByIssuer[22]['outlook']['watch_kept'] ?? null) === true && !isset($eraByIssuer[22]['last_action_date']));
+check('23 ДелоПортс: дата у агентства новее — обычное расхождение', ($eraByIssuer[23]['outlook']['watch_kept'] ?? null) === false);
+check('24 УК Дело: у агентства другой прогноз — обычное расхождение', ($eraByIssuer[24]['outlook']['watch_kept'] ?? null) === false);
+check('в расхождениях НКР флаг watch_kept всегда false', array_filter($result['field_mismatches'], static fn (array $m): bool => $m['watch_kept']) === []);
 
 echo "\n";
 if ($failures === 0) {

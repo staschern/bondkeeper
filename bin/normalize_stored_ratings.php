@@ -7,7 +7,8 @@ declare(strict_types=1);
  * которые теперь действуют при каждой записи (см. StoredRatingsNormalizer):
  *   1. кириллические буквы в рейтинге → латиница ("ruВВВ+" → "ruBBB+");
  *   2. отзыв НРА, записанный прочерком "—", → "отозван";
- *   3. у отозванного рейтинга прогноз пустой.
+ *   3. у отозванного рейтинга прогноз пустой;
+ *   4. у дефолтного рейтинга (D/SD) прогноз пустой (добавлено 29.09.2026).
  *
  *   php bin/normalize_stored_ratings.php            # посмотреть, что поменяется
  *   php bin/normalize_stored_ratings.php --apply    # применить
@@ -46,3 +47,9 @@ foreach ($report['withdrawn_outlook'] as $r) {
     Logger::info("issuer_id={$r['issuer_id']} / {$r['agency']}: прогноз «{$r['outlook']}» → пусто");
 }
 Logger::info('Строк: ' . count($report['withdrawn_outlook']));
+
+Logger::info('--- 4. Дефолтный рейтинг (D/SD) — прогноз пустой (current_ratings) ---');
+foreach ($report['default_outlook'] as $r) {
+    Logger::info("issuer_id={$r['issuer_id']} / {$r['agency']}: рейтинг {$r['rating']}, прогноз «{$r['outlook']}» → пусто");
+}
+Logger::info('Строк: ' . count($report['default_outlook']));

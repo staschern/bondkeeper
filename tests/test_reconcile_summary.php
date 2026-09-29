@@ -89,6 +89,29 @@ check('ГИДРОМАШСЕРВИС и ЕвразХолдинг — в треб�
 check('ВИС ФИНАНС (нет в снимке, старый root) — в требующих внимания с пометкой', str_contains($attentionPart, 'ВИС ФИНАНС') && str_contains($lineWith('ВИС ФИНАНС'), 'по корню'));
 check('реСтор (ручной, отозван) — в ожидаемых с причиной', str_contains($expectedPart, 'реСтор') && str_contains($lineWith('реСтор'), 'вручную'));
 
+echo "--- Сверка Эксперт РА 29.09.2026: новости, которые теперь пропускаем, и статус наблюдения ---\n";
+$era = ReconcileSummary::lines('Эксперт РА', [
+    'snapshot_count' => 250,
+    'field_mismatches' => [
+        $mismatch(95, 'АО "АЛЬФА-БАНК"', 'АО "АЛЬФА-БАНК"', 'rating', 'ruA+', 'ruAA+', 'action', '«Эксперт РА» присвоил кредитный рейтинг субординированным облигациям АО «АЛЬФА-БАНК» серии T2-CR-09 с установленным сроком погашения на уровне ruA+', 'https://raexpert.ru/releases/2026/sep29a'),
+        $mismatch(497, 'ООО "ПетроИнжиниринг"', 'ООО "ИСК "ПЕТРОИНЖИНИРИНГ"', 'rating', 'отозван', 'ruA', 'action', '«Эксперт РА» отозвал кредитный рейтинг облигаций ООО «ИСК «Петроинжиниринг» серии 001Р-01 в связи с их полным погашением', 'https://raexpert.ru/releases/2026/sep21e'),
+        $mismatch(2025, 'АО "Атомэнергопром"', 'АО "АТОМЭНЕРГОПРОМ"', 'last_action_date', '2026-09-29', '2026-09-02', 'action', '«Эксперт РА» присвоил кредитный рейтинг облигациям АО «Атомэнергопром» серии 001Р-18 на уровне ruAAA'),
+        $mismatch(3100, 'ПАО "ТрансКонтейнер"', 'ПАО "ТРАНСКОНТЕЙНЕР"', 'outlook', 'under_review_stable', 'stable', 'action', '«Эксперт РА» продлил статус «под наблюдением» по кредитному рейтингу ПАО «ТрансКонтейнер»') + ['watch_kept' => true],
+    ],
+    'missing_in_ours' => [],
+    'missing_in_snapshot' => [],
+]);
+$eraText = implode("\n", $era);
+$eraLine = static fn (string $needle): string => (string) current(array_filter($era, static fn (string $l): bool => str_contains($l, $needle)));
+$eraAttention = substr($eraText, strpos($eraText, 'Требуют внимания'), strpos($eraText, 'Ожидаемые') - strpos($eraText, 'Требуют внимания'));
+$eraExpected = substr($eraText, strpos($eraText, 'Ожидаемые'));
+check('Альфа-Банк (новость о субординированных) — требует внимания, не ожидаемое', str_contains($eraAttention, 'АЛЬФА-БАНК') && !str_contains($eraExpected, 'АЛЬФА-БАНК'));
+check('…с заголовком, ссылкой и причиной', str_contains($eraLine('АЛЬФА-БАНК'), 'sep29a') && str_contains($eraLine('АЛЬФА-БАНК'), 'рейтинг субординированных облигаций') && str_contains($eraLine('АЛЬФА-БАНК'), 'исправит перезапись'));
+check('ПетроИнжиниринг (отзыв из-за погашения) — требует внимания', str_contains($eraAttention, 'ПетроИнжиниринг') && str_contains($eraLine('ПетроИнжиниринг'), 'из-за погашения'));
+check('Атомэнергопром (обычная новость о выпуске) — по-прежнему ожидаемое', str_contains($eraExpected, 'Атомэнергопром') && str_contains($eraLine('Атомэнергопром'), 'новости о рейтинге выпуска облигаций'));
+check('ТрансКонтейнер (наш статус наблюдения) — ожидаемое с пояснением', str_contains($eraExpected, 'ТрансКонтейнер') && str_contains($eraLine('ТрансКонтейнер'), 'не показывает'));
+check('разделы: 2 требуют внимания, 2 ожидаемых', str_contains($eraText, 'Требуют внимания (2):') && str_contains($eraText, 'Ожидаемые (2):'));
+
 echo "--- AdminNotifier::splitLines() ---\n";
 $many = array_map(static fn (int $i): string => "• строка {$i} " . str_repeat('ж', 90), range(1, 100));
 $messages = AdminNotifier::splitLines($many);

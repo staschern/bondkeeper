@@ -35,10 +35,27 @@ use RuntimeException;
  * которая пишет ровно тот снимок, что был проверен (loadFromFile() +
  * apply()), без повторного скачивания.
  *
+ * === Статус «под наблюдением», которого нет в списке агентства (29.09.2026) ===
+ *
+ * Проверено вживую на raexpert.ru/ratings/: список Эксперт РА статус
+ * наблюдения не показывает. 16.09.2026 агентство продлило наблюдение
+ * ТрансКонтейнеру, ДелоПортс и УК «Дело», а в списке у всех трёх
+ * "Стабильный, 16.09.2026". Из новостей мы пишем under_review_stable
+ * (решение пользователя 28.09.2026), и перезапись снимком каждый месяц
+ * стирала бы статус, а сверка показывала бы расхождение. Поэтому для
+ * таких агентств (keepsOurWatchStatus()) наше значение под наблюдением
+ * остаётся, если рейтинг тот же, прогноз у агентства совпадает с нашим
+ * (или у нас голый under_review) и дата у агентства не новее нашей. Если
+ * дата у агентства новее — у него было действие после нашей новости
+ * (например, наблюдение сняли, а новость мы пропустили), берём его.
+ *
  * @phpstan-type SnapshotRow array{issuer_id: int, issuer_name: string, rating: string, outlook: ?string, last_action_date: string, source_url: ?string}
  */
 final class SnapshotRows
 {
+    /** Агентства, в списке которых нет статуса «под наблюдением» (у НКР и НРА он в списке есть). */
+    private const AGENCIES_WITHOUT_WATCH_IN_LIST = ['expert_ra'];
+
     /**
      * @param array<int, SnapshotRow> $rows
      * @return array<int, SnapshotRow>
@@ -63,12 +80,17 @@ final class SnapshotRows
      * Параллельной записи одного агентства нет: seed_ratings.php держит
      * блокировку на агентство.
      *
+     * Строки, где остаётся наш статус наблюдения (keepsOurWatchStatus()),
+     * не пишутся — их issuer_id складываются в $keptWatch.
+     *
      * @param array<int, SnapshotRow> $rows
+     * @param array<int, int>|null $keptWatch
      * @return int сколько строк записано
      */
-    public static function apply(PDO $db, string $agency, array $rows): int
+    public static function apply(PDO $db, string $agency, array $rows, ?array &$keptWatch = null): int
     {
-        $exists = $db->prepare('SELECT 1 FROM current_ratings WHERE issuer_id = :issuer_id AND agency = :agency');
+        $keptWatch = [];
+        $exists = $db->prepare('SELECT rating, outlook, last_action_date FROM current_ratings WHERE issuer_id = :issuer_id AND agency = :agency');
         $update = $db->prepare(
             "UPDATE current_ratings
              SET rating = :rating, outlook = :outlook, last_action_date = :last_action_date,
@@ -92,14 +114,43 @@ final class SnapshotRows
             ];
 
             $exists->execute($key);
-            $found = $exists->fetchColumn() !== false;
+            $ours = $exists->fetch();
             $exists->closeCursor();
 
-            ($found ? $update : $insert)->execute($values);
+            if ($ours !== false && self::keepsOurWatchStatus($agency, $ours, $values)) {
+                $keptWatch[] = $row['issuer_id'];
+                continue;
+            }
+
+            ($ours !== false ? $update : $insert)->execute($values);
             $count++;
         }
 
         return $count;
+    }
+
+    /**
+     * Оставить наше значение под наблюдением вместо строки снимка — см.
+     * докблок класса. Используется перезаписью (apply()) и сверкой
+     * (CurrentRatingsReconciler), чтобы обе решали одинаково.
+     *
+     * @param array{rating: ?string, outlook: ?string, last_action_date: ?string} $ours
+     * @param array{rating: string, outlook: ?string, last_action_date: string} $theirs
+     */
+    public static function keepsOurWatchStatus(string $agency, array $ours, array $theirs): bool
+    {
+        $ourOutlook = (string) ($ours['outlook'] ?? '');
+        if (!in_array($agency, self::AGENCIES_WITHOUT_WATCH_IN_LIST, true) || !str_starts_with($ourOutlook, 'under_review')) {
+            return false;
+        }
+        if (RatingsNormalizer::normalizeGrade((string) $ours['rating']) !== RatingsNormalizer::normalizeGrade($theirs['rating'])
+            || $theirs['last_action_date'] > (string) $ours['last_action_date']) {
+            return false;
+        }
+
+        return $ourOutlook === 'under_review'
+            || $theirs['outlook'] === null
+            || $ourOutlook === 'under_review_' . $theirs['outlook'];
     }
 
     /**
