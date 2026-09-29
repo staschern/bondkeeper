@@ -41,7 +41,7 @@ src/Ratings/NameMatchReviews.php     — предложения "сопоста�
 src/Ratings/NameMatchResolver.php    — последний шаг сопоставления во всех 7 импортёрах: подтверждённое название или новое предложение (не пишет в current_ratings/rating_actions)
 src/Ratings/SnapshotRows.php         — снимок "сейчас" от агентства: одна строка на эмитента (latestPerIssuer()), запись в current_ratings (apply(), source='snapshot'), сохранение/чтение JSON-файла снимка (saveToFile()/loadFromFile(), П2)
 src/Telegram/AdminNotifier.php       — служебное сообщение администратору (config/telegram_bot.php: admin_telegram_id) из CLI-скриптов, опционально с inline-клавиатурой (кнопки предложений); sendLines() — длинный текст (сводка сверки) несколькими сообщениями, по границам строк; ошибка отправки не роняет импорт/сверку
-src/Ratings/RatingsNormalizer.php    — общие преобразования для рейтинговых выгрузок: прогноз/дата, absoluteUrl() (ссылка без схемы → полный адрес), normalizeGrade() (кириллические двойники букв → латиница), bondNewsSkipStatus() (новости про облигации, не влияющие на рейтинг компании — погашение/неразмещение/субординированные/ожидаемый рейтинг, единое для НКР/Эксперт РА/АКРА), watchStatusFromText()/combineWithWatch()/outlookFromNraColumns() (статус "под наблюдением" — единое правило для всех агентств), см. docs/STAGE3_RATINGS.md
+src/Ratings/RatingsNormalizer.php    — общие преобразования для рейтинговых выгрузок: прогноз/дата, absoluteUrl() (ссылка без схемы → полный адрес), normalizeGrade() (кириллические двойники букв → латиница), outlookForRating()/isWithdrawnRating() (отозванный рейтинг — прогноз пустой, для любого источника), ratingFromNraColumn() (отзыв НРА прочерком "—" → 'отозван'), bondNewsSkipStatus() (новости про облигации, не влияющие на рейтинг компании — погашение/неразмещение/субординированные/ожидаемый рейтинг, единое для НКР/Эксперт РА/АКРА), watchStatusFromText()/combineWithWatch()/outlookFromNraColumns() (статус "под наблюдением" — единое правило для всех агентств), см. docs/STAGE3_RATINGS.md
 src/Ratings/RatingsHttp.php          — HTTP-загрузчик с ретраями для сайтов рейтинговых агентств
 src/Ratings/NkrImporter.php          — current_ratings из Excel-выгрузки НКР (ratings.ru)
 src/Ratings/NraImporter.php          — current_ratings из Excel-выгрузки НРА (ra-national.ru)
@@ -56,8 +56,8 @@ bin/reconcile_ratings.php            — запуск сверки (--agency=nkr
 bin/review_matches.php               — подтверждение/отклонение предложений сопоставления по названию: --list, --approve=ID, --reject=ID, см. docs/STAGE3_RATINGS.md
 bin/apply_2026_09_review_decisions.php — РАЗОВЫЙ скрипт решений по разбору сверки 20-26 сентября 2026 (dry-run по умолчанию, --apply): связки issuer_spv_links, отклонённые пары (Озон/Прогресс), чистка их чужих рейтингов, метка source='manual', см. docs/STAGE3_RATINGS.md
 bin/link_spv.php                     — управление issuer_spv_links: --spv-inn=... --issuer-inn=...|--issuer-id=... [--spv-name=...] [--note=...], --list, --remove — см. docs/STAGE3_RATINGS.md
-src/Ratings/GradeLookalikeFixer.php  — разовое исправление уже сохранённых рейтингов с кириллическими двойниками букв (RatingsNormalizer::normalizeGrade()), см. docs/STAGE3_RATINGS.md
-bin/fix_grade_lookalikes.php         — РАЗОВЫЙ скрипт: применение GradeLookalikeFixer к current_ratings/rating_actions (dry-run по умолчанию, --apply)
+src/Ratings/StoredRatingsNormalizer.php — разовое выравнивание уже сохранённых рейтингов: кириллица → латиница, отзыв НРА прочерком → 'отозван', у отозванного рейтинга прогноз пустой, см. docs/STAGE3_RATINGS.md
+bin/normalize_stored_ratings.php     — РАЗОВЫЙ скрипт: применение StoredRatingsNormalizer к current_ratings/rating_actions (dry-run по умолчанию, --apply)
 src/Ratings/CurrentRatingsSync.php   — чтение/запись current_ratings для новостных импортёров (источник rating_from/outlook_from; апсерт кэша только если действие не старше уже сохранённого)
 src/Ratings/RatingNewsLog.php        — журнал просмотренных пресс-релизов (rating_news_log) — дедуп/ретрай по (agency, source_url), независимо от rating_actions
 src/Ratings/NkrTitleParser.php       — чистый (без БД/сети) разбор заголовков пресс-релизов НКР; extractOutlook() — прогноз из заголовка, а если там его нет — из вводного абзаца (extractLeadFromDetailHtml(), страница и так скачивается ради ИНН), см. docs/STAGE3_RATINGS.md
@@ -104,12 +104,12 @@ tests/test_no_duplicate_named_params.php — статическая провер
 tests/test_issuer_name_shortener.php — офлайн-проверка IssuerNameShortener (24 проверки, чистая текстовая логика, БД не нужна)
 bin/backfill_issuer_short_names.php  — разовая пересборка issuers.short_name из full_name для строк, накопленных до появления IssuerNameShortener (идемпотентно, безопасно перезапускать)
 tests/test_offers_importer.php       — офлайн-проверка OffersImporter (20 проверок: выбор даты/типа оферты из bondization/offers, put/call — чистая логика, БД не нужна; даты в тесте считаются от сегодняшнего дня, П9)
-tests/test_ratings_normalizer.php    — офлайн-проверка RatingsNormalizer (35 проверок: isBondIssueRedemptionWithdrawal()/isBondIssueRatingTitle(), bondNewsSkipStatus() — общее правило пропуска новостей про облигации для НКР/Эксперт РА/АКРА, чистая текстовая логика, БД не нужна)
+tests/test_ratings_normalizer.php    — офлайн-проверка RatingsNormalizer (39 проверок: isBondIssueRedemptionWithdrawal()/isBondIssueRatingTitle() — прилагательные между "рейтинг"/"выпуск" и "облигаций" узнаются по окончанию, а не по списку слов, bondNewsSkipStatus() — общее правило пропуска новостей про облигации для НКР/Эксперт РА/АКРА, чистая текстовая логика, БД не нужна)
 tests/test_current_ratings_reconciler.php — офлайн-проверка CurrentRatingsReconciler (36 проверок: сравнение с обоими названиями + applyMissingInOurs()/кейс 3 + explainMissing()/explainFieldMismatch() — ожидаемые расхождения с причиной, и у missing_in_snapshot, и у field_mismatches — MySQL-диалекта нет)
 tests/test_nkr_importer_url.php      — офлайн-проверка RatingsNormalizer::absoluteUrl()/NkrImporter::describeRow() (15 проверок: ссылка на пресс-релиз НКР без схемы https:// теперь распознаётся, не теряется в тексте заголовка; общий метод, используется также в NameMatchReviews)
 tests/test_nkr_outlook_parsing.php   — офлайн-проверка NkrTitleParser::extractOutlook()/extractLeadFromDetailHtml() (42 проверки на дословных фразах НКР: прогноз из вводного абзаца пресс-релиза, если в заголовке его нет)
 tests/test_watch_status.php          — офлайн-проверка общего правила статуса "под наблюдением" (33 проверки: RatingsNormalizer::watchStatusFromText()/combineWithWatch()/outlookFromNraColumns() — одно правило вместо пяти расходившихся между собой)
-tests/test_grade_lookalike_fixer.php — офлайн-проверка GradeLookalikeFixer (16 проверок: разовое исправление уже сохранённых рейтингов с кириллическими двойниками букв)
+tests/test_stored_ratings_normalizer.php — офлайн-проверка StoredRatingsNormalizer (27 проверок: кириллица в рейтингах, отзыв НРА прочерком → 'отозван', прогноз пустой у отозванного)
 tests/test_reconcile_summary.php     — офлайн-проверка ReconcileSummary::lines() (20 проверок: текст сводки сверки для Telegram, все строки без обрезки, деление на "требуют внимания"/"ожидаемые")
 tests/test_name_match_reviews.php    — офлайн-проверка NameMatchReviews (44 проверки: предложить/подтвердить/отклонить, тёзки не предлагаются, ссылка в предложении — полный адрес для любого агентства)
 tests/test_snapshot_rows.php         — офлайн-проверка SnapshotRows (18 проверок: latestPerIssuer()/apply()/saveToFile()/loadFromFile())
@@ -154,7 +154,7 @@ mysql -u root -p bondkeeper < database/024_issuer_name_match_reviews.sql
 mysql -u root -p bondkeeper < database/025_current_ratings_source.sql
 php bin/apply_2026_09_review_decisions.php --apply   # разовые решения по разбору сверки 20-26 сентября (см. docs/STAGE3_RATINGS.md)
 mysql -u root -p bondkeeper < database/026_outlook_indefinite.sql
-php bin/fix_grade_lookalikes.php --apply   # разовое исправление уже сохранённых рейтингов с кириллическими двойниками букв
+php bin/normalize_stored_ratings.php --apply   # разовое выравнивание сохранённых рейтингов: кириллица, отзыв НРА прочерком, прогноз у отозванных
 
 php bin/seed_market.php        # issuers, securities, redemptions(scheduled_maturity)
 php bin/seed_bondization.php   # coupons, amortizations

@@ -220,11 +220,15 @@ if ($agency === 'nra' || $agency === 'all') {
             continue;
         }
 
+        $rating = mb_substr(RatingsNormalizer::ratingFromNraColumn($row['Рейтинг'] ?? ''), 0, 20);
         $rows[] = [
             'issuer_id' => $issuerId,
             'issuer_name' => (string) ($row['Название организации'] ?? ''),
-            'rating' => mb_substr(RatingsNormalizer::normalizeGrade(trim($row['Рейтинг'] ?? '')), 0, 20),
-            'outlook' => RatingsNormalizer::outlookFromNraColumns(trim($row['Прогноз'] ?? ''), trim($row['Под наблюдением'] ?? '')),
+            'rating' => $rating,
+            'outlook' => RatingsNormalizer::outlookForRating(
+                $rating,
+                RatingsNormalizer::outlookFromNraColumns(trim($row['Прогноз'] ?? ''), trim($row['Под наблюдением'] ?? '')),
+            ),
             'last_action_date' => $row['_date'],
             'source_url' => ($row['Ссылка на пресс релиз'] ?? '') !== '' ? $row['Ссылка на пресс релиз'] : null,
         ];

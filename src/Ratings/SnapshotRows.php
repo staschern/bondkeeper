@@ -83,9 +83,11 @@ final class SnapshotRows
         $count = 0;
         foreach ($rows as $row) {
             $key = ['issuer_id' => $row['issuer_id'], 'agency' => $agency];
+            $rating = mb_substr(RatingsNormalizer::normalizeGrade($row['rating']), 0, 20);
             $values = $key + [
-                'rating' => mb_substr(RatingsNormalizer::normalizeGrade($row['rating']), 0, 20),
-                'outlook' => $row['outlook'],
+                'rating' => $rating,
+                // "отозван" → прогноз пустой для любого источника (решение 28.09.2026).
+                'outlook' => RatingsNormalizer::outlookForRating($rating, $row['outlook']),
                 'last_action_date' => $row['last_action_date'],
             ];
 

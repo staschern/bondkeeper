@@ -96,10 +96,6 @@ final class CurrentRatingsSync
      */
     private static function resolveOutlook(string $ratingTo, ?string $outlookTo, ?string $cachedOutlook): ?string
     {
-        if (RatingsNormalizer::isDefaultGrade($ratingTo) || $ratingTo === 'отозван') {
-            return null;
-        }
-
-        return $outlookTo ?? $cachedOutlook;
+        return RatingsNormalizer::outlookForRating($ratingTo, $outlookTo ?? $cachedOutlook);
     }
 }

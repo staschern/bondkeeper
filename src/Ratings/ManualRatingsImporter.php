@@ -139,11 +139,13 @@ final class ManualRatingsImporter
                 matched_by_root_name = 0,
                 source = 'manual'"
         );
+        $rating = RatingsNormalizer::normalizeGrade(RatingsNormalizer::normalizeWithdrawnRatingText($row['rating'] ?? ''));
         $stmt->execute([
             'issuer_id' => $issuerId,
             'agency' => $agency,
-            'rating' => mb_substr(RatingsNormalizer::normalizeGrade(trim($row['rating'] ?? '')), 0, 20),
-            'outlook' => $outlook,
+            'rating' => $rating,
+            // "отозван" → прогноз пустой для любого источника (решение 28.09.2026).
+            'outlook' => RatingsNormalizer::outlookForRating($rating, $outlook),
             'last_action_date' => $date,
         ]);
 

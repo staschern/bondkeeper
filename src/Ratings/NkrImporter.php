@@ -182,10 +182,11 @@ final class NkrImporter
         // сетка (собственная колонка "Outlook" у НКР для D-строк на
         // практике и так обычно пустая), основной случай — новостной путь
         // через CurrentRatingsSync::sync().
-        $outlook = RatingsNormalizer::isDefaultGrade($rating)
-            ? null
-            : (RatingsNormalizer::extractReviewStatusFromProse($row['Outlook'] ?? '')
-                ?? RatingsNormalizer::mapOutlook($row['Outlook'] ?? ''));
+        $outlook = RatingsNormalizer::outlookForRating(
+            $rating,
+            RatingsNormalizer::extractReviewStatusFromProse($row['Outlook'] ?? '')
+                ?? RatingsNormalizer::mapOutlook($row['Outlook'] ?? ''),
+        );
 
         return [
             'issuer_id' => $issuerId,

@@ -267,7 +267,8 @@ final class NraImporter
         }
         $this->lastActionDatePerIssuerThisRun[$issuerId] = $row['_date'];
 
-        $ratingTo = mb_substr(trim($row['Рейтинг'] ?? ''), 0, 20);
+        // Отзыв НРА пишет прочерком "—" → 'отозван', как у остальных агентств.
+        $ratingTo = mb_substr(RatingsNormalizer::ratingFromNraColumn($row['Рейтинг'] ?? ''), 0, 20);
         // Обе колонки — "Прогноз" и "Под наблюдением" — одним общим
         // правилом (статус берётся и из окончания "Прогноз", если колонка
         // "Под наблюдением" пустая — случай ПАО «ЕвроТранс» 09.04.2026).

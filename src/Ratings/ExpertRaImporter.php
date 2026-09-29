@@ -152,7 +152,7 @@ final class ExpertRaImporter
         $this->totalRows++;
 
         $inn = $this->resolveInn($row['card_url']);
-        $rating = mb_substr(RatingsNormalizer::normalizeGrade(trim($row['rating'])), 0, 20);
+        $rating = RatingsNormalizer::normalizeGrade(RatingsNormalizer::normalizeWithdrawnRatingText($row['rating']));
         $sourceTitle = self::describeRow($row, $rating, $categoryLabel);
 
         $issuerId = $this->resolveIssuerId($inn, $row['name'], $sourceTitle, $row['card_url'], isset($this->failedCards[$row['card_url']]));
@@ -175,7 +175,7 @@ final class ExpertRaImporter
         // см. RatingsNormalizer::isDefaultGrade(). Защитная сетка для
         // полной сверки — основной случай для новостей идёт через
         // CurrentRatingsSync::sync().
-        $outlook = RatingsNormalizer::isDefaultGrade($rating) ? null : RatingsNormalizer::mapOutlook($row['outlook']);
+        $outlook = RatingsNormalizer::outlookForRating($rating, RatingsNormalizer::mapOutlook($row['outlook']));
 
         return [
             'issuer_id' => $issuerId,

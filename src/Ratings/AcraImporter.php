@@ -136,7 +136,7 @@ final class AcraImporter
         $rawInn = $row['inn'] ?? null;
         $inn = is_string($rawInn) ? IssuerMatcher::normalizeInn($rawInn) : null;
         $companyName = (string) ($row['company'] ?? '');
-        $rating = mb_substr(RatingsNormalizer::normalizeGrade(trim((string) ($row['rating'] ?? ''))), 0, 20);
+        $rating = RatingsNormalizer::normalizeGrade(RatingsNormalizer::normalizeWithdrawnRatingText((string) ($row['rating'] ?? '')));
         $url = is_string($row['url'] ?? null) && $row['url'] !== '' ? $row['url'] : null;
         $sourceTitle = 'Выгрузка АКРА (JSON-файл): ' . $companyName
             . ' — рейтинг ' . ($rating !== '' ? $rating : '?')
@@ -167,9 +167,10 @@ final class AcraImporter
         // см. RatingsNormalizer::isDefaultGrade(). Защитная сетка для
         // полной сверки — основной случай для новостей идёт через
         // CurrentRatingsSync::sync().
-        $outlook = RatingsNormalizer::isDefaultGrade($rating)
-            ? null
-            : RatingsNormalizer::combineOutlookWithAcraWatchSuffix((string) ($row['forecast'] ?? ''));
+        $outlook = RatingsNormalizer::outlookForRating(
+            $rating,
+            RatingsNormalizer::combineOutlookWithAcraWatchSuffix((string) ($row['forecast'] ?? '')),
+        );
 
         return [
             'issuer_id' => $issuerId,
