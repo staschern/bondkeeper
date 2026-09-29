@@ -40,9 +40,9 @@ final class ManualRatingsImporter
 {
     private const VALID_AGENCIES = ['nra', 'acra', 'expert_ra', 'nkr'];
     private const VALID_OUTLOOKS = [
-        'positive', 'stable', 'negative', 'developing',
+        'positive', 'stable', 'negative', 'developing', 'indefinite',
         'under_review', 'under_review_negative', 'under_review_positive',
-        'under_review_stable', 'under_review_developing', 'review_concluded',
+        'under_review_stable', 'under_review_developing', 'under_review_indefinite', 'review_concluded',
     ];
 
     private int $totalRows = 0;
@@ -142,7 +142,7 @@ final class ManualRatingsImporter
         $stmt->execute([
             'issuer_id' => $issuerId,
             'agency' => $agency,
-            'rating' => mb_substr(trim($row['rating'] ?? ''), 0, 20),
+            'rating' => mb_substr(RatingsNormalizer::normalizeGrade(trim($row['rating'] ?? '')), 0, 20),
             'outlook' => $outlook,
             'last_action_date' => $date,
         ]);

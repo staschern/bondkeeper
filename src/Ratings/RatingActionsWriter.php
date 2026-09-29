@@ -57,6 +57,11 @@ final class RatingActionsWriter
         ?string $sourceUrl,
         ?string $sourceTitle = null,
     ): void {
+        // Рейтинг латиницей — агентства иногда пишут кириллическими
+        // двойниками букв ("ruВВВ+"), см. RatingsNormalizer::normalizeGrade().
+        $ratingFrom = $ratingFrom !== null ? RatingsNormalizer::normalizeGrade($ratingFrom) : null;
+        $ratingTo = RatingsNormalizer::normalizeGrade($ratingTo);
+
         $stmt = $this->db->prepare(
             'INSERT INTO rating_actions
                 (issuer_id, agency, action_date, rating_from, rating_to, outlook_from, outlook_to, source_url, source_title, matched_by_root_name)

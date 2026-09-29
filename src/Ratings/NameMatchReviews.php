@@ -50,6 +50,8 @@ final class NameMatchReviews
     public const SKIPPED = 'skipped';
 
     private const AGENCY_LABELS = ['nkr' => 'НКР', 'expert_ra' => 'Эксперт РА', 'acra' => 'АКРА', 'nra' => 'НРА'];
+    /** Сайт агентства — для ссылок вида "/путь" (см. RatingsNormalizer::absoluteUrl()). */
+    private const AGENCY_HOSTS = ['nkr' => 'ratings.ru', 'expert_ra' => 'raexpert.ru', 'acra' => 'www.acra-ratings.ru', 'nra' => 'www.ra-national.ru'];
     private const MATCH_TYPE_LABELS = [
         'exact_name' => 'точное совпадение названия',
         'root_name' => 'совпадение по корню названия (без ОПФ и слов Финанс/Капитал/Групп)',
@@ -108,7 +110,7 @@ final class NameMatchReviews
                 'agency' => $agency,
                 'source_name' => mb_substr($sourceName, 0, 500),
                 'source_title' => $sourceTitle !== null ? mb_substr($sourceTitle, 0, 500) : null,
-                'source_url' => $sourceUrl !== null && $sourceUrl !== '' ? mb_substr($sourceUrl, 0, 500) : null,
+                'source_url' => self::normalizeUrl($agency, $sourceUrl),
             ]);
         } catch (PDOException $e) {
             // Та же пара только что предложена параллельным прогоном другого агентства.
@@ -276,6 +278,22 @@ final class NameMatchReviews
             . "Ссылка: {$url}\n\n"
             . "Подтвердить: php bin/review_matches.php --approve={$id}\n"
             . "Отклонить: php bin/review_matches.php --reject={$id}";
+    }
+
+    /**
+     * Ссылка в предложении всегда кликабельная, для любого агентства
+     * (решение пользователя, 28.09.2026): выгрузка НКР отдаёт адрес без
+     * https://, остальные сейчас дают полные — это страховка на случай
+     * смены формата. Не похоже на адрес — сохраняем как есть.
+     */
+    private static function normalizeUrl(string $agency, ?string $url): ?string
+    {
+        if ($url === null || trim($url) === '') {
+            return null;
+        }
+        $absolute = RatingsNormalizer::absoluteUrl($url, self::AGENCY_HOSTS[$agency] ?? '');
+
+        return mb_substr($absolute ?? trim($url), 0, 500);
     }
 
     private function isNamesake(string $sourceInn, string $sourceName, int $issuerId): bool

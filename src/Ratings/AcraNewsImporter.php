@@ -87,7 +87,8 @@ final class AcraNewsImporter
     private int $totalCandidates = 0;
     private int $skippedAlreadyLogged = 0;
     private int $skippedNotRatingAction = 0;
-    private int $skippedBondRedemption = 0;
+    /** @var array<string, int> статус rating_news_log => сколько новостей про облигации пропущено (RatingsNormalizer::bondNewsSkipStatus()) */
+    private array $skippedBondNews = [];
     private int $skippedNoRatingParsed = 0;
     private int $matched = 0;
     private int $matchedByInn = 0;
@@ -164,14 +165,15 @@ final class AcraNewsImporter
             return;
         }
 
-        // Отзыв рейтинга КОНКРЕТНОГО ВЫПУСКА облигаций из-за его
-        // погашения — технический шум, не отзыв рейтинга эмитента (см.
-        // докблок RatingsNormalizer::isBondIssueRedemptionWithdrawal(),
-        // живой найденный баг с ФосАгро, 17 сентября 2026). Полностью
-        // исключается из БД, а не просто помечается ошибкой разбора.
-        if (str_starts_with($verb, 'отозвал') && RatingsNormalizer::isBondIssueRedemptionWithdrawal($row['title'])) {
-            RatingNewsLog::log($this->db, self::AGENCY, $row['url'], $row['date'], 'skipped_bond_redemption');
-            $this->skippedBondRedemption++;
+        // Новости про облигации, которые не должны влиять на рейтинг
+        // компании (решение пользователя, 28.09.2026): отзыв из-за
+        // погашения или неразмещения, отзыв ожидаемого рейтинга, любые
+        // новости про субординированные облигации — одно общее правило
+        // для НКР, Эксперт РА и АКРА, см. RatingsNormalizer::bondNewsSkipStatus().
+        $bondSkip = RatingsNormalizer::bondNewsSkipStatus($row['title'], $row['title'], str_starts_with($verb, 'отозвал'));
+        if ($bondSkip !== null) {
+            RatingNewsLog::log($this->db, self::AGENCY, $row['url'], $row['date'], $bondSkip);
+            $this->skippedBondNews[$bondSkip] = ($this->skippedBondNews[$bondSkip] ?? 0) + 1;
             return;
         }
 
@@ -347,7 +349,11 @@ final class AcraNewsImporter
         Logger::info("Кандидатов в окне: {$this->totalCandidates}");
         Logger::info("Уже были окончательно обработаны раньше (status=matched в rating_news_log): {$this->skippedAlreadyLogged}");
         Logger::info("Пропущено (не похоже на кредитное рейтинговое действие): {$this->skippedNotRatingAction}");
-        Logger::info("Пропущено (отзыв рейтинга выпуска облигаций из-за погашения — шум, не эмитентское действие): {$this->skippedBondRedemption}");
+        Logger::info('Пропущено как новости про облигации, не влияющие на рейтинг компании (погашение / не размещены / субординированные / ожидаемый рейтинг): '
+            . ($this->skippedBondNews['skipped_bond_redemption'] ?? 0) . ' / '
+            . ($this->skippedBondNews['skipped_bond_not_placed'] ?? 0) . ' / '
+            . ($this->skippedBondNews['skipped_subordinated'] ?? 0) . ' / '
+            . ($this->skippedBondNews['skipped_expected'] ?? 0));
         Logger::info("Пропущено (не удалось разобрать уровень рейтинга): {$this->skippedNoRatingParsed}");
         Logger::info("Сопоставлено с issuers и записано: {$this->matched} (по ИНН: {$this->matchedByInn}, по связке issuer_spv_links: {$this->matchedBySpvLink}, по ISIN: {$this->matchedByIsin}, по подтверждённому названию: {$this->matchedByApprovedName})");
         Logger::info("Новых предложений сопоставления по названию (ждут подтверждения, bin/review_matches.php): {$this->proposedByName}");

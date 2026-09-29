@@ -133,7 +133,7 @@ final class AcraEmailParser
         $primary = preg_split('/\bтакже\b/ui', $action, 2)[0];
 
         $verb = self::detectGradeVerb($primary);
-        $watch = self::detectWatchStatus($primary);
+        $watch = RatingsNormalizer::watchStatusFromText($primary);
         if ($verb === null && $watch === null) {
             return null;
         }
@@ -148,11 +148,9 @@ final class AcraEmailParser
             $baseOutlook = RatingsNormalizer::mapOutlook(self::fixCyrillicLookalikes($m[1]));
         }
 
-        $outlookTo = match ($watch) {
-            'set' => 'under_review',
-            'concluded' => $baseOutlook ?? 'review_concluded',
-            default => $baseOutlook,
-        };
+        // Общее правило для всех агентств (RatingsNormalizer::combineWithWatch()):
+        // статус + названный прогноз → under_review_<прогноз>.
+        $outlookTo = RatingsNormalizer::combineWithWatch($baseOutlook, $watch);
 
         return [
             'subject' => $subject,
@@ -174,19 +172,6 @@ final class AcraEmailParser
             if (preg_match('/\b' . $verb . '\w*\b/ui', $action)) {
                 return $verb;
             }
-        }
-
-        return null;
-    }
-
-    /** @return 'set'|'concluded'|null */
-    private static function detectWatchStatus(string $action): ?string
-    {
-        if (preg_match('/снят[аы]?\s+статус\s*«?под\s+наблюдением»?/ui', $action)) {
-            return 'concluded';
-        }
-        if (preg_match('/(установлен[а]?|продлён|продлена)\s+статус\s*«?под\s+наблюдением»?/ui', $action)) {
-            return 'set';
         }
 
         return null;

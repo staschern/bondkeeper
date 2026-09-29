@@ -84,7 +84,7 @@ final class SnapshotRows
         foreach ($rows as $row) {
             $key = ['issuer_id' => $row['issuer_id'], 'agency' => $agency];
             $values = $key + [
-                'rating' => mb_substr($row['rating'], 0, 20),
+                'rating' => mb_substr(RatingsNormalizer::normalizeGrade($row['rating']), 0, 20),
                 'outlook' => $row['outlook'],
                 'last_action_date' => $row['last_action_date'],
             ];

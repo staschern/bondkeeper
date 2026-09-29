@@ -36,7 +36,8 @@ declare(strict_types=1);
  * порядке, сам запускает:
  *   php bin/seed_ratings.php --agency=nkr --snapshot=var/snapshots/nkr-....json
  * Перезапись пишет ровно проверенный снимок, без повторного скачивания.
- * Короткая сводка сверки уходит администратору в Telegram.
+ * Сводка сверки уходит администратору в Telegram — все строки, одна на
+ * компанию, с источником нашего значения (ReconcileSummary).
  *
  * По расписанию — только сверка, 1-го числа ночью (строки перезаписи
  * --agency=nkr / --agency=expert_ra из crontab убрать):
@@ -64,6 +65,7 @@ use BondKeeper\Ratings\NkrImporter;
 use BondKeeper\Ratings\NraImporter;
 use BondKeeper\Ratings\RatingActionsWriter;
 use BondKeeper\Ratings\RatingsNormalizer;
+use BondKeeper\Ratings\ReconcileSummary;
 use BondKeeper\Ratings\SnapshotRows;
 use BondKeeper\Support\Logger;
 use BondKeeper\Telegram\AdminNotifier;
@@ -101,69 +103,33 @@ $reconciler = new CurrentRatingsReconciler($db);
 $summary = [];
 
 /**
- * Группирует расхождения по полям в ОДНУ строку на компанию (28 сентября
- * 2026, прямой запрос пользователя после разбора первой полной сводки:
- * раньше была отдельная строка на КАЖДОЕ поле — источник нашего значения
- * и признак "ожидаемо"/"требует внимания" одинаковы для всех полей одной
- * пары (issuer_id, agency) в рамках одного прогона, реконсайлер уже
- * считает их один раз на эмитента, тут просто схлопываем).
- *
- * @param array<int, array{issuer_id: int, our_name: string, agency_name: string, field: string, ours: ?string, theirs: ?string, our_source: ?string, our_action_title: ?string, our_action_url: ?string, expected: bool, reason: ?string}> $fieldMismatches
- * @return array<int, string>
- */
-function formatFieldMismatchLines(array $fieldMismatches): array
-{
-    $byIssuer = [];
-    foreach ($fieldMismatches as $d) {
-        $byIssuer[$d['issuer_id']][] = $d;
-    }
-
-    $lines = [];
-    foreach ($byIssuer as $rows) {
-        $first = $rows[0];
-        $fieldsText = implode('; ', array_map(
-            static fn (array $d): string => "{$d['field']}: наше=" . var_export($d['ours'], true) . ', агентства=' . var_export($d['theirs'], true),
-            $rows,
-        ));
-        $line = "{$first['our_name']} (id {$first['issuer_id']}; у агентства: «{$first['agency_name']}») — {$fieldsText}; источник: " . ($first['our_source'] ?? 'не указан (до миграции 025)');
-        if ($first['our_action_title'] !== null) {
-            $line .= "; новость: «{$first['our_action_title']}»" . ($first['our_action_url'] !== null ? " {$first['our_action_url']}" : '');
-        }
-        $line .= $first['expected'] ? "; ОЖИДАЕМО: {$first['reason']}" : '; ТРЕБУЕТ ВНИМАНИЯ';
-        $lines[] = $line;
-    }
-
-    return $lines;
-}
-
-/**
  * @param array{
  *     snapshot_count: int,
- *     field_mismatches: array<int, array{issuer_id: int, our_name: string, agency_name: string, field: string, ours: ?string, theirs: ?string, our_source: ?string, our_action_title: ?string, our_action_url: ?string, expected: bool, reason: ?string}>,
+ *     field_mismatches: array<int, array{issuer_id: int, our_name: string, agency_name: string, field: string, ours: ?string, theirs: ?string, our_source: ?string, our_action_title: ?string, our_action_url: ?string}>,
  *     missing_in_ours: array<int, array{issuer_id: int, our_name: string, agency_name: string, rating: string, outlook: ?string, last_action_date: string}>,
  *     missing_in_snapshot: array<int, array{issuer_id: int, our_name: string, ours: ?string, last_action_date: ?string, source: ?string, expected: bool, reason: ?string, note: ?string}>
  * } $result
- * @return array<int, string> строки "требуют внимания" ПЛЮС ожидаемые — теперь ВСЕ, без обрезки (28 сентября 2026)
  */
-function printReconcileReport(string $agency, array $result): array
+function printReconcileReport(string $agency, array $result): void
 {
-    $attention = [];
     $source = static fn (?string $s): string => $s ?? 'не указан (до миграции 025)';
 
     Logger::info("[{$agency}] Эмитентов в свежем снимке агентства: {$result['snapshot_count']}");
 
-    $mismatchLines = formatFieldMismatchLines($result['field_mismatches']);
-    Logger::info("[{$agency}] Расхождений по полям: " . count($result['field_mismatches']) . ' (эмитентов: ' . count($mismatchLines) . ')');
-    foreach ($mismatchLines as $line) {
+    Logger::info("[{$agency}] Расхождений по полям: " . count($result['field_mismatches']));
+    foreach ($result['field_mismatches'] as $d) {
+        $line = "{$d['our_name']} (issuer_id={$d['issuer_id']}; у агентства: «{$d['agency_name']}») — поле '{$d['field']}':"
+            . ' у нас = ' . var_export($d['ours'], true) . ', у агентства = ' . var_export($d['theirs'], true)
+            . '; наш источник: ' . $source($d['our_source']);
+        if ($d['our_action_title'] !== null) {
+            $line .= "; наша новость: «{$d['our_action_title']}»" . ($d['our_action_url'] !== null ? " {$d['our_action_url']}" : '');
+        }
         Logger::info("[{$agency}]   {$line}");
-        $attention[] = $line;
     }
 
     Logger::info("[{$agency}] Эмитентов у агентства, которых у нас нет вообще: " . count($result['missing_in_ours']));
     foreach ($result['missing_in_ours'] as $d) {
-        $line = "{$d['our_name']} (id {$d['issuer_id']}; у агентства: «{$d['agency_name']}») — current_ratings для этой пары нет (rating={$d['rating']}, дата {$d['last_action_date']})";
-        Logger::info("[{$agency}]   {$line}");
-        $attention[] = $line;
+        Logger::info("[{$agency}]   {$d['our_name']} (issuer_id={$d['issuer_id']}; у агентства: «{$d['agency_name']}») — current_ratings для этой пары нет (rating={$d['rating']}, дата {$d['last_action_date']})");
     }
 
     $expected = array_filter($result['missing_in_snapshot'], static fn (array $d): bool => $d['expected']);
@@ -171,22 +137,17 @@ function printReconcileReport(string $agency, array $result): array
     Logger::info("[{$agency}] Эмитентов у нас, которых свежий снимок не упоминает: " . count($result['missing_in_snapshot'])
         . ' (требуют внимания: ' . count($unexplained) . ', ожидаемые: ' . count($expected) . ')');
     foreach ($unexplained as $d) {
-        $line = "{$d['our_name']} (id {$d['issuer_id']}) — у нас rating=" . var_export($d['ours'], true)
+        $line = "{$d['our_name']} (issuer_id={$d['issuer_id']}) — у нас rating=" . var_export($d['ours'], true)
             . " от {$d['last_action_date']}, источник: " . $source($d['source']) . ', в снимке агентства не найден — ТРЕБУЕТ ВНИМАНИЯ';
         if ($d['note'] !== null) {
             $line .= " ({$d['note']})";
         }
         Logger::info("[{$agency}]   {$line}");
-        $attention[] = $line;
     }
     foreach ($expected as $d) {
-        $line = "{$d['our_name']} (id {$d['issuer_id']}) — у нас rating=" . var_export($d['ours'], true)
-            . " от {$d['last_action_date']}, в снимке агентства не найден — ОЖИДАЕМО: {$d['reason']}";
-        Logger::info("[{$agency}]   {$line}");
-        $attention[] = $line;
+        Logger::info("[{$agency}]   {$d['our_name']} (issuer_id={$d['issuer_id']}) — у нас rating=" . var_export($d['ours'], true)
+            . " от {$d['last_action_date']}, в снимке агентства не найден — ОЖИДАЕМО: {$d['reason']}");
     }
-
-    return $attention;
 }
 
 /**
@@ -195,24 +156,15 @@ function printReconcileReport(string $agency, array $result): array
  */
 function reconcileAgency(CurrentRatingsReconciler $reconciler, string $agency, string $label, array $snapshot, bool $saveSnapshot, bool $applyMissing): array
 {
-    $summary = [];
     $result = $reconciler->reconcile($agency, $snapshot);
-    $attention = printReconcileReport($agency, $result);
-
-    $expectedCount = count(array_filter($result['missing_in_snapshot'], static fn (array $d): bool => $d['expected']));
-    $summary[] = "{$label}: в снимке {$result['snapshot_count']}; расхождений по полям " . count($result['field_mismatches'])
-        . '; нет у нас ' . count($result['missing_in_ours'])
-        . '; нет в снимке ' . count($result['missing_in_snapshot']) . " (ожидаемых {$expectedCount})";
-    // Все строки, без обрезки — раньше было --10--, а сводка ссылалась на
-    // лог сверки, недоступный владельцу бота (не разработчику с SSH).
-    foreach ($attention as $line) {
-        $summary[] = "  • {$line}";
-    }
+    printReconcileReport($agency, $result);
+    // Все строки, одна на компанию, с источником нашего значения — см. ReconcileSummary.
+    $summary = ReconcileSummary::lines($label, $result);
 
     if ($applyMissing && $result['missing_in_ours'] !== []) {
         $applied = $reconciler->applyMissingInOurs($agency, $result['missing_in_ours']);
         Logger::info("[{$agency}] --apply-missing: записано новых строк current_ratings: {$applied}");
-        $summary[] = "  --apply-missing: добавлено строк {$applied}";
+        $summary[] = "--apply-missing: добавлено строк {$applied}";
     }
 
     if ($saveSnapshot) {
@@ -220,8 +172,10 @@ function reconcileAgency(CurrentRatingsReconciler $reconciler, string $agency, s
         $command = "php bin/seed_ratings.php --agency={$agency} --snapshot=var/snapshots/" . basename($path);
         Logger::info("[{$agency}] Снимок сохранён: {$path}");
         Logger::info("[{$agency}] Если отчёт в порядке — перезапись этим же снимком: {$command}");
-        $summary[] = "  Перезапись после проверки: {$command}";
+        $summary[] = '';
+        $summary[] = "Перезапись после проверки: {$command}";
     }
+    $summary[] = '';
 
     return $summary;
 }
@@ -266,12 +220,11 @@ if ($agency === 'nra' || $agency === 'all') {
             continue;
         }
 
-        $baseOutlook = RatingsNormalizer::mapOutlook(RatingsNormalizer::stripWatchSuffix(trim($row['Прогноз'] ?? '')));
         $rows[] = [
             'issuer_id' => $issuerId,
             'issuer_name' => (string) ($row['Название организации'] ?? ''),
-            'rating' => mb_substr(trim($row['Рейтинг'] ?? ''), 0, 20),
-            'outlook' => RatingsNormalizer::combineWithWatchStatus($baseOutlook, trim($row['Под наблюдением'] ?? '')),
+            'rating' => mb_substr(RatingsNormalizer::normalizeGrade(trim($row['Рейтинг'] ?? '')), 0, 20),
+            'outlook' => RatingsNormalizer::outlookFromNraColumns(trim($row['Прогноз'] ?? ''), trim($row['Под наблюдением'] ?? '')),
             'last_action_date' => $row['_date'],
             'source_url' => ($row['Ссылка на пресс релиз'] ?? '') !== '' ? $row['Ссылка на пресс релиз'] : null,
         ];
@@ -281,47 +234,8 @@ if ($agency === 'nra' || $agency === 'all') {
     $summary = array_merge($summary, reconcileAgency($reconciler, 'nra', 'НРА', SnapshotRows::latestPerIssuer($rows), false, $applyMissing));
 }
 
-/**
- * Разбивает текст на части не длиннее $maxLen символов, по границам
- * строк (не внутри одной строки) — та же защита от "Bad Request:
- * MESSAGE_TOO_LONG", что и в BotCommandHandler::splitIntoTelegramChunks()
- * (28 сентября 2026, найдено вживую на "Весь список"): сводка сверки
- * теперь печатает ВСЕ расхождения без обрезки на 10 строках (см. выше),
- * а значит сама вполне может превысить лимит Telegram 4096 символов —
- * AdminNotifier::send() раньше просто молча резала текст до 4000
- * (mb_substr), теряя хвост сводки без предупреждения.
- *
- * @return array<int, string>
- */
-function splitTextIntoTelegramChunks(string $text, int $maxLen = 3500): array
-{
-    if ($text === '') {
-        return [''];
-    }
-
-    $lines = explode("\n", $text);
-    $chunks = [];
-    $current = '';
-    foreach ($lines as $line) {
-        $candidate = $current === '' ? $line : $current . "\n" . $line;
-        if (mb_strlen($candidate) > $maxLen && $current !== '') {
-            $chunks[] = $current;
-            $current = $line;
-        } else {
-            $current = $candidate;
-        }
-    }
-    if ($current !== '') {
-        $chunks[] = $current;
-    }
-
-    return $chunks;
-}
-
-$summaryText = "Сверка рейтингов " . date('d.m.Y') . "\n\n" . implode("\n", $summary);
-foreach (splitTextIntoTelegramChunks($summaryText) as $chunk) {
-    AdminNotifier::send($chunk);
-}
+// Длинная сводка уходит несколькими сообщениями, по границам строк.
+AdminNotifier::sendLines(array_merge(['Сверка рейтингов ' . date('d.m.Y'), ''], $summary));
 $reviews->notifyNewProposals([AdminNotifier::class, 'send']);
 
 Logger::info('Готово.');

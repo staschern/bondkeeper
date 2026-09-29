@@ -96,6 +96,14 @@ check(
     $resolveOutlook->invoke(null, 'BB+', 'positive', 'stable')
 );
 
+echo "\n--- Часть 3: отзыв рейтинга обнуляет прогноз (АО «АВТОБАН-Финанс», сентябрь 2026) ---\n";
+
+check(
+    'Был прогноз "positive", рейтинг отозван ("...рейтинг и прогноз по нему") → NULL',
+    null,
+    $resolveOutlook->invoke(null, 'отозван', null, 'positive')
+);
+
 echo "\n";
 if ($failures > 0) {
     echo "ИТОГО: {$failures} из {$checks} ПРОВАЛЕНО.\n";

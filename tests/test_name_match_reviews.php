@@ -117,6 +117,18 @@ check('для тёзки строка не создана', 0, countRows($db, 'i
 
 check('без ИНН и без названия — нечем идентифицировать', NameMatchReviews::SKIPPED, $reviews->propose('nkr', 'exact_name', null, '«»', 3, null, null));
 
+echo "\n--- ссылка в предложении — полный адрес для любого агентства ---\n";
+
+$urlDb = makeDb();
+$urlReviews = new NameMatchReviews($urlDb);
+$urlReviews->propose('nkr', 'root_name', '7728355650', 'Группа «ВИС» (АО)', 3, 't', 'ratings.ru/ratings/press-releases/VIS-RA-160726/');
+$urlReviews->propose('expert_ra', 'root_name', '7710380617', 'ООО «Аэрофьюэлз Групп»', 3, 't', '/releases/2026/jul14e');
+$urlReviews->propose('acra', 'exact_name', null, 'АО «Аэрофьюэлз»', 3, 't', 'Пресс-релиз');
+$urls = $urlDb->query('SELECT source_url FROM issuer_name_match_reviews ORDER BY id')->fetchAll(PDO::FETCH_COLUMN);
+check('НКР: адрес без схемы → https://ratings.ru/…', 'https://ratings.ru/ratings/press-releases/VIS-RA-160726/', $urls[0]);
+check('Эксперт РА: путь от корня → https://raexpert.ru/…', 'https://raexpert.ru/releases/2026/jul14e', $urls[1]);
+check('не адрес — сохраняется как есть, не теряется', 'Пресс-релиз', $urls[2]);
+
 echo "\n--- reject(): больше не предлагается, чистит старую root-строку current_ratings ---\n";
 
 $db->exec("INSERT INTO current_ratings VALUES (1, 'expert_ra', 'ruA', 'stable', '2026-04-06', 1, NULL)");

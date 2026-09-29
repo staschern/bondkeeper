@@ -3,13 +3,17 @@
 declare(strict_types=1);
 
 /**
- * Офлайн-проверка NkrImporter::normalizeUrl()/describeRow() — чистая
- * текстовая логика, без сети/БД. Живая находка (28 сентября 2026,
- * реальный случай «Группа «ВИС» (АО)»): колонка "Press release" у НКР
- * иногда отдаёт адрес БЕЗ схемы ("ratings.ru/..."), старая проверка
+ * Офлайн-проверка RatingsNormalizer::absoluteUrl()/NkrImporter::describeRow()
+ * — чистая текстовая логика, без сети/БД. Живая находка (28 сентября
+ * 2026, реальный случай «Группа «ВИС» (АО)»): колонка "Press release" у
+ * НКР иногда отдаёт адрес БЕЗ схемы ("ratings.ru/..."), старая проверка
  * `^https?://` не признавала такую строку ссылкой — она терялась в
  * тексте заголовка вместо source_url, а в предложении на подтверждение
  * подставлялся общий список эмитентов вместо настоящего пресс-релиза.
+ * Изначально фикс был узким (NkrImporter::normalizeUrl()), 28 сентября
+ * заменён на общий RatingsNormalizer::absoluteUrl($value, $host) — тот
+ * же случай пригодился для предложений сопоставления любого агентства
+ * (см. NameMatchReviews.php), не только НКР.
  *
  * Запуск (из корня репозитория, с этим файлом в tests/):
  *   php -d extension=pdo_sqlite -d extension=mbstring tests/test_nkr_importer_url.php
@@ -20,6 +24,7 @@ declare(strict_types=1);
 require dirname(__DIR__) . '/bin/bootstrap.php';
 
 use BondKeeper\Ratings\NkrImporter;
+use BondKeeper\Ratings\RatingsNormalizer;
 
 $failures = 0;
 $checks = 0;
@@ -45,22 +50,24 @@ function callStatic(string $method, array $args)
     return $m->invokeArgs(null, $args);
 }
 
-echo "--- normalizeUrl() ---\n";
+echo "--- RatingsNormalizer::absoluteUrl() ---\n";
 
-check('normalizeUrl(): пустая строка -> null', null, callStatic('normalizeUrl', ['']));
+check('absoluteUrl(): пустая строка -> null', null, RatingsNormalizer::absoluteUrl('', 'ratings.ru'));
 check(
-    'normalizeUrl(): со схемой https:// -> как есть',
+    'absoluteUrl(): со схемой https:// -> как есть',
     'https://ratings.ru/ratings/press-releases/VIS-RA-160726/',
-    callStatic('normalizeUrl', ['https://ratings.ru/ratings/press-releases/VIS-RA-160726/'])
+    RatingsNormalizer::absoluteUrl('https://ratings.ru/ratings/press-releases/VIS-RA-160726/', 'ratings.ru')
 );
 check(
-    'normalizeUrl(): реальный случай — БЕЗ схемы (Группа «ВИС», 28 сентября 2026) -> https:// подставлена',
+    'absoluteUrl(): реальный случай — БЕЗ схемы (Группа «ВИС», 28 сентября 2026) -> https:// подставлена',
     'https://ratings.ru/ratings/press-releases/VIS-RA-160726/',
-    callStatic('normalizeUrl', ['ratings.ru/ratings/press-releases/VIS-RA-160726/'])
+    RatingsNormalizer::absoluteUrl('ratings.ru/ratings/press-releases/VIS-RA-160726/', 'ratings.ru')
 );
-check('normalizeUrl(): голый домен без пути -> https:// подставлена', 'https://ratings.ru', callStatic('normalizeUrl', ['ratings.ru']));
-check('normalizeUrl(): не похоже на URL (обычный текст) -> null', null, callStatic('normalizeUrl', ['уточняется']));
-check('normalizeUrl(): не похоже на URL (просто слово без точки-домена) -> null', null, callStatic('normalizeUrl', ['нет']));
+check('absoluteUrl(): путь от корня "/…" -> https://{host}/…', 'https://ratings.ru/ratings/x', RatingsNormalizer::absoluteUrl('/ratings/x', 'ratings.ru'));
+check('absoluteUrl(): "//host/…" -> https://host/…', 'https://ratings.ru/x', RatingsNormalizer::absoluteUrl('//ratings.ru/x', 'ratings.ru'));
+check('absoluteUrl(): голый домен БЕЗ пути -> null (нет "/" в конце, не похоже на реальный адрес пресс-релиза)', null, RatingsNormalizer::absoluteUrl('ratings.ru', 'ratings.ru'));
+check('absoluteUrl(): не похоже на URL (обычный текст) -> null', null, RatingsNormalizer::absoluteUrl('уточняется', 'ratings.ru'));
+check('absoluteUrl(): не похоже на URL (просто слово без точки-домена) -> null', null, RatingsNormalizer::absoluteUrl('нет', 'ratings.ru'));
 
 echo "\n--- describeRow() ---\n";
 

@@ -43,6 +43,12 @@ final class NkrTitleParser
      */
     public const VERBS = ['повысило', 'снизило', 'подтвердило', 'отозвало', 'присвоило', 'изменило'];
 
+    /** Корни слов прогноза в тексте НКР, включая "неопределённый" (→ indefinite, отдельный код — миграция 026). */
+    private const OUTLOOK_WORD = '(?:позитивн|положительн|негативн|отрицательн|стабильн|развивающ|неопределённ|неопределенн)[а-яё]*';
+
+    /** Часть предложения без конца предложения: точка внутри "A.ru"/"ВЭБ.РФ" допустима, точка перед пробелом — нет. */
+    private const SAME_SENTENCE = '(?:[^.;]|\.(?!\s))*?';
+
     /**
      * Заголовок должен начинаться с "НКР <глагол>" — иначе это не
      * рейтинговое действие в привычном формате (например, методическая
@@ -128,10 +134,87 @@ final class NkrTitleParser
         return null;
     }
 
+    /**
+     * Прогноз из текста действия НКР — заголовка или вводного абзаца
+     * пресс-релиза (extractLeadFromDetailHtml()). Найдено вживую (сентябрь
+     * 2026, АО «ГИДРОМАШСЕРВИС»): заголовок "НКР снизило кредитные рейтинги
+     * АО «ГИДРОМАШСЕРВИС» и его облигаций с A+.ru до A.ru" прогноз не
+     * называет, а первое предложение текста — называет ("…и изменило
+     * прогноз по кредитному рейтингу со стабильного на негативный").
+     * Порядок:
+     *   1. Изменение прогноза — берётся то, что ПОСЛЕ "на": "со стабильного
+     *      на негативный" → negative, "с позитивного на стабильный" →
+     *      stable, "на «рейтинг на пересмотре …»" → статус пересмотра. Раньше
+     *      заголовок "с негативного на стабильный" прочитался бы как
+     *      negative (слово "негативн" проверялось раньше "стабильн").
+     *   2. Статус "на пересмотре" без изменения — extractReviewStatusFromProse()
+     *      ("— неопределённый прогноз" → under_review_indefinite).
+     *   3. Иначе — слово прогноза в тексте ("со стабильным прогнозом",
+     *      "прогноз — стабильный", "остался стабильным"). Если слов с РАЗНЫМ
+     *      значением несколько (две компании в одном действии с разными
+     *      прогнозами) — не угадываем, NULL.
+     * NULL — прогноз не назван; вызывающий код оставляет прежний.
+     * Проверено на 120 реальных релизах НКР (июнь–сентябрь 2026): на
+     * заголовках результат совпал с прежней логикой во всех случаях.
+     */
+    public static function extractOutlook(string $text): ?string
+    {
+        $lower = mb_strtolower($text);
+
+        if (preg_match('/прогноз' . self::SAME_SENTENCE . '\sна\s+«?\s*(рейтинг\s+на\s+пересмотре[^»]*)/u', $lower, $m)) {
+            return RatingsNormalizer::extractReviewStatusFromProse($m[1]);
+        }
+        if (preg_match('/прогноз' . self::SAME_SENTENCE . '\sна\s+(' . self::OUTLOOK_WORD . ')/u', $lower, $m)) {
+            return RatingsNormalizer::mapOutlookFromProse($m[1]);
+        }
+
+        $review = RatingsNormalizer::extractReviewStatusFromProse($lower);
+        if ($review !== null) {
+            return $review;
+        }
+
+        preg_match_all('/' . self::OUTLOOK_WORD . '/u', $lower, $m);
+        $found = array_values(array_unique(array_map(
+            static fn (string $word): ?string => RatingsNormalizer::mapOutlookFromProse($word),
+            $m[0],
+        )));
+
+        return count($found) === 1 ? $found[0] : null;
+    }
+
+    /**
+     * Вводный абзац пресс-релиза: первое предложение "Рейтинговое агентство
+     * НКР <глагол> …" и, если следующее предложение начинается со слова
+     * "Прогноз", — оно тоже (реальный случай ООО «Инвест КЦ»: "…с A.ru до
+     * BBB+.ru. Прогноз по кредитному рейтингу ООО «Инвест КЦ» остался
+     * стабильным."). Дальше в тексте прогноз не ищем: там история рейтинга
+     * ("рейтинг A+.ru стабильный"), прошлые статусы и обороты вроде
+     * "положительное влияние на оценку…", а у отзыва — "до момента отзыва
+     * действовал рейтинг … со стабильным прогнозом".
+     */
+    public static function extractLeadFromDetailHtml(string $html): ?string
+    {
+        $text = self::htmlToPlainText($html);
+        $end = '\.(?=\s+[А-ЯЁA-Z«"]|\s*$)';
+
+        if (!preg_match('/Рейтинговое агентство НКР\s+[а-яё]+\s.{10,1200}?' . $end . '/u', $text, $m, PREG_OFFSET_CAPTURE)) {
+            return null;
+        }
+        $lead = $m[0][0];
+
+        $rest = ltrim(substr($text, $m[0][1] + strlen($lead)));
+        if (preg_match('/^Прогноз\s.{5,400}?' . $end . '/u', $rest, $next)) {
+            $lead .= ' ' . $next[0];
+        }
+
+        return $lead;
+    }
+
     private static function htmlToPlainText(string $html): string
     {
-        $html = preg_replace('/<script.*?<\/script>/su', ' ', $html) ?? $html;
+        $html = preg_replace('/<(script|style)\b.*?<\/\1>/su', ' ', $html) ?? $html;
         $text = preg_replace('/<[^>]+>/', ' ', $html) ?? $html;
+        $text = str_replace("\u{00A0}", ' ', html_entity_decode($text, ENT_QUOTES | ENT_HTML5, 'UTF-8'));
 
         return trim(preg_replace('/\s+/u', ' ', $text) ?? $text);
     }

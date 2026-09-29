@@ -88,11 +88,13 @@ use PDO;
  * честно нечего писать в NOT NULL rating_to, такой issuer пропускается
  * (см. importRow()).
  *
- * Статус "на пересмотре" (CreditWatch/Rating Watch, миграция 017) —
- * RatingsNormalizer::extractReviewStatusFromProse() проверяется ПЕРЕД
- * обычным mapOutlookFromProse() — своя, более специфичная категория
- * outlook (under_review/under_review_negative/under_review_positive), не
- * обычные 4 направления прогноза.
+ * Прогноз (включая статус "на пересмотре", миграция 017) —
+ * NkrTitleParser::extractOutlook(): сначала из заголовка, а если там его
+ * нет — из вводного абзаца пресс-релиза (страница и так скачивается ради
+ * ИНН). Найдено вживую 24.09.2026: у АО «ГИДРОМАШСЕРВИС» заголовок
+ * называл только понижение рейтинга, а смена прогноза со стабильного на
+ * негативный была только в тексте — у нас остался стабильный. Прогноз
+ * не назван ни там, ни там — остаётся прежний (CurrentRatingsSync).
  *
  * === Составные действия (компания-поручитель + её SPV) ===
  *
@@ -126,7 +128,8 @@ final class NkrNewsImporter
     private int $totalCandidates = 0;
     private int $skippedAlreadyLogged = 0;
     private int $skippedNotRatingAction = 0;
-    private int $skippedBondRedemption = 0;
+    /** @var array<string, int> статус rating_news_log => сколько новостей про облигации пропущено (RatingsNormalizer::bondNewsSkipStatus()) */
+    private array $skippedBondNews = [];
     private int $skippedNonStandardRating = 0;
     private int $skippedNoRatingParsed = 0;
     /** Штук пресс-релизов, по которым записана хотя бы одна строка rating_actions. */
@@ -138,6 +141,8 @@ final class NkrNewsImporter
     private int $skippedNoIssuerResolved = 0;
     /** Новых предложений сопоставления по названию (ждут подтверждения администратора). */
     private int $proposedByName = 0;
+    /** Прогноз взят из вводного абзаца пресс-релиза — в заголовке его не было. */
+    private int $outlookFromLead = 0;
     /** @var array<int, string> */
     private array $unmatchedTitles = [];
     /** @var array<int, string> */
@@ -241,14 +246,15 @@ final class NkrNewsImporter
             return;
         }
 
-        // Отзыв рейтинга КОНКРЕТНОГО ВЫПУСКА облигаций из-за его
-        // погашения — технический шум, не отзыв рейтинга эмитента (см.
-        // докблок RatingsNormalizer::isBondIssueRedemptionWithdrawal() —
-        // NkrTitleParser уже предвидел этот случай в своём докблоке
-        // ("в связи с его погашением"), но раньше не обрабатывал).
-        if (str_starts_with($verb, 'отозвал') && RatingsNormalizer::isBondIssueRedemptionWithdrawal($row['title'])) {
-            RatingNewsLog::log($this->db, self::AGENCY, $row['url'], $row['date'], 'skipped_bond_redemption');
-            $this->skippedBondRedemption++;
+        // Новости про облигации, которые не должны влиять на рейтинг
+        // компании (решение пользователя, 28.09.2026): отзыв из-за
+        // погашения или неразмещения, отзыв ожидаемого рейтинга, любые
+        // новости про субординированные облигации — одно общее правило
+        // для НКР, Эксперт РА и АКРА, см. RatingsNormalizer::bondNewsSkipStatus().
+        $bondSkip = RatingsNormalizer::bondNewsSkipStatus($row['title'], $row['title'], str_starts_with($verb, 'отозвал'));
+        if ($bondSkip !== null) {
+            RatingNewsLog::log($this->db, self::AGENCY, $row['url'], $row['date'], $bondSkip);
+            $this->skippedBondNews[$bondSkip] = ($this->skippedBondNews[$bondSkip] ?? 0) + 1;
             return;
         }
 
@@ -271,10 +277,17 @@ final class NkrNewsImporter
             return;
         }
 
-        $outlookTo = RatingsNormalizer::extractReviewStatusFromProse($row['title'])
-            ?? RatingsNormalizer::mapOutlookFromProse($row['title']);
+        $detailHtml = RatingsHttp::get($row['url'], 60);
+        $inn = NkrTitleParser::extractInnFromDetailHtml($detailHtml);
 
-        $inn = $this->fetchInnFromDetailPage($row['url']);
+        $outlookTo = NkrTitleParser::extractOutlook($row['title']);
+        if ($outlookTo === null) {
+            $lead = NkrTitleParser::extractLeadFromDetailHtml($detailHtml);
+            $outlookTo = $lead !== null ? NkrTitleParser::extractOutlook($lead) : null;
+            if ($outlookTo !== null) {
+                $this->outlookFromLead++;
+            }
+        }
         $issuerIds = $this->resolveIssuerIds($inn, $row['title'], $row['url']);
 
         if ($issuerIds === []) {
@@ -382,26 +395,24 @@ final class NkrNewsImporter
         return array_values(array_unique($issuerIds));
     }
 
-    private function fetchInnFromDetailPage(string $url): ?string
-    {
-        $html = RatingsHttp::get($url, 60);
-
-        return NkrTitleParser::extractInnFromDetailHtml($html);
-    }
-
     private function printReport(): void
     {
         Logger::info('=== Отчёт по импорту rating_actions (НКР, новости) ===');
         Logger::info("Кандидатов в окне: {$this->totalCandidates}");
         Logger::info("Уже были окончательно обработаны раньше (status=matched в rating_news_log): {$this->skippedAlreadyLogged}");
         Logger::info("Пропущено (не похоже на кредитное рейтинговое действие): {$this->skippedNotRatingAction}");
-        Logger::info("Пропущено (отзыв рейтинга выпуска облигаций из-за погашения — шум, не эмитентское действие): {$this->skippedBondRedemption}");
+        Logger::info('Пропущено как новости про облигации, не влияющие на рейтинг компании (погашение / не размещены / субординированные / ожидаемый рейтинг): '
+            . ($this->skippedBondNews['skipped_bond_redemption'] ?? 0) . ' / '
+            . ($this->skippedBondNews['skipped_bond_not_placed'] ?? 0) . ' / '
+            . ($this->skippedBondNews['skipped_subordinated'] ?? 0) . ' / '
+            . ($this->skippedBondNews['skipped_expected'] ?? 0));
         Logger::info("Пропущено (нестандартная шкала, напр. 'sf'): {$this->skippedNonStandardRating}");
         Logger::info("Пропущено (не удалось разобрать уровень рейтинга и нет данных в current_ratings): {$this->skippedNoRatingParsed}");
         Logger::info("Действий записано (matchedActions): {$this->matchedActions}");
         Logger::info("Строк rating_actions записано (matchedRows): {$this->matchedRows}");
         Logger::info("Из них составных действий (2+ юрлица сопоставились): {$this->compositeActions}");
         Logger::info("Новых предложений сопоставления по названию (ждут подтверждения, bin/review_matches.php): {$this->proposedByName}");
+        Logger::info("Прогноз взят из текста пресс-релиза (в заголовке его не было): {$this->outlookFromLead}");
         Logger::info("Не сопоставлено ни с одним issuer_id (попробуем снова на следующем прогоне): {$this->skippedNoIssuerResolved}");
         if ($this->unmatchedTitles !== []) {
             Logger::info('Не сопоставленные: ' . implode('; ', array_slice($this->unmatchedTitles, 0, 20)));

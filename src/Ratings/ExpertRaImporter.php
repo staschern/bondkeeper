@@ -152,7 +152,7 @@ final class ExpertRaImporter
         $this->totalRows++;
 
         $inn = $this->resolveInn($row['card_url']);
-        $rating = mb_substr(trim($row['rating']), 0, 20);
+        $rating = mb_substr(RatingsNormalizer::normalizeGrade(trim($row['rating'])), 0, 20);
         $sourceTitle = self::describeRow($row, $rating, $categoryLabel);
 
         $issuerId = $this->resolveIssuerId($inn, $row['name'], $sourceTitle, $row['card_url'], isset($this->failedCards[$row['card_url']]));

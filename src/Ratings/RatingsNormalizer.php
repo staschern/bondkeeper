@@ -16,7 +16,8 @@ final class RatingsNormalizer
      * current_ratings.outlook — ENUM('positive','stable','negative','developing',
      * 'under_review'/'under_review_negative'/'under_review_positive'/
      * 'under_review_stable'/'under_review_developing'/'review_concluded',
-     * см. миграцию 017). Этот метод — только 4 "базовых" направления;
+     * см. миграцию 017; 'indefinite' — миграция 026). Этот метод — только
+     * "базовые" направления;
      * статус "на пересмотре"/"под наблюдением" собирается ОТДЕЛЬНО (см.
      * combineWithWatchStatus() для НРА, extractReviewStatusFromProse() для
      * НКР) — не здесь, чтобы не разрастить один exact-match на десяток
@@ -29,10 +30,12 @@ final class RatingsNormalizer
             'стабильный' => 'stable',
             'позитивный' => 'positive',
             'негативный' => 'negative',
-            'неопределенный', 'неопределённый' => 'developing',
-            // АКРА использует "развивающийся" там, где остальные говорят
-            // "неопределённый" — тот же смысл (S&P-style "developing"),
-            // другое слово (см. STAGE3_RATINGS.md, JSON-выгрузка АКРА).
+            // "Неопределённый" (НКР) и "развивающийся" (Эксперт РА, АКРА,
+            // НРА) — разные понятия (решение пользователя, сентябрь 2026,
+            // миграция 026): у НКР — высокая вероятность ИЗМЕНЕНИЯ
+            // рейтинга с неизвестным направлением; у остальных —
+            // равновероятны несколько исходов, включая сохранение.
+            'неопределенный', 'неопределённый' => 'indefinite',
             'развивающийся' => 'developing',
             default => null,
         };
@@ -75,29 +78,29 @@ final class RatingsNormalizer
      *     значение, не молчаливый NULL: сам факт "снято этим действием"
      *     значим, даже когда текущий прогноз не назван.
      *   - "" (не под наблюдением вообще) → база как есть, без изменений.
+     * Сама логика — общее правило combineWithWatch() (одно для всех
+     * агентств); для обеих колонок НРА сразу — outlookFromNraColumns().
      */
     public static function combineWithWatchStatus(?string $baseOutlook, string $watchColumnRaw): ?string
     {
-        return match (mb_strtolower(trim($watchColumnRaw))) {
-            'под наблюдением' => match ($baseOutlook) {
-                'negative' => 'under_review_negative',
-                'positive' => 'under_review_positive',
-                'stable' => 'under_review_stable',
-                'developing' => 'under_review_developing',
-                default => 'under_review',
-            },
-            'снято с наблюдения' => $baseOutlook ?? 'review_concluded',
-            default => $baseOutlook,
-        };
+        return self::combineWithWatch($baseOutlook, match (mb_strtolower(trim($watchColumnRaw))) {
+            'под наблюдением' => self::WATCH_ON,
+            'снято с наблюдения' => self::WATCH_OFF,
+            default => null,
+        });
     }
 
     /**
-     * НКР статус "на пересмотре" даёт только свободным текстом заголовка
-     * (нет отдельной структурированной колонки, в отличие от НРА) —
-     * "рейтинг на пересмотре с возможностью понижения/повышения" или
-     * просто "на пересмотре" без уточнения направления. Проверяется
-     * ДО обычного mapOutlookFromProse() — это отдельный, более
-     * специфичный статус, не сводится к 4 базовым направлениям.
+     * НКР статус "на пересмотре" (то же, что "под наблюдением" у НРА и
+     * Эксперт РА) даёт только свободным текстом. У НКР ровно три
+     * формулировки (проверено по 1069 заголовкам, сентябрь 2026):
+     * "с возможностью понижения" → under_review_negative, "с возможностью
+     * повышения" → under_review_positive, "— неопределённый прогноз" →
+     * under_review_indefinite (миграция 026: статус пересмотра + направление
+     * «неопределённый», по той же схеме, что under_review_developing у НРА).
+     * Голое under_review — только если направление не названо вовсе.
+     * Проверяется ДО обычного mapOutlookFromProse() — это отдельный,
+     * более специфичный статус.
      */
     public static function extractReviewStatusFromProse(string $text): ?string
     {
@@ -109,47 +112,117 @@ final class RatingsNormalizer
         return match (true) {
             (bool) preg_match('/возможностью понижения|возможностью снижения/u', $text) => 'under_review_negative',
             (bool) preg_match('/возможностью повышения/u', $text) => 'under_review_positive',
+            (bool) preg_match('/неопределённ|неопределенн/u', $text) => 'under_review_indefinite',
             default => 'under_review',
         };
     }
 
+    /** Статус наблюдения, названный в тексте действия: поставлен/продлён/сохранён. */
+    public const WATCH_ON = 'on';
+    /** Статус наблюдения снят. */
+    public const WATCH_OFF = 'off';
+
     /**
-     * Эксперт РА даёт статус "под наблюдением" СВОЕЙ терминологией — не
-     * "на пересмотре" (НКР), не структурированной колонкой (НРА), а
-     * собственными глагольными оборотами в тексте (проверено вживую на
-     * 18 реальных примерах, сентябрь 2026):
-     *   - "установил статус «под наблюдением»" — статус НАЧАТ (обычно
-     *     вместе с "присвоил" — новый рейтинг сразу под наблюдением);
-     *   - "продлил статус «под наблюдением»" — статус ПРОДЛЁН (свой
-     *     отдельный глагол — см. добавление "продлил" в
-     *     ExpertRaNewsImporter::VERBS);
-     *   - "снял статус «под наблюдением»" — статус ЗАВЕРШЁН.
-     * Направление (positive/negative) в этой формулировке НИ РАЗУ не
-     * встретилось явно — всегда общая фраза "означает высокую вероятность
-     * рейтинговых действий в ближайшее время", без уточнения "в какую
-     * сторону". Поэтому "установил"/"продлил" здесь ВСЕГДА даёт голое
-     * under_review, без directional-вариантов (в отличие от НКР/НРА, где
-     * направление иногда есть).
+     * ОБЩЕЕ правило чтения статуса "под наблюдением" из текста действия —
+     * для всех агентств (решение пользователя, 28.09.2026: "по
+     * возможности универсально во всех импортёрах"). Раньше у НРА,
+     * Эксперт РА, выгрузки АКРА, новостей АКРА и писем АКРА было по своему
+     * разбору, и они расходились: новости АКРА читали "…И СНЯЛО СТАТУС «ПОД
+     * НАБЛЮДЕНИЕМ»" как "поставлен" (проверяли только упоминание), письмо
+     * АКРА и Эксперт РА теряли прогноз при "продлил статус".
      *
-     * "Снял" обрабатывается тем же правилом, что и у НРА
-     * (combineWithWatchStatus): $baseOutlook уже вычислен вызывающим
-     * кодом (обычный прогноз ИЗ ЭТОГО ЖЕ действия, если он был назван) —
-     * если есть, он и остаётся; если нет — review_concluded.
+     * WATCH_OFF — снят: "снял/сняло/сняв/снят (со) статус(а) «под
+     * наблюдением»", "статус «под наблюдением» снят" (и "cнял" с латинской c
+     * — реальная опечатка Эксперт РА). WATCH_ON — установлен/присвоен/продлён/
+     * сохранён в любой форме ("присвоило статус", "продлен статус", "по
+     * рейтингу установлен статус", "статус «под наблюдением» продлён"), а
+     * также упоминание статуса без глагола (как раньше у новостей АКРА).
+     * Предложения "Ранее …" (прежнее состояние) не учитываются. NULL — о
+     * статусе ничего не сказано.
      *
-     * Возвращает NULL, если про статус наблюдения в тексте вообще ничего
-     * нет — тогда вызывающий код использует $baseOutlook как есть.
+     * НКР говорит "на пересмотре" с направлением внутри формулировки — у
+     * неё свой разбор, extractReviewStatusFromProse().
      */
-    public static function extractWatchStatusFromExpertRaProse(string $text, ?string $baseOutlook): ?string
+    public static function watchStatusFromText(string $text): ?string
     {
         $text = mb_strtolower($text);
-        if (preg_match('/снял\s+статус\s*«?под\s+наблюдением»?/u', $text)) {
-            return $baseOutlook ?? 'review_concluded';
+        $text = preg_replace('/(?:^|(?<=[.!?]\s))ранее[^.]*\./u', ' ', $text) ?? $text;
+
+        $status = 'статус\w*\s*«?\s*под\s*«?\s*наблюдени\w*»?';
+        $off = '[сc]нял\w*|[сc]нят[аоы]?|[сc]няв|[сc]нимает';
+        $on = 'установил\w*|установлен\w*|установив|присвоил\w*|присвоен\w*|присвоив|продлил\w*|продлен\w*|продлён\w*|продлив|сохранил\w*|сохранен\w*|сохранён\w*|сохранив';
+
+        if (preg_match("/(?:{$off})\s+(?:со\s+)?{$status}|{$status}\s+(?:{$off})/u", $text)) {
+            return self::WATCH_OFF;
         }
-        if (preg_match('/(установил|продлил)\s+статус\s*«?под\s+наблюдением»?/u', $text)) {
-            return 'under_review';
+        if (preg_match("/(?:{$on})\s+{$status}|{$status}\s+(?:{$on})|{$status}/u", $text)) {
+            return self::WATCH_ON;
         }
 
         return null;
+    }
+
+    /**
+     * ОБЩЕЕ правило сложения статуса наблюдения с прогнозом — для всех
+     * агентств (решение пользователя, 28.09.2026): если агентство
+     * поставило/продлило наблюдение и прямо называет прогноз, сохраняются
+     * ОБА факта — under_review_<прогноз> (реальные случаи: НРА «Оил Ресурс»
+     * — "рейтинг продолжает действовать …, прогноз «стабильный»"; Эксперт РА
+     * — "продлил статус «под наблюдением» … Рейтинг компании продолжает
+     * действовать на уровне ruAA- со стабильным прогнозом").
+     *   - WATCH_ON: under_review_<прогноз>; прогноза нет (облигации, CC/C) —
+     *     under_review.
+     *   - WATCH_OFF: сам прогноз; прогноза нет — review_concluded.
+     *   - NULL: прогноз как есть.
+     */
+    public static function combineWithWatch(?string $baseOutlook, ?string $watch): ?string
+    {
+        if ($watch === self::WATCH_ON && $baseOutlook !== null && str_starts_with($baseOutlook, 'under_review')) {
+            return $baseOutlook;
+        }
+
+        return match ($watch) {
+            self::WATCH_ON => match ($baseOutlook) {
+                'negative' => 'under_review_negative',
+                'positive' => 'under_review_positive',
+                'stable' => 'under_review_stable',
+                'developing' => 'under_review_developing',
+                'indefinite' => 'under_review_indefinite',
+                default => 'under_review',
+            },
+            self::WATCH_OFF => $baseOutlook ?? 'review_concluded',
+            default => $baseOutlook,
+        };
+    }
+
+    /**
+     * Прогноз НРА из двух колонок выгрузки: "Прогноз" ("Стабильный",
+     * "Развивающийся - под наблюдением", "Без прогноза - снято с
+     * наблюдения", …) и "Под наблюдением" ("", "Под наблюдением", "Снято с
+     * наблюдения"). Статус — из колонки "Под наблюдением", а если она
+     * пустая — из окончания колонки "Прогноз" (реальный случай ПАО
+     * «ЕвроТранс» 09.04.2026: "Без прогноза - под наблюдением" при пустой
+     * колонке, в пресс-релизе — "продлив статус «под наблюдением»"; раньше
+     * получался NULL). Одна функция для импортёра и сверки НРА.
+     */
+    public static function outlookFromNraColumns(string $prognozRaw, string $watchColumnRaw): ?string
+    {
+        $base = self::mapOutlook(self::stripWatchSuffix($prognozRaw));
+
+        $watch = match (mb_strtolower(trim($watchColumnRaw))) {
+            'под наблюдением' => self::WATCH_ON,
+            'снято с наблюдения' => self::WATCH_OFF,
+            default => null,
+        };
+        if ($watch === null) {
+            if (preg_match('/-\s*под\s+наблюдением\s*$/ui', $prognozRaw)) {
+                $watch = self::WATCH_ON;
+            } elseif (preg_match('/-\s*снято\s+с\s+наблюдения\s*$/ui', $prognozRaw)) {
+                $watch = self::WATCH_OFF;
+            }
+        }
+
+        return self::combineWithWatch($base, $watch);
     }
 
     /**
@@ -318,20 +391,34 @@ final class RatingsNormalizer
         $raw = trim($raw);
 
         if (preg_match('/^(.*?),\s*под\s+наблюдением\s*$/ui', $raw, $m)) {
-            return match (self::mapOutlook(trim($m[1]))) {
-                'negative' => 'under_review_negative',
-                'positive' => 'under_review_positive',
-                'stable' => 'under_review_stable',
-                'developing' => 'under_review_developing',
-                default => 'under_review',
-            };
+            return self::combineWithWatch(self::mapOutlook(trim($m[1])), self::WATCH_ON);
         }
 
         if (preg_match('/^(.*?),\s*снято\s+с\s+наблюдения\s*$/ui', $raw, $m)) {
-            return self::mapOutlook(trim($m[1])) ?? 'review_concluded';
+            return self::combineWithWatch(self::mapOutlook(trim($m[1])), self::WATCH_OFF);
         }
 
         return self::mapOutlook($raw);
+    }
+
+    /**
+     * Ссылка к полному адресу: "ratings.ru/…" (выгрузка НКР отдаёт адреса
+     * пресс-релизов без схемы — найдено 28.09.2026) → "https://ratings.ru/…",
+     * путь от корня "/…" → "https://{$host}/…", "//host/…" → "https://host/…".
+     * Не похоже на адрес — NULL.
+     */
+    public static function absoluteUrl(string $value, string $host): ?string
+    {
+        $value = trim($value);
+
+        return match (true) {
+            $value === '' => null,
+            (bool) preg_match('~^https?://~i', $value) => $value,
+            str_starts_with($value, '//') => 'https:' . $value,
+            str_starts_with($value, '/') => "https://{$host}{$value}",
+            (bool) preg_match('~^(?:www\.)?[a-z0-9-]+(?:\.[a-z0-9-]+)+/~i', $value) => 'https://' . $value,
+            default => null,
+        };
     }
 
     /**
@@ -355,7 +442,9 @@ final class RatingsNormalizer
             (bool) preg_match('/позитивн|положительн/u', $text) => 'positive',
             (bool) preg_match('/негативн|отрицательн/u', $text) => 'negative',
             (bool) preg_match('/стабильн/u', $text) => 'stable',
-            (bool) preg_match('/развивающ|неопределенн|неопределённ/u', $text) => 'developing',
+            (bool) preg_match('/развивающ/u', $text) => 'developing',
+            // Отдельный код — см. mapOutlook() и миграцию 026.
+            (bool) preg_match('/неопределенн|неопределённ/u', $text) => 'indefinite',
             default => null,
         };
     }
@@ -450,12 +539,149 @@ final class RatingsNormalizer
      */
     public static function isBondIssueRatingTitle(string $title): bool
     {
+        // Прилагательные между "рейтинг" и "облигаций" (28.09.2026: "рейтинг
+        // субординированных облигаций Банка ГПБ" не узнавался как рейтинг
+        // облигаций и проскакивал мимо фильтра погашения), и "рейтинг
+        // инструмента структурированного финансирования облигаций".
+        $adjectives = '(?:(?:биржев|субординированн|несубординированн|бессрочн|коммерческ)[а-яё]*\s+)*';
+        $instrument = '(?:инструмент[а-яё]*\s+структурированн[а-яё]*\s+финансировани[а-яё]*\s+)?';
+
         return (bool) preg_match(
-            '/рейтинг[а-я]*\s+(?:по\s+)?(?:выпуск[а-я]*\s+)?(?:биржев[а-я]*\s+)?облигаци'
-            . '|рейтинг[а-я]*\s+(?:по\s+)?облигационн[а-я]*\s+выпуск'
-            . '|выпуск[а-я]*\s+(?:биржев[а-я]*\s+)?облигаци.*рейтинг/u',
+            "/рейтинг[а-яё]*\s+(?:по\s+)?{$instrument}(?:выпуск[а-яё]*\s+)?{$adjectives}облигаци"
+            . '|рейтинг[а-яё]*\s+(?:по\s+)?облигационн[а-яё]*\s+выпуск'
+            . "|выпуск[а-яё]*\s+{$adjectives}облигаци.*рейтинг/u",
             mb_strtolower($title)
         );
+    }
+
+    /**
+     * Отзыв рейтинга ОБЛИГАЦИЙ, который не должен влиять на рейтинг
+     * компании (решение пользователя, 28.09.2026) — общий для новостей
+     * НКР, Эксперт РА и АКРА. Вызывающий код проверяет, что действие —
+     * отзыв. Срабатывает, только если новость про облигации/выпуск (не про
+     * компанию), и причина одна из:
+     *   - погашение (полное, досрочное) — как раньше;
+     *   - выпуск не размещён: "отсутствием размещения облигаций в течение
+     *     года" (ПАО «Банк ПСБ»), "решением об отказе от размещения"
+     *     (Республика Башкортостан), "решение не размещать";
+     *   - отзывается ОЖИДАЕМЫЙ рейтинг / облигации "планируемые к выпуску" —
+     *     по определению выпуск ещё не размещён, причина не важна.
+     * Отзыв облигаций по другим причинам (истёк/расторгнут договор) — НЕ
+     * пропускается: у компании, от которой у нас есть только рейтинг
+     * облигаций (ВСК, АБЗ-1, ПКТ), это и есть отзыв; у остальных агентство
+     * в тот же день отдельно отзывает рейтинг компании (Селектел, О'КЕЙ,
+     * ТрансФин-М, Томская область — проверено на ленте Эксперт РА).
+     * Отзыв рейтинга самой компании ("в связи с погашением задолженности")
+     * не задевается никогда.
+     */
+    public static function isNeutralBondWithdrawal(string $text): bool
+    {
+        $lower = mb_strtolower($text);
+        $planned = (bool) preg_match('/планируем[а-яё]*\s+к\s+выпуск/u', $lower);
+        if (!self::isBondIssueRatingTitle($text) && !$planned) {
+            return false;
+        }
+
+        return $planned
+            || (bool) preg_match(
+                // "от размещения" — всегда отказ: "решением об отказе от
+                // размещения", "в связи с отказом эмитента от размещения".
+                '/ожидаем[а-яё]*\s+(?:кредитн[а-яё]*\s+)?рейтинг|погашен|не\s+размещ|неразмещ|от\s+размещени|отсутстви[а-яё]*\s+размещ/u',
+                $lower
+            );
+    }
+
+    /**
+     * Общее решение для новостей НКР, Эксперт РА и АКРА: пропустить
+     * новость про облигации, которая не должна влиять на рейтинг компании,
+     * и с каким статусом записать её в rating_news_log (миграция 026). NULL
+     * — не пропускать. Предмет новости (облигации или компания) —
+     * по заголовку; причина отзыва — по всему тексту (у Эксперт РА она
+     * часто только в подзаголовке).
+     *   - skipped_subordinated — рейтинг субординированных облигаций, любое
+     *     действие;
+     *   - skipped_expected — ожидаемый рейтинг облигаций (присвоение,
+     *     подтверждение, отзыв — любое действие; решение пользователя
+     *     28.09.2026): выпуск ещё не размещён, итоговый рейтинг придёт после
+     *     размещения (ТБанк: ожидаемый 04.09 → итоговый 15.09; Мэйл.Ру
+     *     Финанс: eAA.ru 15.09 → AA.ru 22.09). Раньше записывался как рейтинг
+     *     компании с пометкой "(EXP)"/"e…" (у Эксперт РА 63 из 946 новостей,
+     *     у НКР 15 из 1069);
+     *   - skipped_bond_redemption — отзыв из-за погашения;
+     *   - skipped_bond_not_placed — отзыв из-за неразмещения.
+     */
+    public static function bondNewsSkipStatus(string $title, string $fullText, bool $isWithdrawal): ?string
+    {
+        $isBondNews = self::isBondIssueRatingTitle($title)
+            || (bool) preg_match('/планируем[а-яё]*\s+к\s+выпуск/u', mb_strtolower($title));
+        if (!$isBondNews) {
+            return null;
+        }
+        if (self::isSubordinatedBondRating($title)) {
+            return 'skipped_subordinated';
+        }
+        if (self::isExpectedRatingTitle($title)) {
+            return 'skipped_expected';
+        }
+        if (!$isWithdrawal) {
+            return null;
+        }
+        if (preg_match('/погашен/u', mb_strtolower($fullText))) {
+            return 'skipped_bond_redemption';
+        }
+
+        return self::isNeutralBondWithdrawal($title . ' ' . $fullText) ? 'skipped_bond_not_placed' : null;
+    }
+
+    /**
+     * Новость про ОЖИДАЕМЫЙ рейтинг (выпуска, который ещё не размещён) —
+     * по словам "ожидаемый … рейтинг" в любом падеже/регистре (НКР
+     * "ожидаемый кредитный рейтинг eAA.ru", Эксперт РА "присвоил ожидаемый
+     * кредитный рейтинг облигациям …", АКРА "ОЖИДАЕМЫЙ КРЕДИТНЫЙ РЕЙТИНГ")
+     * или по пометке "(EXP)".
+     */
+    public static function isExpectedRatingTitle(string $title): bool
+    {
+        $lower = mb_strtolower($title);
+
+        return (bool) preg_match('/ожидаем[а-яё]*\s+(?:кредитн[а-яё]*\s+)?рейтинг|\(exp\)/u', $lower);
+    }
+
+    /**
+     * Рейтинг латиницей: агентства иногда набирают буквы рейтинга
+     * кириллическими двойниками — у Эксперт РА в 177 новостях из 946
+     * ("ruВВВ+", "ruАA-"), у НКР "eAАА.ru", у АКРА "еA(RU)" (28.09.2026).
+     * На вид одинаково, но для базы "ruАА" и "ruAA" — разные строки: сверка
+     * показывает расхождение там, где его нет, сравнение рейтингов ошибается.
+     * Заменяем А, В, С, Е и е (префикс ожидаемого рейтинга) на латиницу.
+     * Слово "отозван" и любой другой текст с кириллицей в нижнем регистре
+     * (кроме одиночной "е") не трогаем — это не рейтинг.
+     */
+    public static function normalizeGrade(string $grade): string
+    {
+        if (preg_match('/[а-дж-яё]/u', $grade)) {
+            return $grade;
+        }
+
+        return strtr($grade, ['А' => 'A', 'В' => 'B', 'С' => 'C', 'Е' => 'E', 'е' => 'e']);
+    }
+
+    /**
+     * Новость про рейтинг СУБОРДИНИРОВАННЫХ облигаций — не влияет на
+     * рейтинг компании при любом действии (решение пользователя,
+     * 28.09.2026): у субордов рейтинг обычно ниже рейтинга банка (Банк ГПБ:
+     * ruAAA у банка, ruAA- у субординированных), и раньше такая новость
+     * перезаписывала рейтинг банка. За июнь–сентябрь 2026 у Эксперт РА 7
+     * таких новостей (ТБанк, Альфа-Банк, Банк ГПБ, ПСБ), у НКР — ни одной.
+     * "Несубординированные" (обычные) облигации не задеваются — слово
+     * должно начинаться именно с "субординированн". Совмещённая новость
+     * "рейтинги ПАО «Х» и его субординированных облигаций" — это новость
+     * про компанию (isBondIssueRatingTitle() = false), она пишется.
+     */
+    public static function isSubordinatedBondRating(string $text): bool
+    {
+        return self::isBondIssueRatingTitle($text)
+            && (bool) preg_match('/(?<![а-яё])субординированн[а-яё]*\s+(?:бессрочн[а-яё]*\s+)?облигаци/u', mb_strtolower($text));
     }
 
     /**

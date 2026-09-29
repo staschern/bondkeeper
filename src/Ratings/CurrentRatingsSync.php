@@ -76,7 +76,7 @@ final class CurrentRatingsSync
         $stmt->execute([
             'issuer_id' => $issuerId,
             'agency' => $agency,
-            'rating' => mb_substr($ratingTo, 0, 20),
+            'rating' => mb_substr(RatingsNormalizer::normalizeGrade($ratingTo), 0, 20),
             'outlook' => $outlook,
             'last_action_date' => $actionDate,
         ]);
@@ -88,9 +88,18 @@ final class CurrentRatingsSync
      * VALUES()", тот же нюанс, что и везде в проекте, см.
      * tests/test_offers_importer.php) — см. tests/
      * test_default_grade_clears_outlook.php, вызывается через Reflection.
+     *
+     * Отзыв рейтинга ('отозван') обнуляет прогноз так же, как дефолтный
+     * грейд: агентство отзывает "кредитный рейтинг и прогноз по нему"
+     * (найдено на АО «АВТОБАН-Финанс», сентябрь 2026 — без этого у
+     * отозванного рейтинга оставался прежний "позитивный" прогноз).
      */
     private static function resolveOutlook(string $ratingTo, ?string $outlookTo, ?string $cachedOutlook): ?string
     {
-        return RatingsNormalizer::isDefaultGrade($ratingTo) ? null : ($outlookTo ?? $cachedOutlook);
+        if (RatingsNormalizer::isDefaultGrade($ratingTo) || $ratingTo === 'отозван') {
+            return null;
+        }
+
+        return $outlookTo ?? $cachedOutlook;
     }
 }

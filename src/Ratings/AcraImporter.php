@@ -136,7 +136,7 @@ final class AcraImporter
         $rawInn = $row['inn'] ?? null;
         $inn = is_string($rawInn) ? IssuerMatcher::normalizeInn($rawInn) : null;
         $companyName = (string) ($row['company'] ?? '');
-        $rating = mb_substr(trim((string) ($row['rating'] ?? '')), 0, 20);
+        $rating = mb_substr(RatingsNormalizer::normalizeGrade(trim((string) ($row['rating'] ?? ''))), 0, 20);
         $url = is_string($row['url'] ?? null) && $row['url'] !== '' ? $row['url'] : null;
         $sourceTitle = 'Выгрузка АКРА (JSON-файл): ' . $companyName
             . ' — рейтинг ' . ($rating !== '' ? $rating : '?')

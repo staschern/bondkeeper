@@ -68,10 +68,14 @@ use PDO;
  * "снял статус «под наблюдением»" (статус завершён). "продлил" — новый
  * глагол в VERBS, ради заголовков вида "«Эксперт РА» продлил статус
  * «под наблюдением» по кредитному рейтингу ООО «Х»", где сам грейд явно
- * не переподтверждается через "с X до Y" (см. RatingsNormalizer::
- * extractWatchStatusFromExpertRaProse()). Направление (positive/negative)
- * в этой формулировке НИ РАЗУ не встретилось на 18 реальных примерах —
- * "установил"/"продлил" всегда даёт голое under_review.
+ * не переподтверждается через "с X до Y". Статус и прогноз складываются
+ * общим для всех агентств правилом (RatingsNormalizer::
+ * watchStatusFromText() + combineWithWatch(), 28.09.2026): если в
+ * заголовке/подзаголовке назван прогноз ("изменил прогноз на развивающийся
+ * и продлил статус", "Рейтинг компании продолжает действовать на уровне
+ * ruAA- со стабильным прогнозом") — under_review_<прогноз>, иначе (рейтинги
+ * облигаций) — under_review. Раньше прогноз терялся: из 49 новостей со
+ * статусом за июнь–сентябрь 2026 у 23 он был назван.
  *
  * === Нестандартные шкалы (.sf) — реально нужно, в отличие от НКР ===
  *
@@ -97,7 +101,8 @@ final class ExpertRaNewsImporter
     private int $totalItems = 0;
     private int $skippedAlreadyLogged = 0;
     private int $skippedNotRatingAction = 0;
-    private int $skippedBondRedemption = 0;
+    /** @var array<string, int> статус rating_news_log => сколько новостей про облигации пропущено (RatingsNormalizer::bondNewsSkipStatus()) */
+    private array $skippedBondNews = [];
     private int $skippedNonStandardRating = 0;
     private int $skippedNoRatingParsed = 0;
     private int $skippedNoEntityFound = 0;
@@ -175,12 +180,15 @@ final class ExpertRaNewsImporter
             return;
         }
 
-        // Отзыв рейтинга КОНКРЕТНОГО ВЫПУСКА облигаций из-за его
-        // погашения — технический шум, не отзыв рейтинга эмитента (см.
-        // докблок RatingsNormalizer::isBondIssueRedemptionWithdrawal()).
-        if (str_starts_with($verb, 'отозвал') && RatingsNormalizer::isBondIssueRedemptionWithdrawal($combined)) {
-            RatingNewsLog::log($this->db, self::AGENCY, $item['url'], $item['_date'], 'skipped_bond_redemption');
-            $this->skippedBondRedemption++;
+        // Новости про облигации, которые не должны влиять на рейтинг
+        // компании (решение пользователя, 28.09.2026): отзыв из-за
+        // погашения или неразмещения, отзыв ожидаемого рейтинга, любые
+        // новости про субординированные облигации — одно общее правило
+        // для НКР, Эксперт РА и АКРА, см. RatingsNormalizer::bondNewsSkipStatus().
+        $bondSkip = RatingsNormalizer::bondNewsSkipStatus($item['title'], $combined, str_starts_with($verb, 'отозвал'));
+        if ($bondSkip !== null) {
+            RatingNewsLog::log($this->db, self::AGENCY, $item['url'], $item['_date'], $bondSkip);
+            $this->skippedBondNews[$bondSkip] = ($this->skippedBondNews[$bondSkip] ?? 0) + 1;
             return;
         }
 
@@ -202,9 +210,12 @@ final class ExpertRaNewsImporter
             return;
         }
 
-        $baseOutlookTo = $this->extractOutlookTo($combined);
-        $watchStatus = RatingsNormalizer::extractWatchStatusFromExpertRaProse($combined, $baseOutlookTo);
-        $outlookTo = $watchStatus ?? $baseOutlookTo;
+        // Общее правило для всех агентств: статус наблюдения + названный
+        // прогноз → under_review_<прогноз> (см. RatingsNormalizer::combineWithWatch()).
+        $outlookTo = RatingsNormalizer::combineWithWatch(
+            $this->extractOutlookTo($combined),
+            RatingsNormalizer::watchStatusFromText($combined),
+        );
 
         $issuerId = $this->resolveIssuer($item['url'], $item['title']);
         if ($issuerId === null) {
@@ -370,7 +381,11 @@ final class ExpertRaNewsImporter
         Logger::info("Кандидатов в окне: {$this->totalItems}");
         Logger::info("Уже были окончательно обработаны раньше (status=matched в rating_news_log): {$this->skippedAlreadyLogged}");
         Logger::info("Пропущено (не похоже на кредитное рейтинговое действие): {$this->skippedNotRatingAction}");
-        Logger::info("Пропущено (отзыв рейтинга выпуска облигаций из-за погашения — шум, не эмитентское действие): {$this->skippedBondRedemption}");
+        Logger::info('Пропущено как новости про облигации, не влияющие на рейтинг компании (погашение / не размещены / субординированные / ожидаемый рейтинг): '
+            . ($this->skippedBondNews['skipped_bond_redemption'] ?? 0) . ' / '
+            . ($this->skippedBondNews['skipped_bond_not_placed'] ?? 0) . ' / '
+            . ($this->skippedBondNews['skipped_subordinated'] ?? 0) . ' / '
+            . ($this->skippedBondNews['skipped_expected'] ?? 0));
         Logger::info("Пропущено (нестандартная шкала, напр. '.sf'): {$this->skippedNonStandardRating}");
         Logger::info("Сопоставлено с issuers и записано: {$this->matched} (по ИНН: {$this->matchedByInn}, по связке issuer_spv_links: {$this->matchedBySpvLink}, по подтверждённому названию: {$this->matchedByApprovedName})");
         Logger::info("Новых предложений сопоставления по названию (ждут подтверждения, bin/review_matches.php): {$this->proposedByName}");

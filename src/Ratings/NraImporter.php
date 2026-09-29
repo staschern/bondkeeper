@@ -268,10 +268,10 @@ final class NraImporter
         $this->lastActionDatePerIssuerThisRun[$issuerId] = $row['_date'];
 
         $ratingTo = mb_substr(trim($row['Рейтинг'] ?? ''), 0, 20);
-        $baseOutlook = RatingsNormalizer::mapOutlook(
-            RatingsNormalizer::stripWatchSuffix(trim($row['Прогноз'] ?? ''))
-        );
-        $outlookTo = RatingsNormalizer::combineWithWatchStatus($baseOutlook, trim($row['Под наблюдением'] ?? ''));
+        // Обе колонки — "Прогноз" и "Под наблюдением" — одним общим
+        // правилом (статус берётся и из окончания "Прогноз", если колонка
+        // "Под наблюдением" пустая — случай ПАО «ЕвроТранс» 09.04.2026).
+        $outlookTo = RatingsNormalizer::outlookFromNraColumns(trim($row['Прогноз'] ?? ''), trim($row['Под наблюдением'] ?? ''));
 
         $cached = CurrentRatingsSync::fetch($this->db, $issuerId, self::AGENCY);
         $ratingFrom = $cached['rating'];

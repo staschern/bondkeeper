@@ -149,11 +149,11 @@ final class AcraNewsTitleParser
         // [eе]? — не только латинская "e" префикса "ожидаемый", но и её
         // кириллический двойник "е" (U+0435) — реальный найденный случай
         // ("еA(RU)"): движок regex вообще не захватит букву в капчер, если
-        // класс символов её не перечисляет, до normalizeGradeLookalikes()
+        // класс символов её не перечисляет, до RatingsNormalizer::normalizeGrade()
         // очередь не доходит вовсе.
         preg_match_all('/\b[eе]?[A-ZА-Я]{1,4}[+\-]?(?:\s*\(RU\))?/u', $withoutIsin, $m);
         foreach ($m[0] as $candidate) {
-            $normalized = self::normalizeGradeLookalikes(trim($candidate));
+            $normalized = RatingsNormalizer::normalizeGrade(trim($candidate));
             if (self::isValidGradeShape($normalized)) {
                 return $normalized;
             }
@@ -181,9 +181,10 @@ final class AcraNewsTitleParser
             $base = RatingsNormalizer::mapOutlook($m[1]);
         }
 
-        return self::detectWatchPhrase($title)
-            ? RatingsNormalizer::combineWithWatchStatus($base, 'под наблюдением')
-            : $base;
+        // Общее правило для всех агентств: "…И СНЯЛО СТАТУС «ПОД
+        // НАБЛЮДЕНИЕМ»" — снят (раньше читалось как "поставлен": проверялось
+        // только упоминание статуса, реальный случай АКБ «ФОРА-БАНК»).
+        return RatingsNormalizer::combineWithWatch($base, RatingsNormalizer::watchStatusFromText($title));
     }
 
     /**
@@ -235,10 +236,4 @@ final class AcraNewsTitleParser
         return (bool) preg_match('/^e?(?:' . implode('|', self::GRADE_WORDS) . ')[+\-]?(?:\(RU\))?$/', $normalized);
     }
 
-    private static function normalizeGradeLookalikes(string $grade): string
-    {
-        static $map = ['А' => 'A', 'В' => 'B', 'С' => 'C', 'Е' => 'E', 'е' => 'e'];
-
-        return strtr($grade, $map);
-    }
 }

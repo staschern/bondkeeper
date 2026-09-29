@@ -31,4 +31,43 @@ final class AdminNotifier
             return false;
         }
     }
+
+    /**
+     * Длинный текст (сводка сверки) — несколькими сообщениями, разрезая
+     * только по границам строк, а не обрезая хвост.
+     *
+     * @param array<int, string> $lines
+     */
+    public static function sendLines(array $lines): bool
+    {
+        foreach (self::splitLines($lines) as $message) {
+            if (!self::send($message)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * @param array<int, string> $lines
+     * @return array<int, string> сообщения не длиннее $limit символов (строка длиннее лимита — отдельным сообщением, обрезается в send())
+     */
+    public static function splitLines(array $lines, int $limit = 3800): array
+    {
+        $messages = [];
+        $current = '';
+        foreach ($lines as $line) {
+            if ($current !== '' && mb_strlen($current) + 1 + mb_strlen($line) > $limit) {
+                $messages[] = $current;
+                $current = '';
+            }
+            $current .= ($current === '' ? '' : "\n") . $line;
+        }
+        if ($current !== '') {
+            $messages[] = $current;
+        }
+
+        return $messages;
+    }
 }
