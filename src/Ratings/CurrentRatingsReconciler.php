@@ -308,7 +308,11 @@ final class CurrentRatingsReconciler
 
         return 'наше — из новости ' . self::quoteAction($lastAction) . ', такие новости теперь не влияют на рейтинг компании ('
             . RatingsNormalizer::bondNewsSkipLabel($status) . '); записано до обновления правил. Перезапись это не исправит — компании нет в списке агентства'
-            . ($status === 'skipped_bond_redemption' ? '; исправит bin/fix_bond_redemption_ratings.php' : '');
+            . match ($status) {
+                'skipped_bond_redemption' => '; исправит bin/fix_bond_redemption_ratings.php',
+                'skipped_non_standard' => '; исправит bin/fix_acra_news_ratings.php',
+                default => '',
+            };
     }
 
     /** @param array{source_title: ?string, source_url: ?string} $action */

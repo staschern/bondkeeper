@@ -239,10 +239,20 @@ final class RatingsNormalizer
      *
      * Проверка по целому слову ("\bsf\b"), не по подстроке — случайное
      * совпадение в русском тексте практически исключено.
+     *
+     * Ипотечные ценные бумаги (решение пользователя, 03.10.2026): любая
+     * новость про них исключается целиком — это отдельный продукт, не
+     * облигации компании ("не просто так там не написано про облигации").
+     * Живой случай: "АКРА ОТОЗВАЛО КРЕДИТНЫЙ РЕЙТИНГ ВЫПУСКА ИПОТЕЧНЫХ
+     * ЦЕННЫХ БУМАГ ООО «ДОМ.РФ ИПОТЕЧНЫЙ АГЕНТ» … В СВЯЗИ С ПОГАШЕНИЕМ
+     * ВЫПУСКА" (30.09.2026) поставил компании "отозван". Только сами слова
+     * "ипотечные ценные бумаги" в любом падеже — название компании
+     * («Ипотечный агент») и другие формулировки не задеваются.
      */
     public static function isNonStandardRating(string $title): bool
     {
-        return (bool) preg_match('/\bsf\b/ui', $title);
+        return (bool) preg_match('/\bsf\b/ui', $title)
+            || (bool) preg_match('/ипотечн[а-яё]*\s+ценн[а-яё]*\s+бумаг/u', mb_strtolower($title));
     }
 
     /**
@@ -648,6 +658,12 @@ final class RatingsNormalizer
      */
     public static function bondNewsSkipStatusForStoredTitle(string $title): ?string
     {
+        // Нестандартный инструмент (ипотечные ценные бумаги, шкала .sf) —
+        // такая новость теперь тоже не пишется (03.10.2026).
+        if (self::isNonStandardRating($title)) {
+            return 'skipped_non_standard';
+        }
+
         return self::bondNewsSkipStatus($title, $title, (bool) preg_match('/отозва/u', mb_strtolower($title)));
     }
 
@@ -659,6 +675,7 @@ final class RatingsNormalizer
             'skipped_bond_not_placed' => 'отзыв рейтинга облигаций из-за неразмещения',
             'skipped_subordinated' => 'рейтинг субординированных облигаций',
             'skipped_expected' => 'ожидаемый рейтинг облигаций',
+            'skipped_non_standard' => 'ипотечные ценные бумаги или шкала структурированного финансирования',
             default => $status,
         };
     }

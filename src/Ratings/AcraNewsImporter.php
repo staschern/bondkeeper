@@ -8,6 +8,7 @@ use BondKeeper\Support\Logger;
 use DOMDocument;
 use DOMXPath;
 use PDO;
+use RuntimeException;
 
 /**
  * rating_actions из ленты пресс-релизов АКРА
@@ -35,6 +36,26 @@ use PDO;
  * доказательство "навсегда" (если ситуация изменится — увидим в логах
  * cron-прогонов, тот же принцип, что и у остальных источников).
  *
+ * === Лента листается дальше первой страницы (03.10.2026, сверка АКРА) ===
+ * Первая страница — 10 карточек, это около двух дней. Сверка 03.10.2026
+ * показала пропуск: понижение ООО «ПКФ» до D(RU) от 23.09.2026
+ * (/press-releases/7329/) не попало в базу — между успешными прогонами
+ * прошло больше суток (записи создавались 22.09 09:30, 23.09 12:30, затем
+ * только 28.09), и карточка ушла с первой страницы. Постраничная навигация
+ * у ленты есть: /press-releases/?PAGEN_1=N (проверено вживую, 6 страниц
+ * подряд с паузой отдаются без капчи). Теперь:
+ *   - окно не короче MIN_WINDOW_DAYS дней, что бы ни стояло в --days
+ *     (в crontab --days=2): окно не экономит запросов — уже записанные
+ *     новости пропускаются без обращения к сайту;
+ *   - следующая страница запрашивается, только если на текущей есть
+ *     карточки в окне, которых ещё нет в rating_news_log; обычный прогон
+ *     — по-прежнему один запрос списка, после простоя — столько страниц,
+ *     сколько пропущено, но не больше MAX_PAGES;
+ *   - не открылась вторая и дальше страница — обрабатывается то, что
+ *     уже получено.
+ * Новости про ипотечные ценные бумаги и шкалу структурированного
+ * финансирования не пишутся (RatingsNormalizer::isNonStandardRating(),
+ * статус skipped_non_standard) — как у НКР и Эксперт РА.
  * === ИНН — со страницы конкретного пресс-релиза, как у НКР ===
  *
  * Список отдаёт только заголовок/дату/ссылку — ИНН только на детальной
@@ -83,13 +104,19 @@ final class AcraNewsImporter
     private const AGENCY = 'acra';
     private const BASE_URL = 'https://www.acra-ratings.ru';
     private const LIST_URL = self::BASE_URL . '/press-releases/';
+    /** Сколько страниц ленты читать самое большее: 8 × 10 карточек — около двух недель. */
+    private const MAX_PAGES = 8;
+    /** Окно не короче этого числа дней — см. докблок класса. */
+    private const MIN_WINDOW_DAYS = 14;
 
     private int $totalCandidates = 0;
     private int $skippedAlreadyLogged = 0;
     private int $skippedNotRatingAction = 0;
     /** @var array<string, int> статус rating_news_log => сколько новостей про облигации пропущено (RatingsNormalizer::bondNewsSkipStatus()) */
     private array $skippedBondNews = [];
+    private int $skippedNonStandard = 0;
     private int $skippedNoRatingParsed = 0;
+    private int $pagesFetched = 0;
     private int $matched = 0;
     private int $matchedByInn = 0;
     private int $matchedByIsin = 0;
@@ -113,41 +140,94 @@ final class AcraNewsImporter
     }
 
     /**
-     * $days — сколько последних календарных дней рассматривать (по
-     * умолчанию 2 — частый прогон каждые 30 минут); $full=true
-     * игнорирует окно полностью (вся доступная лента — на момент
-     * написания это всего 10 карточек, сайт не хранит архив на этой
-     * странице глубже первой "страницы" списка, пагинация не найдена
-     * вживую и не реализована — не гадаем про то, чего не видели).
+     * $days — сколько последних календарных дней рассматривать, но не
+     * меньше MIN_WINDOW_DAYS; $full=true игнорирует окно и читает все
+     * MAX_PAGES страниц ленты. См. докблок класса про листание ленты.
      */
     public function import(bool $full = false, int $days = 2): void
     {
+        $days = max($days, self::MIN_WINDOW_DAYS);
         $cutoffDate = $full ? null : date('Y-m-d', strtotime("-{$days} days"));
         Logger::info('АКРА (новости): окно — ' . ($full ? 'вся доступная лента (--full)' : "последние {$days} дн. (с {$cutoffDate})"));
 
-        $html = RatingsHttp::get(self::LIST_URL, 30);
-        $rows = $this->parseListPage($html);
-        Logger::info('АКРА (новости): карточек в списке пресс-релизов: ' . count($rows));
-
-        // Список отсортирован по убыванию даты — собираем кандидатов в
-        // пределах окна, потом проходим в обратном порядке
-        // (хронологически, от старых к новым) — то же требование
-        // корректности для CurrentRatingsSync, что и у остальных трёх
-        // агентств (см. их докблоки).
-        $candidates = [];
-        foreach ($rows as $row) {
-            if ($cutoffDate !== null && $row['date'] < $cutoffDate) {
-                break;
-            }
-            $candidates[] = $row;
-        }
+        $candidates = $this->collectCandidates(
+            static fn (int $page): string => RatingsHttp::get($page === 1 ? self::LIST_URL : self::LIST_URL . '?PAGEN_1=' . $page, 30),
+            $cutoffDate,
+            $full,
+        );
         $this->totalCandidates = count($candidates);
 
-        foreach (array_reverse($candidates) as $row) {
+        foreach ($candidates as $row) {
             $this->importRow($row);
         }
 
         $this->printReport();
+    }
+
+    /**
+     * Карточки ленты в пределах окна, от старых к новым (хронологически
+     * — то же требование корректности для CurrentRatingsSync, что и у
+     * остальных агентств). Страницы читаются по правилам из докблока
+     * класса. Отбор по дате — без остановки на первой старой карточке:
+     * внутри одного дня лента не строго упорядочена.
+     *
+     * @param callable(int): string $fetchPage HTML страницы ленты по её номеру (с 1)
+     * @return array<int, array{title: string, url: string, date: string}>
+     */
+    private function collectCandidates(callable $fetchPage, ?string $cutoffDate, bool $full): array
+    {
+        $candidates = [];
+        $seen = [];
+        for ($page = 1; $page <= self::MAX_PAGES; $page++) {
+            if ($page > 1) {
+                usleep($this->delayMicroseconds);
+            }
+            try {
+                $html = $fetchPage($page);
+            } catch (RuntimeException $e) {
+                if ($page === 1) {
+                    throw $e;
+                }
+                Logger::warn("АКРА (новости): страница {$page} ленты не открылась — обрабатываем уже полученные: {$e->getMessage()}");
+                break;
+            }
+            $rows = $this->parseListPage($html);
+            $this->pagesFetched++;
+            if ($rows === []) {
+                break;
+            }
+
+            $inWindow = 0;
+            $unknown = 0;
+            $olderThanWindow = false;
+            foreach ($rows as $row) {
+                if ($cutoffDate !== null && $row['date'] < $cutoffDate) {
+                    $olderThanWindow = true;
+                    continue;
+                }
+                $inWindow++;
+                if (isset($seen[$row['url']])) {
+                    continue; // лента сдвинулась между запросами страниц
+                }
+                $seen[$row['url']] = true;
+                $candidates[] = $row;
+                if (!RatingNewsLog::isKnown($this->db, self::AGENCY, $row['url'])) {
+                    $unknown++;
+                }
+            }
+            Logger::info("АКРА (новости): страница {$page} — карточек: " . count($rows) . ", в окне: {$inWindow}, ещё не виденных: {$unknown}");
+
+            // Дальше не листаем: окно кончилось на этой странице (лента
+            // идёт от новых дат к старым) или на ней всё уже видено.
+            if ($inWindow === 0 || $olderThanWindow || (!$full && $unknown === 0)) {
+                break;
+            }
+        }
+
+        $candidates = array_reverse($candidates);
+        usort($candidates, static fn (array $a, array $b): int => $a['date'] <=> $b['date']);
+
+        return $candidates;
     }
 
     /** @param array{title: string, url: string, date: string} $row */
@@ -162,6 +242,15 @@ final class AcraNewsImporter
         if ($verb === null || !AcraNewsTitleParser::isCreditRatingAction($row['title'])) {
             RatingNewsLog::log($this->db, self::AGENCY, $row['url'], $row['date'], 'skipped_not_rating');
             $this->skippedNotRatingAction++;
+            return;
+        }
+
+        // Ипотечные ценные бумаги и шкала структурированного
+        // финансирования — не пишем вообще (решение пользователя,
+        // 03.10.2026), см. RatingsNormalizer::isNonStandardRating().
+        if (RatingsNormalizer::isNonStandardRating($row['title'])) {
+            RatingNewsLog::log($this->db, self::AGENCY, $row['url'], $row['date'], 'skipped_non_standard');
+            $this->skippedNonStandard++;
             return;
         }
 
@@ -346,6 +435,7 @@ final class AcraNewsImporter
     private function printReport(): void
     {
         Logger::info('=== Отчёт по импорту rating_actions (АКРА, новости) ===');
+        Logger::info("Страниц ленты прочитано: {$this->pagesFetched}");
         Logger::info("Кандидатов в окне: {$this->totalCandidates}");
         Logger::info("Уже были окончательно обработаны раньше (status=matched в rating_news_log): {$this->skippedAlreadyLogged}");
         Logger::info("Пропущено (не похоже на кредитное рейтинговое действие): {$this->skippedNotRatingAction}");
@@ -354,6 +444,7 @@ final class AcraNewsImporter
             . ($this->skippedBondNews['skipped_bond_not_placed'] ?? 0) . ' / '
             . ($this->skippedBondNews['skipped_subordinated'] ?? 0) . ' / '
             . ($this->skippedBondNews['skipped_expected'] ?? 0));
+        Logger::info("Пропущено (ипотечные ценные бумаги / шкала структурированного финансирования): {$this->skippedNonStandard}");
         Logger::info("Пропущено (не удалось разобрать уровень рейтинга): {$this->skippedNoRatingParsed}");
         Logger::info("Сопоставлено с issuers и записано: {$this->matched} (по ИНН: {$this->matchedByInn}, по связке issuer_spv_links: {$this->matchedBySpvLink}, по ISIN: {$this->matchedByIsin}, по подтверждённому названию: {$this->matchedByApprovedName})");
         Logger::info("Новых предложений сопоставления по названию (ждут подтверждения, bin/review_matches.php): {$this->proposedByName}");

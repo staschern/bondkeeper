@@ -29,6 +29,19 @@ final class RatingNewsLog
         return $stmt->fetchColumn() === 'matched';
     }
 
+    /**
+     * Пресс-релиз уже встречался (с любым статусом). Нужно ленте АКРА
+     * (03.10.2026): листать её дальше первой страницы, только пока на
+     * странице есть ещё не виденные карточки.
+     */
+    public static function isKnown(PDO $db, string $agency, string $sourceUrl): bool
+    {
+        $stmt = $db->prepare('SELECT 1 FROM rating_news_log WHERE agency = :agency AND source_url = :url');
+        $stmt->execute(['agency' => $agency, 'url' => $sourceUrl]);
+
+        return $stmt->fetchColumn() !== false;
+    }
+
     public static function log(PDO $db, string $agency, string $sourceUrl, string $actionDate, string $status): void
     {
         $stmt = $db->prepare(
