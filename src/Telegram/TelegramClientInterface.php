@@ -20,8 +20,10 @@ interface TelegramClientInterface
      * @param string|null $parseMode 'HTML' — разбирать <b>/<i>/... в $text
      *   (Bot API parse_mode); null — как есть, без разметки (по умолчанию,
      *   не менять поведение существующих вызовов).
+     * @param bool $disableWebPagePreview true — не разворачивать превью
+     *   ссылки в тексте (карточка на пол-экрана) под самим сообщением.
      */
-    public function sendMessage(int $chatId, string $text, ?array $replyMarkup = null, ?string $parseMode = null): bool;
+    public function sendMessage(int $chatId, string $text, ?array $replyMarkup = null, ?string $parseMode = null, bool $disableWebPagePreview = false): bool;
 
     /** @param array<string, mixed>|null $replyMarkup */
     public function sendMessageReturningId(int $chatId, string $text, ?array $replyMarkup = null): ?int;

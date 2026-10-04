@@ -32,7 +32,7 @@ final class FakeTelegramClient implements TelegramClientInterface
     /** @var array<int, string> тексты всех вызовов sendMessage() по порядку — для проверки разбивки "Весь список" на несколько сообщений */
     public array $sentMessages = [];
 
-    public function sendMessage(int $chatId, string $text, ?array $replyMarkup = null, ?string $parseMode = null): bool
+    public function sendMessage(int $chatId, string $text, ?array $replyMarkup = null, ?string $parseMode = null, bool $disableWebPagePreview = false): bool
     {
         $this->sentMessages[] = $text;
 

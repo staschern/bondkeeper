@@ -124,9 +124,14 @@ final class NotificationDispatcher
             $this->decodePayload($event['payload_json']),
             (string) $event['issuer_name'],
             (string) $event['issuer_inn'],
+            (string) $event['status_text'],
         );
 
-        if ($this->telegram->sendMessage($user['telegram_id'], $text)) {
+        // parse_mode=HTML — заголовки "🔔 Новости рейтингов:"/"⚠️ Блокировки
+        // ФНC:" жирным; disable_web_page_preview — ссылка на пресс-релиз в
+        // тексте C5 иначе разворачивается превью-карточкой на пол-экрана
+        // (по просьбе пользователя, 4 октября 2026).
+        if ($this->telegram->sendMessage($user['telegram_id'], $text, null, 'HTML', true)) {
             $this->markSent($notificationId);
 
             return true;
@@ -152,11 +157,11 @@ final class NotificationDispatcher
             : null;
     }
 
-    /** @return array{event_type_code: string, payload_json: ?string, issuer_name: string, issuer_inn: string}|null */
+    /** @return array{event_type_code: string, payload_json: ?string, issuer_name: string, issuer_inn: string, status_text: string}|null */
     private function fetchEvent(int $eventId): ?array
     {
         $stmt = $this->db->prepare(
-            'SELECT e.event_type_code, e.payload_json, i.short_name AS issuer_name, i.inn AS issuer_inn
+            'SELECT e.event_type_code, e.payload_json, e.status_text, i.short_name AS issuer_name, i.inn AS issuer_inn
              FROM events e
              JOIN issuers i ON i.id = e.issuer_id
              WHERE e.id = :id'
@@ -170,6 +175,7 @@ final class NotificationDispatcher
                 'payload_json' => $row['payload_json'],
                 'issuer_name' => (string) $row['issuer_name'],
                 'issuer_inn' => (string) ($row['issuer_inn'] ?? ''),
+                'status_text' => (string) ($row['status_text'] ?? ''),
             ]
             : null;
     }
@@ -186,98 +192,106 @@ final class NotificationDispatcher
     }
 
     /**
-     * Шаблоны — дословно из docs/STAGE4_EVENT_ENGINE.md, раздел
-     * "Рассылка уведомлений". C5/E1 — единственные типы, которые сейчас
-     * реально создаёт EventPublisher (Фаза 1); прочие event_types
-     * (A1-D2 и т.д.) для этого MVP не заполняются вообще, но на всякий
-     * случай — общая заглушка в default, а не падение.
+     * C5/E1 — единственные типы, которые сейчас реально создаёт
+     * EventPublisher (Фаза 1); прочие event_types (A1-D2 и т.д.) для
+     * этого MVP не заполняются вообще, но на всякий случай — общая
+     * заглушка в default, а не падение.
+     *
+     * Каждый шаблон начинается с жирного заголовка темы ("🔔 Новости
+     * рейтингов:"/"⚠️ Блокировки ФНC:") на отдельной строке — по просьбе
+     * пользователя (4 октября 2026): видов уведомлений будет больше, тема
+     * должна быть понятна с первого взгляда, не вчитываясь в текст.
+     * parse_mode=HTML (см. dispatchOne()) — весь внешний текст (заголовок
+     * новости, название эмитента, основание блокировки) экранируется
+     * BotFormatting::escapeHtml(), сама разметка `<b>...</b>` — нет.
      *
      * @param array<string, mixed> $payload
      */
-    private function buildMessageText(string $eventTypeCode, array $payload, string $issuerName, string $issuerInn): string
+    private function buildMessageText(string $eventTypeCode, array $payload, string $issuerName, string $issuerInn, string $statusText): string
     {
         return match ($eventTypeCode) {
-            'C5' => $this->buildRatingActionText($payload, $issuerName),
+            'C5' => $this->buildRatingActionText($payload, $statusText),
             'E1' => $this->buildFnsBlockText($payload, $issuerName, $issuerInn),
-            default => "Новое событие по эмитенту «{$issuerName}».",
+            default => '<b>🔔 Новое событие:</b>' . "\n" . BotFormatting::escapeHtml("Эмитент «{$issuerName}»."),
         };
     }
 
-    /** @param array<string, mixed> $payload */
-    private function buildRatingActionText(array $payload, string $issuerName): string
+    /**
+     * Заголовок новости дословно (events.status_text — уже готовый текст:
+     * либо сам заголовок пресс-релиза, если он был у источника, либо
+     * собранное из рейтинга/прогноза описание, см.
+     * EventPublisher::publishRatingAction()/buildRatingStatusText()) — по
+     * прямому запросу пользователя (4 октября 2026): раньше уведомление
+     * пересобирало "агентство: эмитент — было → стало", теперь просто
+     * показывает тот же заголовок, что и в карточке-превью ссылки.
+     *
+     * @param array<string, mixed> $payload
+     */
+    private function buildRatingActionText(array $payload, string $statusText): string
     {
-        $agency = BotFormatting::agencyDisplayName((string) ($payload['agency'] ?? ''));
-        $ratingFrom = $payload['rating_from'] ?? null;
-        $ratingTo = (string) ($payload['rating_to'] ?? '');
-        $outlookTo = $payload['outlook_to'] ?? null;
         $sourceUrl = $payload['source_url'] ?? null;
 
-        // Не подавать "было X → стало X" при подтверждении без изменений
-        // (см. EventPublisher::buildRatingStatusText() — та же логика,
-        // тут отдельно, потому что шаблон уведомления и status_text
-        // события — разные тексты с разным назначением).
-        $change = ($ratingFrom !== null && $ratingFrom !== $ratingTo)
-            ? "{$ratingFrom} → {$ratingTo}"
-            : "рейтинг подтверждён на уровне {$ratingTo}";
-
-        $text = "🔔 {$agency}: {$issuerName} — {$change}";
-        if ($outlookTo !== null) {
-            $text .= ", прогноз: {$outlookTo}";
-        }
+        $text = '<b>🔔 Новости рейтингов:</b>' . "\n" . BotFormatting::escapeHtml($statusText);
         if ($sourceUrl !== null) {
-            $text .= ".\n{$sourceUrl}";
+            $text .= "\n" . BotFormatting::escapeHtml((string) $sourceUrl);
         }
 
         return $text;
     }
 
     /**
-     * Форматы — дословно по правкам пользователя (17 сентября 2026):
-     * ИНН добавлен в started/amount_changed/count_changed (в lifted —
-     * намеренно без ИНН, по тому же образцу, что прислан); суммы — через
-     * BotFormatting::formatMoney() (разделитель разрядов + "₽", тот же
-     * формат, что и в разделе "Статус"). 'count_changed' — новый вид
-     * (см. EventPublisher::publishFnsBlockChange(), решение пересмотрено
-     * 17 сентября — раньше изменение только числа банков без изменения
-     * суммы события не создавало вообще).
+     * Форматы — дословно по правкам пользователя (17 сентября 2026,
+     * обновлено 4 октября 2026): ИНН теперь и в lifted тоже (раньше
+     * намеренно без него — пользователь явно попросил добавить). Заголовок
+     * темы ("⚠️ Блокировки ФНC:"/"✅ Блокировки ФНC:" — смайл по kind)
+     * жирным на отдельной строке (см. buildMessageText()), дальше — тот же
+     * текст, что и раньше, но БЕЗ собственного смайла в начале (он ушёл в
+     * заголовок темы). Суммы — через BotFormatting::formatMoney()
+     * (разделитель разрядов + "₽", тот же формат, что и в разделе
+     * "Статус"). 'count_changed' — см. EventPublisher::publishFnsBlockChange().
      *
      * @param array<string, mixed> $payload
      */
     private function buildFnsBlockText(array $payload, string $issuerName, string $issuerInn): string
     {
         $kind = (string) ($payload['kind'] ?? '');
+        $emoji = $kind === 'lifted' ? '✅' : '⚠️';
+        $header = "<b>{$emoji} Блокировки ФНC:</b>\n";
+        $name = BotFormatting::escapeHtml($issuerName);
+        $inn = BotFormatting::escapeHtml($issuerInn);
 
-        return match ($kind) {
+        return $header . match ($kind) {
             'started' => sprintf(
-                '⚠️ %s | ИНН %s: Блокировка счетов ФНС | Дата блокировки: %s | Количество заблокированных счетов: %d | Заблокированная сумма: %s | %s',
-                $issuerName,
-                $issuerInn,
+                '%s | ИНН %s: Блокировка счетов ФНС | Дата блокировки: %s | Количество заблокированных счетов: %d | Заблокированная сумма: %s | %s',
+                $name,
+                $inn,
                 BotFormatting::formatDate($payload['block_date'] ?? null),
                 (int) ($payload['active_bank_count'] ?? 0),
                 BotFormatting::formatMoney($payload['new_blocked_amount'] ?? null),
-                $payload['reason'] ?? 'основание не указано'
+                BotFormatting::escapeHtml((string) ($payload['reason'] ?? 'основание не указано'))
             ),
             'amount_changed' => sprintf(
-                '⚠️ %s | ИНН %s: сумма блокировки ФНС изменилась — было %s, стало %s (заблокированных счетов: %d).',
-                $issuerName,
-                $issuerInn,
+                '%s | ИНН %s: сумма блокировки ФНС изменилась — было %s, стало %s (заблокированных счетов: %d).',
+                $name,
+                $inn,
                 BotFormatting::formatMoney($payload['old_blocked_amount'] ?? null),
                 BotFormatting::formatMoney($payload['new_blocked_amount'] ?? null),
                 (int) ($payload['active_bank_count'] ?? 0)
             ),
             'count_changed' => sprintf(
-                '⚠️ %s | ИНН %s: количество заблокированных счетов ФНС изменилось — было %d, стало %d.',
-                $issuerName,
-                $issuerInn,
+                '%s | ИНН %s: количество заблокированных счетов ФНС изменилось — было %d, стало %d.',
+                $name,
+                $inn,
                 (int) ($payload['old_active_bank_count'] ?? 0),
                 (int) ($payload['active_bank_count'] ?? 0)
             ),
             'lifted' => sprintf(
-                '✅ %s: блокировка счетов ФНС снята (по состоянию на %s).',
-                $issuerName,
+                '%s | ИНН %s: блокировка счетов ФНС снята (по состоянию на %s).',
+                $name,
+                $inn,
                 BotFormatting::formatDate($payload['block_date'] ?? null)
             ),
-            default => "Изменение статуса блокировки ФНС по эмитенту «{$issuerName}».",
+            default => "Изменение статуса блокировки ФНС по эмитенту «{$name}».",
         };
     }
 

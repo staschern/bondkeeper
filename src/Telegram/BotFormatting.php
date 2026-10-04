@@ -54,4 +54,17 @@ final class BotFormatting
 
         return number_format((float) $decimal, 2, '.', ' ') . ' ₽';
     }
+
+    /**
+     * Текст из внешнего источника (заголовок новости, название эмитента,
+     * основание блокировки ФНС) под parse_mode=HTML — весь текст
+     * сообщения разбирается как HTML, значит "&"/"<"/">" в содержимом
+     * обязаны быть экранированы, иначе Telegram либо откажет в отправке
+     * ("can't parse entities"), либо исказит текст. Разметку (`<b>...</b>`),
+     * которую добавляет сам код, через этот метод не пропускать.
+     */
+    public static function escapeHtml(string $text): string
+    {
+        return htmlspecialchars($text, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+    }
 }

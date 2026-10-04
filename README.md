@@ -95,13 +95,13 @@ database/026_outlook_indefinite.sql — миграция: коды прогно�
 src/Telegram/TelegramClientInterface.php — интерфейс Bot API (sendMessage/answerCallbackQuery/editMessageText) для подмены фейком в офлайн-тестах
 src/Telegram/TelegramClient.php      — HTTP-клиент Telegram Bot API (long polling, sendMessage/editMessageText/answerCallbackQuery)
 src/Telegram/TelegramBotConfig.php   — токен бота + admin_telegram_id из config/telegram_bot.php (не коммитится, см. .example рядом)
-src/Telegram/BotFormatting.php       — общие форматтеры (agencyDisplayName/formatDate/formatMoney) для BotCommandHandler и NotificationDispatcher
+src/Telegram/BotFormatting.php       — общие форматтеры (agencyDisplayName/formatDate/formatMoney/escapeHtml) для BotCommandHandler и NotificationDispatcher
 src/Telegram/BotCommandHandler.php   — разбор команд/кнопок бота: меню, «Выбор эмитентов» (умный поиск + листалка), «Статус» (разбивка "Весь список" на несколько сообщений при превышении лимита Telegram, splitIntoTelegramChunks()), «Подписка», «О сервисе», чат-релей «Помощь», подтверждение/отклонение предложений сопоставления по названию кнопками (dispatchReviewCallback(), только admin_telegram_id) — см. docs/BOT_UX_SPEC.md, docs/STAGE3_RATINGS.md
-src/Telegram/NotificationDispatcher.php — рассылка событий (events) подписчикам из watchlist в Telegram, этап 4 Фаза 3, см. docs/STAGE4_EVENT_ENGINE.md
+src/Telegram/NotificationDispatcher.php — рассылка событий (events) подписчикам из watchlist в Telegram, этап 4 Фаза 3; каждое уведомление начинается с жирного заголовка темы ("🔔 Новости рейтингов:"/"⚠️/✅ Блокировки ФНC:"), parse_mode=HTML, ссылка на пресс-релиз без разворота превью-карточкой, см. docs/STAGE4_EVENT_ENGINE.md
 bin/daemon_telegram_bot.php          — цикл бота: long-polling команд + рассылка раз в 60 с, один процесс
 config/telegram_bot.example.php      — шаблон конфига токена бота (скопировать в telegram_bot.php, не коммитить)
 tests/test_bot_ux_screens.php        — офлайн-проверка экранов/разделов бота на SQLite (143 проверки: меню/статус/подписка + разбивка "Весь список" на сообщения + кнопки подтверждения предложений)
-tests/test_notification_dispatcher.php — офлайн-проверка рассылки на SQLite (27 проверок, покрыта целиком — без MySQL-диалекта)
+tests/test_notification_dispatcher.php — офлайн-проверка рассылки на SQLite (44 проверки, покрыта целиком — без MySQL-диалекта; включая экранирование внешнего текста под parse_mode=HTML)
 tests/test_no_duplicate_named_params.php — статическая проверка ->prepare(): нет повторов :имени плейсхолдера в одном запросе (PDO::ATTR_EMULATE_PREPARES=false — MySQL это не прощает, в отличие от SQLite)
 tests/test_issuer_name_shortener.php — офлайн-проверка IssuerNameShortener (24 проверки, чистая текстовая логика, БД не нужна)
 bin/backfill_issuer_short_names.php  — разовая пересборка issuers.short_name из full_name для строк, накопленных до появления IssuerNameShortener (идемпотентно, безопасно перезапускать)

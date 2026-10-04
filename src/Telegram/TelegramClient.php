@@ -68,7 +68,7 @@ final class TelegramClient implements TelegramClientInterface
      * @param string|null $parseMode 'HTML' — включить разбор <b>/<i>/... в
      *   $text (Bot API parse_mode); null — как есть, без разметки.
      */
-    public function sendMessage(int $chatId, string $text, ?array $replyMarkup = null, ?string $parseMode = null): bool
+    public function sendMessage(int $chatId, string $text, ?array $replyMarkup = null, ?string $parseMode = null, bool $disableWebPagePreview = false): bool
     {
         $this->lastSendWasBlockedByUser = false;
 
@@ -81,6 +81,9 @@ final class TelegramClient implements TelegramClientInterface
         }
         if ($parseMode !== null) {
             $params['parse_mode'] = $parseMode;
+        }
+        if ($disableWebPagePreview) {
+            $params['disable_web_page_preview'] = 'true';
         }
 
         $response = $this->request($this->apiUrl('sendMessage'), $params);

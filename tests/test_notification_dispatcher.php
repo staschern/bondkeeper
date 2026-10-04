@@ -22,13 +22,13 @@ use BondKeeper\Telegram\TelegramClientInterface;
 
 final class FakeTelegramClient implements TelegramClientInterface
 {
-    /** @var array<int, array{chat_id: int, text: string}> */
+    /** @var array<int, array{chat_id: int, text: string, parse_mode: ?string, disable_web_page_preview: bool}> */
     public array $sent = [];
     public bool $nextSendShouldFail = false;
     public bool $nextFailureIsBlock = false;
     private bool $lastBlocked = false;
 
-    public function sendMessage(int $chatId, string $text, ?array $replyMarkup = null, ?string $parseMode = null): bool
+    public function sendMessage(int $chatId, string $text, ?array $replyMarkup = null, ?string $parseMode = null, bool $disableWebPagePreview = false): bool
     {
         $this->lastBlocked = false;
         if ($this->nextSendShouldFail) {
@@ -38,7 +38,7 @@ final class FakeTelegramClient implements TelegramClientInterface
 
             return false;
         }
-        $this->sent[] = ['chat_id' => $chatId, 'text' => $text];
+        $this->sent[] = ['chat_id' => $chatId, 'text' => $text, 'parse_mode' => $parseMode, 'disable_web_page_preview' => $disableWebPagePreview];
 
         return true;
     }
@@ -94,7 +94,7 @@ $db->exec('CREATE TABLE users (id INTEGER PRIMARY KEY, telegram_id INTEGER, tele
 // секунду не считались "событие раньше подписки".
 $db->exec("CREATE TABLE watchlist (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, issuer_id INTEGER, added_at TEXT DEFAULT (datetime('now')))");
 $db->exec('CREATE TABLE event_types (code TEXT PRIMARY KEY, notify_client INTEGER)');
-$db->exec("CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, issuer_id INTEGER, event_type_code TEXT, payload_json TEXT, detected_at TEXT DEFAULT (datetime('now')))");
+$db->exec("CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, issuer_id INTEGER, event_type_code TEXT, status_text TEXT, payload_json TEXT, detected_at TEXT DEFAULT (datetime('now')))");
 $db->exec('CREATE TABLE notifications (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, event_id INTEGER, channel TEXT, status TEXT, failure_reason TEXT, sent_at TEXT, UNIQUE(user_id, event_id, channel))');
 
 $db->exec("INSERT INTO event_types (code, notify_client) VALUES ('C5', 1), ('E1', 1), ('A1', 0)"); // A1 — есть в схеме, но notify_client=FALSE, для проверки фильтра
@@ -107,14 +107,21 @@ $telegram = new FakeTelegramClient();
 $dispatcher = new NotificationDispatcher($db, $telegram);
 
 // --- C5: подтверждение без изменений ---
-$db->exec("INSERT INTO events (id, issuer_id, event_type_code, payload_json) VALUES (1, 1, 'C5', '"
+// status_text — то, что реально кладёт EventPublisher::publishRatingAction()
+// (sourceTitle ?? buildRatingStatusText()) — тут синтетический текст вместо
+// реального заголовка пресс-релиза, логика та же.
+$db->exec("INSERT INTO events (id, issuer_id, event_type_code, status_text, payload_json) VALUES (1, 1, 'C5', "
+    . $db->quote('подтверждён на уровне AA.ru, прогноз: stable') . ", '"
     . json_encode(['agency' => 'nkr', 'rating_from' => 'AA.ru', 'rating_to' => 'AA.ru', 'outlook_from' => 'stable', 'outlook_to' => 'stable', 'source_url' => null], JSON_UNESCAPED_UNICODE)
     . "')");
 
 $sentCount = $dispatcher->dispatchPending();
 check('dispatchPending(): одно уведомление отправлено (C5 без изменений)', $sentCount === 1);
-check('C5 без изменений: текст "подтверждён на уровне"', str_contains($telegram->sent[0]['text'], 'рейтинг подтверждён на уровне AA.ru'));
+check('C5: заголовок темы жирным', str_contains($telegram->sent[0]['text'], '<b>🔔 Новости рейтингов:</b>'));
+check('C5 без изменений: текст status_text дословно', str_contains($telegram->sent[0]['text'], 'подтверждён на уровне AA.ru, прогноз: stable'));
 check('C5: chat_id — telegram_id пользователя', $telegram->sent[0]['chat_id'] === 1007481909);
+check('C5: parse_mode=HTML', $telegram->sent[0]['parse_mode'] === 'HTML');
+check('C5: disable_web_page_preview=true', $telegram->sent[0]['disable_web_page_preview'] === true);
 check('notifications: статус sent', $db->query("SELECT status FROM notifications WHERE event_id = 1")->fetchColumn() === 'sent');
 
 // --- Идемпотентность: повторный проход не шлёт то же самое событие снова ---
@@ -122,24 +129,24 @@ $secondPass = $dispatcher->dispatchPending();
 check('dispatchPending(): повторный проход — 0 новых отправок (идемпотентность)', $secondPass === 0);
 check('notifications: всё ещё ровно одна строка на (user=1, event=1)', (int) $db->query('SELECT COUNT(*) FROM notifications WHERE user_id = 1 AND event_id = 1')->fetchColumn() === 1);
 
-// --- C5: реальное изменение рейтинга ---
-$db->exec("INSERT INTO events (id, issuer_id, event_type_code, payload_json) VALUES (2, 1, 'C5', '"
+// --- C5: реальное изменение рейтинга, со ссылкой ---
+$db->exec("INSERT INTO events (id, issuer_id, event_type_code, status_text, payload_json) VALUES (2, 1, 'C5', "
+    . $db->quote('A+.ru → AA-.ru, прогноз: positive') . ", '"
     . json_encode(['agency' => 'acra', 'rating_from' => 'A+.ru', 'rating_to' => 'AA-.ru', 'outlook_from' => 'stable', 'outlook_to' => 'positive', 'source_url' => 'https://example.com/press/1'], JSON_UNESCAPED_UNICODE)
     . "')");
 $telegram->sent = [];
 $dispatcher->dispatchPending();
-check('C5 с изменением: формат "было -> стало"', str_contains($telegram->sent[0]['text'], 'A+.ru → AA-.ru'));
-check('C5: агентство АКРА в читаемом виде', str_contains($telegram->sent[0]['text'], 'АКРА'));
-check('C5: прогноз в тексте', str_contains($telegram->sent[0]['text'], 'прогноз: positive'));
-check('C5: ссылка на источник в тексте', str_contains($telegram->sent[0]['text'], 'https://example.com/press/1'));
+check('C5 с изменением: текст status_text дословно, не пересобран из payload', str_contains($telegram->sent[0]['text'], 'A+.ru → AA-.ru, прогноз: positive'));
+check('C5: ссылка на источник отдельной строкой', str_contains($telegram->sent[0]['text'], "\nhttps://example.com/press/1"));
 
-// --- E1: started — формат переписан 17 сентября 2026 (ИНН + разделитель разрядов, см. BotFormatting::formatMoney()) ---
+// --- E1: started — заголовок темы жирным, тело без собственного смайла ---
 $db->exec("INSERT INTO events (id, issuer_id, event_type_code, payload_json) VALUES (3, 1, 'E1', '"
     . json_encode(['kind' => 'started', 'old_blocked_amount' => null, 'new_blocked_amount' => '1500000.00', 'active_bank_count' => 2, 'block_date' => '2026-08-20', 'reason' => 'Код 01: взыскание задолженности'], JSON_UNESCAPED_UNICODE)
     . "')");
 $telegram->sent = [];
 $dispatcher->dispatchPending();
-check('E1 started: заголовок с ИНН', str_starts_with($telegram->sent[0]['text'], '⚠️ Роснефть | ИНН 7706107510: Блокировка счетов ФНС'));
+check('E1 started: заголовок темы жирным', str_starts_with($telegram->sent[0]['text'], "<b>⚠️ Блокировки ФНC:</b>\n"));
+check('E1 started: тело с ИНН, без повторного смайла', str_contains($telegram->sent[0]['text'], 'Роснефть | ИНН 7706107510: Блокировка счетов ФНС'));
 check('E1 started: количество счетов', str_contains($telegram->sent[0]['text'], 'Количество заблокированных счетов: 2'));
 check('E1 started: сумма с разделителем разрядов и ₽', str_contains($telegram->sent[0]['text'], 'Заблокированная сумма: 1 500 000.00 ₽'));
 check('E1 started: дата дд.мм.гг', str_contains($telegram->sent[0]['text'], 'Дата блокировки: 20.08.26'));
@@ -151,7 +158,8 @@ $db->exec("INSERT INTO events (id, issuer_id, event_type_code, payload_json) VAL
     . "')");
 $telegram->sent = [];
 $dispatcher->dispatchPending();
-check('E1 amount_changed: заголовок с ИНН', str_starts_with($telegram->sent[0]['text'], '⚠️ Роснефть | ИНН 7706107510: сумма блокировки ФНС изменилась'));
+check('E1 amount_changed: заголовок темы жирным', str_starts_with($telegram->sent[0]['text'], "<b>⚠️ Блокировки ФНC:</b>\n"));
+check('E1 amount_changed: тело с ИНН', str_contains($telegram->sent[0]['text'], 'Роснефть | ИНН 7706107510: сумма блокировки ФНС изменилась'));
 check('E1 amount_changed: было/стало с разделителем разрядов', str_contains($telegram->sent[0]['text'], 'было 1 500 000.00 ₽, стало 2 000 000.00 ₽'));
 check('E1 amount_changed: число заблокированных счетов', str_contains($telegram->sent[0]['text'], '(заблокированных счетов: 3)'));
 
@@ -162,16 +170,20 @@ $db->exec("INSERT INTO events (id, issuer_id, event_type_code, payload_json) VAL
     . "')");
 $telegram->sent = [];
 $dispatcher->dispatchPending();
-check('E1 count_changed: заголовок с ИНН', str_starts_with($telegram->sent[0]['text'], '⚠️ Роснефть | ИНН 7706107510: количество заблокированных счетов ФНС изменилось'));
+check('E1 count_changed: заголовок темы жирным', str_starts_with($telegram->sent[0]['text'], "<b>⚠️ Блокировки ФНC:</b>\n"));
+check('E1 count_changed: тело с ИНН', str_contains($telegram->sent[0]['text'], 'Роснефть | ИНН 7706107510: количество заблокированных счетов ФНС изменилось'));
 check('E1 count_changed: было/стало', str_contains($telegram->sent[0]['text'], 'было 3, стало 4'));
 
-// --- E1: lifted — без ИНН (по образцу от пользователя), "по состоянию на X" без "нашу проверку от" ---
+// --- E1: lifted — теперь тоже с ИНН (решение пользователя, 4 октября 2026 — раньше намеренно без него) ---
 $db->exec("INSERT INTO events (id, issuer_id, event_type_code, payload_json) VALUES (5, 1, 'E1', '"
     . json_encode(['kind' => 'lifted', 'old_blocked_amount' => '2000000.00', 'new_blocked_amount' => null, 'active_bank_count' => 0, 'block_date' => '2026-09-01', 'reason' => null], JSON_UNESCAPED_UNICODE)
     . "')");
 $telegram->sent = [];
 $dispatcher->dispatchPending();
-check('E1 lifted: формат "снята (по состоянию на 01.09.26)", без ИНН и без "нашу проверку от"', $telegram->sent[0]['text'] === '✅ Роснефть: блокировка счетов ФНС снята (по состоянию на 01.09.26).');
+check(
+    'E1 lifted: заголовок темы с галочкой жирным, тело с ИНН, "снята (по состоянию на 01.09.26)"',
+    $telegram->sent[0]['text'] === "<b>✅ Блокировки ФНC:</b>\nРоснефть | ИНН 7706107510: блокировка счетов ФНС снята (по состоянию на 01.09.26)."
+);
 
 // --- Фильтр notify_client=FALSE (event_types.A1) — событие не должно попасть в выборку вообще ---
 $db->exec("INSERT INTO events (id, issuer_id, event_type_code, payload_json) VALUES (6, 1, 'A1', '{}')");
@@ -277,6 +289,37 @@ $telegram->sent = [];
 $dispatcher->dispatchPending();
 $freshSentTo = array_filter($telegram->sent, static fn (array $s): bool => $s['chat_id'] === 111222333);
 check('Бэклог: событие ПОСЛЕ added_at доходит как обычно (фильтр не ломает нормальный путь)', count($freshSentTo) === 1);
+
+// ---------------------------------------------------------------------
+// parse_mode=HTML (4 октября 2026): название эмитента и заголовок новости
+// приходят из внешних источников (сайты агентств) — "&"/"<"/">" в них
+// обязаны быть экранированы (BotFormatting::escapeHtml()), иначе Telegram
+// откажет в отправке всего сообщения с "can't parse entities" или исказит
+// текст. Реальный повод для проверки — названия с "&" в них не редкость
+// (например, холдинги вида "Х & Ко").
+// ---------------------------------------------------------------------
+echo "\n=== parse_mode=HTML: экранирование внешнего текста ===\n";
+
+$db->exec("INSERT INTO issuers (id, short_name, inn) VALUES (7, 'ООО «Х & Ко»', '7700000007')");
+$db->exec("INSERT INTO users (id, telegram_id, telegram_bot_blocked) VALUES (7, 222333444, 0)");
+$db->exec("INSERT INTO watchlist (user_id, issuer_id) VALUES (7, 7)");
+$db->exec("INSERT INTO events (id, issuer_id, event_type_code, status_text, payload_json) VALUES (22, 7, 'C5', "
+    . $db->quote('Рейтинг присвоен <X> на уровне AA & B') . ", '"
+    . json_encode(['agency' => 'acra', 'rating_from' => null, 'rating_to' => 'AA(RU)', 'outlook_to' => null, 'source_url' => null], JSON_UNESCAPED_UNICODE)
+    . "')");
+$telegram->sent = [];
+$dispatcher->dispatchPending();
+check('C5: "&" в status_text экранирован как &amp;', str_contains($telegram->sent[0]['text'], 'AA &amp; B'));
+check('C5: "<"/">" в status_text экранированы (не ломают HTML-теги вокруг)', str_contains($telegram->sent[0]['text'], 'Рейтинг присвоен &lt;X&gt; на уровне'));
+check('C5: заголовок темы по-прежнему жирный тегом (сам не экранирован)', str_contains($telegram->sent[0]['text'], '<b>🔔 Новости рейтингов:</b>'));
+
+$db->exec("INSERT INTO events (id, issuer_id, event_type_code, payload_json) VALUES (23, 7, 'E1', '"
+    . json_encode(['kind' => 'started', 'old_blocked_amount' => null, 'new_blocked_amount' => '100.00', 'active_bank_count' => 1, 'block_date' => '2026-10-01', 'reason' => 'Решение № 1 < 2 & 3'], JSON_UNESCAPED_UNICODE)
+    . "')");
+$telegram->sent = [];
+$dispatcher->dispatchPending();
+check('E1: название эмитента с "&" экранировано в тексте', str_contains($telegram->sent[0]['text'], 'ООО «Х &amp; Ко» | ИНН 7700000007'));
+check('E1: причина блокировки с "<"/"&" экранирована', str_contains($telegram->sent[0]['text'], 'Решение № 1 &lt; 2 &amp; 3'));
 
 echo "\n";
 if ($failures === 0) {
