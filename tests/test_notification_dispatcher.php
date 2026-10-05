@@ -92,12 +92,15 @@ $db->exec('CREATE TABLE users (id INTEGER PRIMARY KEY, telegram_id INTEGER, tele
 // докблок NotificationDispatcher::fetchPendingPairs(), баг найден 17
 // сентября 2026) — <= (не <) специально, чтобы вставки в одну и ту же
 // секунду не считались "событие раньше подписки".
-$db->exec("CREATE TABLE watchlist (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, issuer_id INTEGER, added_at TEXT DEFAULT (datetime('now')))");
+// security_id в watchlist и events — для отбора по бумаге (Этап 5,
+// выплаты); здесь везде NULL: эмитент отслеживается целиком, события —
+// уровня эмитента. Сам отбор по бумаге проверяется в tests/test_payments.php.
+$db->exec("CREATE TABLE watchlist (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, issuer_id INTEGER, security_id INTEGER, added_at TEXT DEFAULT (datetime('now')))");
 $db->exec('CREATE TABLE event_types (code TEXT PRIMARY KEY, notify_client INTEGER)');
-$db->exec("CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, issuer_id INTEGER, event_type_code TEXT, status_text TEXT, payload_json TEXT, detected_at TEXT DEFAULT (datetime('now')))");
+$db->exec("CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, security_id INTEGER, issuer_id INTEGER, event_type_code TEXT, status_text TEXT, payload_json TEXT, detected_at TEXT DEFAULT (datetime('now')))");
 $db->exec('CREATE TABLE notifications (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, event_id INTEGER, channel TEXT, status TEXT, failure_reason TEXT, sent_at TEXT, UNIQUE(user_id, event_id, channel))');
 
-$db->exec("INSERT INTO event_types (code, notify_client) VALUES ('C5', 1), ('E1', 1), ('A1', 0)"); // A1 — есть в схеме, но notify_client=FALSE, для проверки фильтра
+$db->exec("INSERT INTO event_types (code, notify_client) VALUES ('C5', 1), ('E1', 1), ('A1', 0), ('R1', 1), ('A2', 1), ('B1', 1), ('B2a', 1)"); // A1 — есть в схеме, но notify_client=FALSE, для проверки фильтра
 
 $db->exec("INSERT INTO issuers (id, short_name, inn) VALUES (1, 'Роснефть', '7706107510')");
 $db->exec("INSERT INTO users (id, telegram_id, telegram_bot_blocked) VALUES (1, 1007481909, 0)");
@@ -320,6 +323,73 @@ $telegram->sent = [];
 $dispatcher->dispatchPending();
 check('E1: название эмитента с "&" экранировано в тексте', str_contains($telegram->sent[0]['text'], 'ООО «Х &amp; Ко» | ИНН 7700000007'));
 check('E1: причина блокировки с "<"/"&" экранирована', str_contains($telegram->sent[0]['text'], 'Решение № 1 &lt; 2 &amp; 3'));
+
+// ---------------------------------------------------------------------
+// Этап 5 (выплаты, 4 октября 2026): R1/A2/.../B2a — тот же заголовок темы
+// жирным, что у C5/E1 ("⏰/✅/🔴/🟡 Выплаты:"), одна общая тема на все виды
+// событий о выплатах, смайл меняется по характеру (напоминание/получено/
+// просрочка/предупреждение). Логика PaymentWatch/PaymentProcessor и отбор
+// по security_id — в tests/test_payments.php; тут только сами тексты,
+// которые реально уходят в Telegram.
+// ---------------------------------------------------------------------
+echo "\n=== Этап 5: тексты уведомлений о выплатах ===\n";
+
+$db->exec("INSERT INTO issuers (id, short_name, inn) VALUES (8, 'ПАО «СибАвтоТранс»', '5400001234')");
+$db->exec("INSERT INTO users (id, telegram_id, telegram_bot_blocked) VALUES (8, 333444555, 0)");
+$db->exec("INSERT INTO watchlist (user_id, issuer_id) VALUES (8, 8)");
+
+// --- R1: напоминание накануне выплаты ---
+$db->exec("INSERT INTO events (id, security_id, issuer_id, event_type_code, payload_json) VALUES (30, 100, 8, 'R1', '"
+    . json_encode([
+        'isin' => 'RU000A1ABCD1', 'security_name' => 'СибАвтоТранс-БО-01', 'payment_date' => '2026-04-16',
+        'effective_date' => '2026-04-16', 'payments' => [['kind' => 'coupon', 'amount_planned' => '41.10']],
+    ], JSON_UNESCAPED_UNICODE)
+    . "')");
+$telegram->sent = [];
+$dispatcher->dispatchPending();
+check('R1: заголовок темы жирным', str_starts_with($telegram->sent[0]['text'], "<b>⏰ Выплаты:</b>\n"));
+check('R1: заголовок бумаги — эмитент · бумага (ISIN)', str_contains($telegram->sent[0]['text'], 'ПАО «СибАвтоТранс» · СибАвтоТранс-БО-01 (RU000A1ABCD1)'));
+check('R1: дата и сумма купона', str_contains($telegram->sent[0]['text'], 'Завтра, 16.04.26, выплата: купон — 41.10 ₽ на бумагу.'));
+
+// --- A2: купон получен НРД ---
+$db->exec("INSERT INTO events (id, security_id, issuer_id, event_type_code, payload_json) VALUES (31, 100, 8, 'A2', '"
+    . json_encode(['kind' => 'coupon', 'isin' => 'RU000A1ABCD1', 'security_name' => 'СибАвтоТранс-БО-01', 'payment_date' => '2026-04-16', 'amount_actual' => '41.10'], JSON_UNESCAPED_UNICODE)
+    . "')");
+$telegram->sent = [];
+$dispatcher->dispatchPending();
+check('A2: заголовок темы — галочка (получено)', str_starts_with($telegram->sent[0]['text'], "<b>✅ Выплаты:</b>\n"));
+check('A2: текст "получен НРД" с суммой', str_contains($telegram->sent[0]['text'], 'Купон за 16.04.26 получен НРД: 41.10 ₽ на бумагу.'));
+
+// --- B1: частичная выплата, со сроком полного дефолта ---
+$db->exec("INSERT INTO events (id, security_id, issuer_id, event_type_code, payload_json) VALUES (32, 101, 8, 'B1', '"
+    . json_encode([
+        'kind' => 'coupon', 'isin' => 'RU000A1EFGH2', 'security_name' => 'ВЗВТ-01', 'payment_date' => '2026-05-10',
+        'amount_planned' => '100.00', 'amount_actual' => '60.00', 'full_default_date' => '2026-05-24', 'working_days_to_default' => 10,
+    ], JSON_UNESCAPED_UNICODE)
+    . "')");
+$telegram->sent = [];
+$dispatcher->dispatchPending();
+check('B1: заголовок темы — красный (просрочка/отклонение)', str_starts_with($telegram->sent[0]['text'], "<b>🔴 Выплаты:</b>\n"));
+check('B1: получено X из Y', str_contains($telegram->sent[0]['text'], 'получено 60.00 ₽ из 100.00 ₽ на бумагу.'));
+check('B1: срок полного дефолта', str_contains($telegram->sent[0]['text'], 'Полный дефолт наступит, если долг не будет закрыт до 24.05.26 (осталось рабочих дней: 10).'));
+
+// --- B2a: вечер дня выплаты, сообщения о получении ещё нет ---
+$db->exec("INSERT INTO events (id, security_id, issuer_id, event_type_code, payload_json) VALUES (33, 100, 8, 'B2a', '"
+    . json_encode(['payment_date' => '2026-04-16', 'payments' => [['kind' => 'coupon']], 'check' => 'evening'], JSON_UNESCAPED_UNICODE)
+    . "')");
+$telegram->sent = [];
+$dispatcher->dispatchPending();
+check('B2a: заголовок темы — жёлтый (предупреждение)', str_starts_with($telegram->sent[0]['text'], "<b>🟡 Выплаты:</b>\n"));
+check('B2a: "пока не поступили" (вечер, не "до сих пор")', str_contains($telegram->sent[0]['text'], 'пока не поступили в НРД'));
+check('B2a: оговорка про возможное сообщение на следующий рабочий день', str_contains($telegram->sent[0]['text'], 'сообщение о получении может выйти на следующий рабочий день'));
+
+// --- Экранирование: название бумаги с "&" тоже идёт через escapeHtml() ---
+$db->exec("INSERT INTO events (id, security_id, issuer_id, event_type_code, payload_json) VALUES (34, 102, 8, 'A2', '"
+    . json_encode(['kind' => 'redemption', 'isin' => 'RU000A1IJKL3', 'security_name' => 'Х & Y Финанс-01', 'payment_date' => '2026-06-01', 'amount_actual' => '1000.00'], JSON_UNESCAPED_UNICODE)
+    . "')");
+$telegram->sent = [];
+$dispatcher->dispatchPending();
+check('Выплаты: "&" в названии бумаги экранирован', str_contains($telegram->sent[0]['text'], 'Х &amp; Y Финанс-01'));
 
 echo "\n";
 if ($failures === 0) {

@@ -137,13 +137,16 @@ declare(strict_types=1);
  *   * /30 * * * *  /usr/bin/php /path/to/bondkeeper/bin/seed_ratings.php --agency=expert_ra-news --days=2  >> /var/log/bondkeeper/seed_ratings_expert_ra_news.log 2>&1
  *   55 6 * * *     /usr/bin/php /path/to/bondkeeper/bin/seed_ratings.php --agency=expert_ra-news --days=14 >> /var/log/bondkeeper/seed_ratings_expert_ra_news_deep.log 2>&1
  *   * /30 * * * *  /usr/bin/php /path/to/bondkeeper/bin/seed_ratings.php --agency=acra-news --days=2       >> /var/log/bondkeeper/seed_ratings_acra_news.log 2>&1
+ *   45 6 * * *     /usr/bin/php /path/to/bondkeeper/bin/seed_ratings.php --agency=acra-news --full         >> /var/log/bondkeeper/seed_ratings_acra_news_deep.log 2>&1
  * (у nra нет отдельного "глубокого" прохода — она не делает запрос на
  * КАЖДУЮ строку, дедуп по rating_news_log сам решает, что уже обработано,
  * узкое "частое" окно тут не даёт экономии. У expert_ra-news/acra-news
- * такой запрос есть — тот же случай, что и у nkr-news, хотя у АКРА список
- * на сайте настолько короткий (~10 карточек), что отдельный "глубокий"
- * проход, скорее всего, не нужен — оставлен без него, пока не появится
- * причина считать иначе).
+ * такой запрос есть — тот же случай, что и у nkr-news. У АКРА "глубокий"
+ * проход — `--full`, вся лента на 8 страниц (решение пользователя,
+ * 04.10.2026): частый прогон листает ленту только до первой полностью
+ * виденной страницы, и если страница не открылась посреди дочитывания
+ * после простоя, пропуск за ней остался бы незамеченным — так 23.09.2026
+ * потерялось понижение ООО «ПКФ» до D(RU). См. докблок AcraNewsImporter).
  *
  * ЕСЛИ доступа к OS cron нет (или он не гарантирован) — вместо этих
  * crontab-строк самостоятельные процессы с циклом: bin/daemon_nkr_news.php

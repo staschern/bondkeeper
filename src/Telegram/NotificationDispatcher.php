@@ -46,6 +46,14 @@ use PDOException;
  * начал следить за эмитентом; за "здесь и сейчас" статус на момент
  * добавления отвечает отдельный, не через events/notifications, канал —
  * см. BotCommandHandler::checkFnsOnAdd().
+ *
+ * === События по конкретной бумаге (Этап 5, выплаты, 04.10.2026) ===
+ *
+ * У событий о выплатах заполнен events.security_id. Строка watchlist без
+ * security_id (отслеживается эмитент целиком — так бот добавляет сейчас)
+ * получает все события эмитента, как и раньше; строка с security_id —
+ * только события этой бумаги и события уровня эмитента (рейтинг, ФНС).
+ * Это основа будущей настройки «уведомлять только по выбранным выпускам».
  */
 final class NotificationDispatcher
 {
@@ -75,6 +83,7 @@ final class NotificationDispatcher
             "SELECT DISTINCT w.user_id, e.id AS event_id
              FROM events e
              JOIN watchlist w ON w.issuer_id = e.issuer_id AND w.added_at <= e.detected_at
+                 AND (w.security_id IS NULL OR e.security_id IS NULL OR w.security_id = e.security_id)
              LEFT JOIN notifications n ON n.event_id = e.id AND n.user_id = w.user_id AND n.channel = 'telegram'
              JOIN event_types et ON et.code = e.event_type_code
              WHERE et.notify_client = 1 AND n.id IS NULL"
@@ -192,18 +201,21 @@ final class NotificationDispatcher
     }
 
     /**
-     * C5/E1 — единственные типы, которые сейчас реально создаёт
-     * EventPublisher (Фаза 1); прочие event_types (A1-D2 и т.д.) для
-     * этого MVP не заполняются вообще, но на всякий случай — общая
-     * заглушка в default, а не падение.
+     * C5/E1 — рейтинговые действия и блокировки ФНС (Этап 4); R1/A2/A4/A6/
+     * B1/B2/B4/B5/B2a — напоминания и события о выплатах (Этап 5, см.
+     * docs/STAGE5_PAYMENTS.md; A3/A5/A7 "передано депонентам" клиенту не
+     * рассылаются — notify_client=FALSE у event_types, сюда не доходят).
+     * Прочие event_types (C1-D2 и т.д.) пока не заполняются вообще, но на
+     * всякий случай — общая заглушка в default, а не падение.
      *
      * Каждый шаблон начинается с жирного заголовка темы ("🔔 Новости
-     * рейтингов:"/"⚠️ Блокировки ФНC:") на отдельной строке — по просьбе
-     * пользователя (4 октября 2026): видов уведомлений будет больше, тема
-     * должна быть понятна с первого взгляда, не вчитываясь в текст.
-     * parse_mode=HTML (см. dispatchOne()) — весь внешний текст (заголовок
-     * новости, название эмитента, основание блокировки) экранируется
-     * BotFormatting::escapeHtml(), сама разметка `<b>...</b>` — нет.
+     * рейтингов:"/"⚠️ Блокировки ФНC:"/"⏰/✅/🔴/🟡 Выплаты:") на отдельной
+     * строке — по просьбе пользователя (4 октября 2026): видов уведомлений
+     * будет больше, тема должна быть понятна с первого взгляда, не
+     * вчитываясь в текст. parse_mode=HTML (см. dispatchOne()) — весь
+     * внешний текст (заголовок новости, название эмитента/бумаги,
+     * основание блокировки) экранируется BotFormatting::escapeHtml(),
+     * сама разметка `<b>...</b>` — нет.
      *
      * @param array<string, mixed> $payload
      */
@@ -212,8 +224,135 @@ final class NotificationDispatcher
         return match ($eventTypeCode) {
             'C5' => $this->buildRatingActionText($payload, $statusText),
             'E1' => $this->buildFnsBlockText($payload, $issuerName, $issuerInn),
+            'R1' => $this->buildPaymentReminderText($payload, $issuerName),
+            'A2', 'A4', 'A6', 'B1', 'B2', 'B4', 'B5' => $this->buildPaymentText($eventTypeCode, $payload, $issuerName),
+            'B2a' => $this->buildNoReceiptText($payload, $issuerName),
             default => '<b>🔔 Новое событие:</b>' . "\n" . BotFormatting::escapeHtml("Эмитент «{$issuerName}»."),
         };
+    }
+
+    /**
+     * R1 — напоминание накануне выплаты (Этап 5, docs/STAGE5_PAYMENTS.md).
+     * Сутки считаются от даты по графику; если она выпала на выходной,
+     * отдельно называется день, когда деньги должны поступить на деле.
+     * Заголовок темы жирным, как у остальных видов уведомлений (см.
+     * buildMessageText()); "Выплаты" — одна общая тема на весь Этап 5
+     * (R1/A2-A6/B1-B5/B2a), смайл перед темой меняется по характеру
+     * события (⏰ напоминание, ✅ получено, 🔴 просрочка, 🟡 предупреждение).
+     *
+     * @param array<string, mixed> $payload
+     */
+    private function buildPaymentReminderText(array $payload, string $issuerName): string
+    {
+        $parts = [];
+        foreach ((array) ($payload['payments'] ?? []) as $payment) {
+            $amount = $payment['amount_planned'] ?? null;
+            $parts[] = self::paymentKindName((string) ($payment['kind'] ?? ''))
+                . ' — ' . ($amount !== null ? BotFormatting::formatMoney((string) $amount) . ' на бумагу' : 'сумма пока не определена');
+        }
+        $paymentDate = (string) ($payload['payment_date'] ?? '');
+        $effectiveDate = (string) ($payload['effective_date'] ?? $paymentDate);
+
+        $body = 'Завтра, ' . BotFormatting::formatDate($paymentDate) . ', выплата: ' . BotFormatting::escapeHtml(implode('; ', $parts)) . '.';
+        if ($effectiveDate !== $paymentDate) {
+            $body .= ' Дата выпадает на выходной — деньги должны поступить ' . BotFormatting::formatDate($effectiveDate) . '.';
+        }
+
+        return '<b>⏰ Выплаты:</b>' . "\n" . self::bondHeader($payload, $issuerName) . "\n" . $body;
+    }
+
+    /**
+     * Выплата по сообщению НРД: получена (A2/A4/A6), частично (B1), не в
+     * срок (B2), доплата (B4), исполнена после просрочки (B5).
+     *
+     * @param array<string, mixed> $payload
+     */
+    private function buildPaymentText(string $eventTypeCode, array $payload, string $issuerName): string
+    {
+        $kind = (string) ($payload['kind'] ?? '');
+        $ending = match ($kind) {
+            'amortization' => 'а',
+            'redemption' => 'о',
+            default => '',
+        };
+        $what = self::mbUcfirst(self::paymentKindName($kind)) . ($kind === 'coupon' ? ' за ' : ' ')
+            . BotFormatting::formatDate((string) ($payload['payment_date'] ?? ''));
+        $planned = $payload['amount_planned'] ?? null;
+        $actual = $payload['amount_actual'] ?? null;
+        $ofPlanned = $planned !== null ? ' из ' . BotFormatting::formatMoney((string) $planned) : '';
+        $deadline = '';
+        if (($payload['full_default_date'] ?? null) !== null) {
+            $deadline = ' Полный дефолт наступит, если долг не будет закрыт до ' . BotFormatting::formatDate((string) $payload['full_default_date']);
+            if (($payload['working_days_to_default'] ?? null) !== null) {
+                $deadline .= ' (осталось рабочих дней: ' . (int) $payload['working_days_to_default'] . ')';
+            }
+            $deadline .= '.';
+        }
+
+        [$emoji, $body] = match ($eventTypeCode) {
+            'B1' => ['🔴', "{$what} выплачен{$ending} частично: получено "
+                . ($actual !== null ? BotFormatting::formatMoney((string) $actual) : 'меньше положенного') . $ofPlanned . ' на бумагу.' . $deadline],
+            'B2' => ['🔴', "{$what} не выплачен{$ending} в срок." . $deadline],
+            'B4' => ['🟡', "{$what}: доплата"
+                . (($payload['tranche_amount'] ?? null) !== null ? ' ' . BotFormatting::formatMoney((string) $payload['tranche_amount']) : '')
+                . ($actual !== null ? ', всего получено ' . BotFormatting::formatMoney((string) $actual) . $ofPlanned . ' на бумагу' : '') . '.' . $deadline],
+            'B5' => ['✅', "{$what} выплачен{$ending} полностью после просрочки"
+                . ($actual !== null ? ': ' . BotFormatting::formatMoney((string) $actual) . ' на бумагу' : '') . '.'],
+            default => ['✅', "{$what} получен{$ending} НРД"
+                . ($actual !== null ? ': ' . BotFormatting::formatMoney((string) $actual) . ' на бумагу' : '') . '.'],
+        };
+
+        return "<b>{$emoji} Выплаты:</b>" . "\n" . self::bondHeader($payload, $issuerName) . "\n" . $body;
+    }
+
+    /**
+     * B2a — к вечеру дня выплаты (и повторно утром) сообщения «получено
+     * НРД» нет. Это ещё не невыплата: НРД вправе сообщить и на следующий
+     * рабочий день — поэтому текст прямо это оговаривает.
+     *
+     * @param array<string, mixed> $payload
+     */
+    private function buildNoReceiptText(array $payload, string $issuerName): string
+    {
+        $kinds = implode(', ', array_map(
+            static fn (array $payment): string => self::paymentKindName((string) ($payment['kind'] ?? '')),
+            (array) ($payload['payments'] ?? []),
+        ));
+        $morning = ($payload['check'] ?? '') === 'morning';
+        $still = $morning ? 'до сих пор не поступили' : 'пока не поступили';
+        $caveat = $morning
+            ? 'Это ещё не подтверждённая невыплата: сегодня НРД должен сообщить, исполнена выплата, исполнена частично или не исполнена.'
+            : 'Это ещё не означает невыплату: сообщение о получении может выйти на следующий рабочий день.';
+
+        $body = "Деньги от эмитента по выплате ({$kinds}) за " . BotFormatting::formatDate((string) ($payload['payment_date'] ?? ''))
+            . " {$still} в НРД. {$caveat}";
+
+        return '<b>🟡 Выплаты:</b>' . "\n" . self::bondHeader($payload, $issuerName) . "\n" . $body;
+    }
+
+    /** Название бумаги и ИНН/ISIN внешние (из нашей же БД, но исходно — с сайта Мосбиржи) — экранируются. @param array<string, mixed> $payload */
+    private static function bondHeader(array $payload, string $issuerName): string
+    {
+        $name = BotFormatting::escapeHtml($issuerName);
+        $security = BotFormatting::escapeHtml((string) ($payload['security_name'] ?? 'облигация'));
+        $isin = BotFormatting::escapeHtml((string) ($payload['isin'] ?? '—'));
+
+        return "{$name} · {$security} ({$isin})";
+    }
+
+    private static function paymentKindName(string $kind): string
+    {
+        return match ($kind) {
+            'coupon' => 'купон',
+            'amortization' => 'амортизация',
+            'redemption' => 'погашение',
+            default => 'выплата',
+        };
+    }
+
+    private static function mbUcfirst(string $text): string
+    {
+        return mb_strtoupper(mb_substr($text, 0, 1)) . mb_substr($text, 1);
     }
 
     /**

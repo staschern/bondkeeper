@@ -185,6 +185,56 @@ final class EventPublisher
     }
 
     /**
+     * События по выплатам (Этап 5, см. docs/STAGE5_PAYMENTS.md): группы A
+     * и B таксономии, напоминание R1, производные B2a/B2b. В отличие от
+     * C5/E1 событие привязано к конкретной бумаге (security_id) и, если
+     * оно относится к одной выплате, — к её «истории» (story_id), чтобы
+     * серия сообщений по одному купону читалась как одна лента.
+     * Сырое сообщение источника записывает вызывающий код
+     * (PaymentProcessor) — у напоминаний и производных проверок его нет,
+     * поэтому raw_message_id может быть NULL. Текст уведомления строит
+     * NotificationDispatcher по payload, status_text — короткая сводка.
+     *
+     * @param array<string, mixed> $payload
+     */
+    public function publishPaymentEvent(
+        string $eventTypeCode,
+        int $issuerId,
+        int $securityId,
+        string $eventDate,
+        string $statusText,
+        array $payload,
+        ?int $storyId = null,
+        ?int $rawMessageId = null,
+        ?string $amountPlanned = null,
+        ?string $amountActual = null,
+    ): int {
+        $stmt = $this->db->prepare(
+            'INSERT INTO events
+                (security_id, issuer_id, event_type_code, story_id, raw_message_id, event_date,
+                 amount_planned, amount_actual, status_text, priority, payload_json)
+             VALUES
+                (:security_id, :issuer_id, :event_type_code, :story_id, :raw_message_id, :event_date,
+                 :amount_planned, :amount_actual, :status_text, :priority, :payload_json)'
+        );
+        $stmt->execute([
+            'security_id' => $securityId,
+            'issuer_id' => $issuerId,
+            'event_type_code' => $eventTypeCode,
+            'story_id' => $storyId,
+            'raw_message_id' => $rawMessageId,
+            'event_date' => $eventDate,
+            'amount_planned' => $amountPlanned,
+            'amount_actual' => $amountActual,
+            'status_text' => mb_substr($statusText, 0, 255),
+            'priority' => $this->defaultPriority($eventTypeCode),
+            'payload_json' => json_encode($payload, JSON_UNESCAPED_UNICODE),
+        ]);
+
+        return (int) $this->db->lastInsertId();
+    }
+
+    /**
      * DECIMAL(15,2) в БД — сравниваем как числа с округлением до 2
      * знаков, не как сырые строки: значение "только что распарсенное"
      * (FnsBlocksImporter::parseAmount(), тримленная строка из ответа

@@ -2,3 +2,4 @@
 *.log
 *.lock
 config/telegram_bot.php
+config/payments.php

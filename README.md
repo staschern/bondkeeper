@@ -97,11 +97,11 @@ src/Telegram/TelegramClient.php      — HTTP-клиент Telegram Bot API (lon
 src/Telegram/TelegramBotConfig.php   — токен бота + admin_telegram_id из config/telegram_bot.php (не коммитится, см. .example рядом)
 src/Telegram/BotFormatting.php       — общие форматтеры (agencyDisplayName/formatDate/formatMoney/escapeHtml) для BotCommandHandler и NotificationDispatcher
 src/Telegram/BotCommandHandler.php   — разбор команд/кнопок бота: меню, «Выбор эмитентов» (умный поиск + листалка), «Статус» (разбивка "Весь список" на несколько сообщений при превышении лимита Telegram, splitIntoTelegramChunks()), «Подписка», «О сервисе», чат-релей «Помощь», подтверждение/отклонение предложений сопоставления по названию кнопками (dispatchReviewCallback(), только admin_telegram_id) — см. docs/BOT_UX_SPEC.md, docs/STAGE3_RATINGS.md
-src/Telegram/NotificationDispatcher.php — рассылка событий (events) подписчикам из watchlist в Telegram, этап 4 Фаза 3; каждое уведомление начинается с жирного заголовка темы ("🔔 Новости рейтингов:"/"⚠️/✅ Блокировки ФНC:"), parse_mode=HTML, ссылка на пресс-релиз без разворота превью-карточкой, см. docs/STAGE4_EVENT_ENGINE.md
+src/Telegram/NotificationDispatcher.php — рассылка событий (events) подписчикам из watchlist в Telegram, этап 4 Фаза 3; каждое уведомление начинается с жирного заголовка темы ("🔔 Новости рейтингов:"/"⚠️/✅ Блокировки ФНC:"/"⏰/✅/🔴/🟡 Выплаты:"), parse_mode=HTML, ссылка на пресс-релиз без разворота превью-карточкой; этап 5 (выплаты, см. docs/STAGE5_PAYMENTS.md) — события по конкретной бумаге (security_id), а не только по эмитенту
 bin/daemon_telegram_bot.php          — цикл бота: long-polling команд + рассылка раз в 60 с, один процесс
 config/telegram_bot.example.php      — шаблон конфига токена бота (скопировать в telegram_bot.php, не коммитить)
 tests/test_bot_ux_screens.php        — офлайн-проверка экранов/разделов бота на SQLite (143 проверки: меню/статус/подписка + разбивка "Весь список" на сообщения + кнопки подтверждения предложений)
-tests/test_notification_dispatcher.php — офлайн-проверка рассылки на SQLite (44 проверки, покрыта целиком — без MySQL-диалекта; включая экранирование внешнего текста под parse_mode=HTML)
+tests/test_notification_dispatcher.php — офлайн-проверка рассылки на SQLite (56 проверок, покрыта целиком — без MySQL-диалекта; включая экранирование внешнего текста под parse_mode=HTML и тексты уведомлений о выплатах, этап 5)
 tests/test_no_duplicate_named_params.php — статическая проверка ->prepare(): нет повторов :имени плейсхолдера в одном запросе (PDO::ATTR_EMULATE_PREPARES=false — MySQL это не прощает, в отличие от SQLite)
 tests/test_issuer_name_shortener.php — офлайн-проверка IssuerNameShortener (24 проверки, чистая текстовая логика, БД не нужна)
 bin/backfill_issuer_short_names.php  — разовая пересборка issuers.short_name из full_name для строк, накопленных до появления IssuerNameShortener (идемпотентно, безопасно перезапускать)
@@ -124,6 +124,18 @@ tests/test_issuer_spv_link.php       — офлайн-проверка IssuerMat
 tests/test_default_grade_clears_outlook.php — офлайн-проверка RatingsNormalizer::isDefaultGrade() + CurrentRatingsSync::resolveOutlook() (21 проверка, реальный случай ООО «ЛКХ», рейтинг "D"; отзыв рейтинга тоже обнуляет прогноз — АО «АВТОБАН-Финанс»)
 tests/test_root_priority_conflict.php — офлайн-проверка приоритета ИНН/связки над сопоставлением по названию ВНУТРИ одного прогона NkrImporter/ExpertRaImporter/AcraImporter (23 проверки)
 tests/test_acra_news.php             — офлайн-проверка новостей АКРА (46 проверок): AcraNewsTitleParser::extractGrade() — рейтинг только с "(RU)"/после "на уровне"; AcraNewsImporter — листание ленты, ипотечные ЦБ не пишутся; AcraNewsRecheck — разовое исправление уже записанных новостей
+database/027_payment_events.sql      — миграция: типы событий R1 (напоминание о выплате) и B2b (от НРД нет сообщений — только администратору), этап 5, см. docs/STAGE5_PAYMENTS.md
+config/working_calendar.php          — производственный календарь РФ (2026, 2027): праздничные будни и рабочие субботы; пополняется раз в год
+config/payments.example.php          — образец config/payments.php: включение напоминаний и проверок выплат (по умолчанию всё выключено)
+src/Payments/WorkingCalendar.php     — рабочие дни: день исполнения выплаты (перенос с выходного), +N рабочих дней (срок полного дефолта), рабочих дней между датами
+src/Payments/PaymentMessage.php      — сообщение о выплате в нашем виде (ISIN, вид, дата по графику, этап получено/передано, исполнение полное/частичное/нет, сумма); в него будет переводиться сообщение GetNews
+src/Payments/PaymentProcessor.php    — обработка сообщения о выплате: архив raw_messages, поиск выплаты по ISIN и дате, статус/факт в графике, история выплаты (event_stories), события A2–A7, B1, B2, B4, B5
+src/Payments/PaymentWatch.php        — события, которые считаем сами по графику: R1 накануне выплаты, B2a «денег пока нет» (вечер дня выплаты и утро следующего рабочего дня), B2b «от НРД нет ничего»
+src/Payments/PaymentsConfig.php      — чтение config/payments.php (нет файла — всё выключено)
+bin/payment_reminders.php            — напоминания о выплатах на завтра (по расписанию, 10:00 мск; --dry-run — показать список)
+bin/payment_checks.php               — проверки «сообщения о получении денег нет» (--at=evening в 19:00 мск, --at=morning в 10:00 мск; --dry-run)
+tests/test_working_calendar.php      — офлайн-проверка WorkingCalendar (25 проверок: 247 рабочих дней в 2026 и 2027, переносы, сроки дефолта на реальных кейсах)
+tests/test_payments.php              — офлайн-проверка этапа 5 на SQLite (66 проверок: PaymentProcessor на кейсах СибАвтоТранс/КЛВЗ/ВЗВТ/ЕвроТранс/Нэппи Клаб, PaymentWatch, тексты и получатели рассылки)
 ```
 
 ## Запуск
@@ -160,6 +172,7 @@ mysql -u root -p bondkeeper < database/025_current_ratings_source.sql
 php bin/apply_2026_09_review_decisions.php --apply   # разовые решения по разбору сверки 20-26 сентября (см. docs/STAGE3_RATINGS.md)
 mysql -u root -p bondkeeper < database/026_outlook_indefinite.sql
 php bin/normalize_stored_ratings.php --apply   # разовое выравнивание сохранённых рейтингов: кириллица, отзыв НРА прочерком, прогноз у отозванных
+mysql -u root -p bondkeeper < database/027_payment_events.sql   # типы событий выплат R1/B2b, этап 5, см. docs/STAGE5_PAYMENTS.md
 
 php bin/seed_market.php        # issuers, securities, redemptions(scheduled_maturity)
 php bin/seed_bondization.php   # coupons, amortizations
