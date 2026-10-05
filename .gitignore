@@ -3,3 +3,4 @@
 *.lock
 config/telegram_bot.php
 config/payments.php
+config/nsd_api.php

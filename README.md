@@ -136,6 +136,11 @@ bin/payment_reminders.php            — напоминания о выплат�
 bin/payment_checks.php               — проверки «сообщения о получении денег нет» (--at=evening в 19:00 мск, --at=morning в 10:00 мск; --dry-run)
 tests/test_working_calendar.php      — офлайн-проверка WorkingCalendar (25 проверок: 247 рабочих дней в 2026 и 2027, переносы, сроки дефолта на реальных кейсах)
 tests/test_payments.php              — офлайн-проверка этапа 5 на SQLite (66 проверок: PaymentProcessor на кейсах СибАвтоТранс/КЛВЗ/ВЗВТ/ЕвроТранс/Нэппи Клаб, PaymentWatch, тексты и получатели рассылки)
+src/Payments/GetNewsConfig.php       — login/password для API НРД (nsddata.ru) из config/nsd_api.php, не коммитится, см. .example рядом
+src/Payments/GetNewsClientInterface.php — интерфейс клиента GetNews (для подмены фейком в будущих офлайн-тестах разбора сообщений)
+src/Payments/GetNewsClient.php       — HTTP-клиент GetNews: POST /api/auth/login → Bearer-токен, обновление по /api/auth/refresh на 401, GET /api/get/news (filter/limit/skip); адрес и формат подтверждены вживую 05.10.2026, см. docs/STAGE5_PAYMENTS.md
+config/nsd_api.example.php           — шаблон config/nsd_api.php (login/password от НРД, не коммитить)
+bin/debug_getnews.php                — разведка (без записи в БД): проверка токена + вывод реальных ca_type/data.state.code за выбранное окно — нужно для разбора сообщений в PaymentProcessor (см. STAGE5_PAYMENTS.md, раздел 9)
 ```
 
 ## Запуск
