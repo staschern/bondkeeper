@@ -16,11 +16,19 @@ use RuntimeException;
  *   POST /api/auth/login {login, password} -> {access_token, refresh_token}
  *   (неверные данные отвечают HTTP 400 "Login failed" — не 404, путь верный)
  *   POST /api/auth/refresh {refresh_token} -> {access_token, refresh_token}
- *   GET /api/auth/check (Bearer) -> {valid: "true"|"false"}
- *   GET /api/get/news (Bearer) -> массив News (тариф Standard, который
- *   нам выдан) или NewsLite — зависит от прав аккаунта, см. OpenAPI-схему
+ *   GET /api/auth/check -> {valid: "true"|"false"}
+ *   GET /api/get/news -> массив News (тариф Standard, который нам
+ *   выдан) или NewsLite — зависит от прав аккаунта, см. OpenAPI-схему
  *   (Swagger UI: https://nsddata.ru/ru/products/api/docs, спека отдаётся
  *   с /ru/products/api/scheme).
+ *
+ * ВАЖНО про заголовок авторизации: OpenAPI-схема описывает его как
+ * securityScheme с bearerFormat="bearer", что навело на "Authorization:
+ * Bearer <token>" — но официальное "Руководство пользователя API NSD"
+ * (прислано пользователем 05.10.2026, живые curl-примеры) показывает
+ * заголовок БЕЗ префикса "Bearer": "Authorization: <весь access_token>"
+ * целиком. Сделано по руководству, не по догадке из схемы.
+ * access_token живёт 1 час — отсюда и обновление по 401 ниже.
  *
  * В ОТЛИЧИЕ от RatingsHttp/IssClient — НЕТ автоматических ретраев на
  * сетевые ошибки: это платный аккаунт с логином/паролем, а не бесплатный
@@ -155,7 +163,7 @@ final class GetNewsClient implements GetNewsClientInterface
      * @param array<string, scalar>|null $jsonBody
      * @return array{http_code: int, body: string}
      */
-    private function send(string $method, string $path, array $query, ?string $bearerToken = null, ?array $jsonBody = null): array
+    private function send(string $method, string $path, array $query, ?string $accessToken = null, ?array $jsonBody = null): array
     {
         $url = $this->config->baseUrl . $path;
         if ($query !== []) {
@@ -163,8 +171,9 @@ final class GetNewsClient implements GetNewsClientInterface
         }
 
         $headers = ['Accept: application/json'];
-        if ($bearerToken !== null) {
-            $headers[] = "Authorization: Bearer {$bearerToken}";
+        if ($accessToken !== null) {
+            // БЕЗ префикса "Bearer" — см. докблок класса.
+            $headers[] = "Authorization: {$accessToken}";
         }
         if ($jsonBody !== null) {
             $headers[] = 'Content-Type: application/json';
@@ -177,6 +186,7 @@ final class GetNewsClient implements GetNewsClientInterface
             CURLOPT_CUSTOMREQUEST => $method,
             CURLOPT_HTTPHEADER => $headers,
             CURLOPT_USERAGENT => 'BondKeeper/1.0 (GetNews, этап 5)',
+            CURLOPT_ENCODING => 'gzip', // руководство рекомендует Accept-Encoding: gzip для скорости
         ];
         if ($jsonBody !== null) {
             $options[CURLOPT_POSTFIELDS] = json_encode($jsonBody, JSON_UNESCAPED_UNICODE);

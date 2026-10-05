@@ -184,19 +184,26 @@ php bin/payment_checks.php --at=morning --dry-run --date=2026-10-13
 ## 8. Что не сделано и ждёт описания API
 
 1. ~~**Получение сообщений GetNews** — адрес, авторизация, параметры
-   запроса, постраничность.~~ **Сделано 05.10.2026** — реальный технический
-   документ оказался не присланным PDF (презентация и словарь полей не
-   покрывают это вообще), а OpenAPI-схемой на самом nsddata.ru (Swagger UI
-   `/ru/products/api/docs`, спецификация отдаётся с `/ru/products/api/scheme`).
-   Проверено вживую (без настоящих логина/пароля — только структура
-   запроса/ответа): `POST /api/auth/login {login, password}` →
-   `{access_token, refresh_token}`, далее `Authorization: Bearer ...`;
-   `GET /api/get/news?filter=...&limit=&skip=` (`filter` — MongoDB-подобный
-   JSON: `category`, `pub_date.$gte/$lte`, `$and`); `POST /api/auth/refresh`
-   на протухший токен. Реализовано в `src/Payments/GetNewsClient.php` +
-   `GetNewsConfig.php` (`config/nsd_api.php`, по образцу `telegram_bot.php`) +
-   `bin/debug_getnews.php` (разведка — печатает реальные значения `ca_type`/
-   `data.state.code` для пункта 2 ниже).
+   запроса, постраничность.~~ **Сделано 05.10.2026** — сначала нашёл реальную
+   OpenAPI-схему на самом nsddata.ru (Swagger UI `/ru/products/api/docs`,
+   спецификация отдаётся с `/ru/products/api/scheme`) и проверил вживую без
+   настоящих логина/пароля (только структуру запроса/ответа); затем
+   пользователь прислал официальное «Руководство пользователя API NSD»
+   (письмо НРД, то же 05.10.2026), которое уточнило и ИСПРАВИЛО одну деталь
+   из догадки по OpenAPI-схеме: заголовок авторизации — `Authorization:
+   <access_token>` БЕЗ префикса `Bearer` (схема через `bearerFormat`
+   наводила именно на `Bearer`, но живые curl-примеры руководства — без
+   него). `POST /api/auth/login {login, password}` → `{access_token,
+   refresh_token}` (`access_token` живёт 1 час); `GET /api/get/news?
+   filter=...&limit=&skip=` (`filter` — MongoDB-подобный JSON, полный набор
+   операторов из руководства: `$eq/$ne/$in/$nin/$gt/$gte/$lt/$lte/$and/$or/
+   $not/$exists`, `$regex` не рекомендован — медленный); `POST
+   /api/auth/refresh` на протухший токен. Реализовано в
+   `src/Payments/GetNewsClient.php` + `GetNewsConfig.php` (`config/nsd_api.php`,
+   по образцу `telegram_bot.php`) + `bin/debug_getnews.php` (разведка —
+   печатает реальные значения `ca_type`/`data.state.code` для пункта 2
+   ниже; поддерживает `--from=`/`--to=` для тестового доступа — у него
+   фиксированное окно в прошлом, а не «последние N дней от сегодня»).
 2. **Перевод сообщения GetNews в `PaymentMessage`** — какие поля означают
    «получено» / «передано» и «полностью» / «частично» / «не исполнено».
    Этого нет ни в презентации, ни в PDF-словаре полей, ни в самой

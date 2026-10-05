@@ -19,12 +19,20 @@ declare(strict_types=1);
  * Перед запуском: cp config/nsd_api.example.php config/nsd_api.php и
  * вписать login/password, которые выдал НРД (см. README.md).
  *
+ * ТЕСТОВЫЙ ДОСТУП (письмо НРД, 05.10.2026): данные доступны ТОЛЬКО за
+ * фиксированный период 18.09–02.10.2026 — не "последние N дней от
+ * сегодня". По умолчанию скрипт считает окно от сегодняшней даты
+ * (--days), что для тестового доступа НЕ подойдёт — используйте
+ * --from=/--to= с датами из письма:
+ *   php bin/debug_getnews.php --from=2026-09-18 --to=2026-10-02 --limit=200 --raw
+ *
  * Запуск:
- *   php bin/debug_getnews.php                       (проверка токена + 10 последних новостей по корп. действиям)
- *   php bin/debug_getnews.php --days=14              (окно по дате публикации, по умолчанию 7)
- *   php bin/debug_getnews.php --category=COMPANY     (CORP_ACTION по умолчанию; также SECURITY/COMPANY)
- *   php bin/debug_getnews.php --limit=50
- *   php bin/debug_getnews.php --raw                  (вдобавок печатает ПОЛНЫЙ JSON каждой новости, не только сводку)
+ *   php bin/debug_getnews.php                             (проверка токена + 10 последних новостей по корп. действиям, --days=7 от сегодня)
+ *   php bin/debug_getnews.php --from=2026-09-18 --to=2026-10-02  (фиксированное окно по датам публикации — для тестового доступа)
+ *   php bin/debug_getnews.php --days=14                    (альтернатива --from/--to: окно от сегодня, по умолчанию 7)
+ *   php bin/debug_getnews.php --category=COMPANY           (CORP_ACTION по умолчанию; также SECURITY/COMPANY)
+ *   php bin/debug_getnews.php --limit=200                  (по умолчанию 10; максимум по документации — 1000)
+ *   php bin/debug_getnews.php --raw                        (вдобавок печатает ПОЛНЫЙ JSON каждой новости, не только сводку)
  */
 
 require __DIR__ . '/bootstrap.php';
@@ -35,6 +43,8 @@ use BondKeeper\Payments\GetNewsConfig;
 $days = 7;
 $category = 'CORP_ACTION';
 $limit = 10;
+$explicitFrom = null;
+$explicitTo = null;
 $raw = in_array('--raw', $argv, true);
 foreach ($argv as $arg) {
     if (preg_match('/^--days=(\d+)$/', $arg, $m)) {
@@ -45,6 +55,12 @@ foreach ($argv as $arg) {
     }
     if (preg_match('/^--limit=(\d+)$/', $arg, $m)) {
         $limit = (int) $m[1];
+    }
+    if (preg_match('/^--from=(\d{4}-\d{2}-\d{2})$/', $arg, $m)) {
+        $explicitFrom = $m[1];
+    }
+    if (preg_match('/^--to=(\d{4}-\d{2}-\d{2})$/', $arg, $m)) {
+        $explicitTo = $m[1];
     }
 }
 
@@ -61,8 +77,8 @@ try {
     exit(1);
 }
 
-$dateTo = (new DateTimeImmutable('now'))->format('Y-m-d');
-$dateFrom = (new DateTimeImmutable('now'))->modify("-{$days} days")->format('Y-m-d');
+$dateTo = $explicitTo ?? (new DateTimeImmutable('now'))->format('Y-m-d');
+$dateFrom = $explicitFrom ?? (new DateTimeImmutable('now'))->modify("-{$days} days")->format('Y-m-d');
 $filter = [
     '$and' => [
         ['category' => $category],
