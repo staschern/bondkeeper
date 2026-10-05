@@ -143,6 +143,7 @@ config/nsd_api.example.php           — шаблон config/nsd_api.php (login/
 bin/debug_getnews.php                — разведка (без записи в БД): проверка токена + вывод реальных ca_type/data.state.code за выбранное окно — нужно для разбора сообщений в PaymentProcessor (см. STAGE5_PAYMENTS.md, раздел 9)
 src/Payments/GetNewsMessageMapper.php — перевод сырого сообщения GetNews в PaymentMessage: state.code (A/T/N/C), получено/передано по тексту заголовка, ca_type → купон/амортизация/погашение; подтверждён на реальных сообщениях тестового доступа НРД (05.10.2026), см. STAGE5_PAYMENTS.md
 tests/test_getnews_message_mapper.php — офлайн-проверка GetNewsMessageMapper (25 проверок) на урезанных копиях РЕАЛЬНЫХ сообщений (суммы/даты/content_id_out настоящие)
+bin/poll_getnews.php                 — опрос GetNews: получить → GetNewsMessageMapper → PaymentProcessor::process(); --dry-run всегда доступен и ничего не пишет, реальная запись — только при config/payments.php: getnews_polling=true (настоящие уведомления клиентам по A2/A4/A6/B1/B2/B4/B5), см. STAGE5_PAYMENTS.md
 ```
 
 ## Запуск

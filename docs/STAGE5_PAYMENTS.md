@@ -144,8 +144,9 @@ GetNews (НРД). Готово всё, что от API не зависит: ра
 
 ```php
 return [
-    'reminders' => false,   // true — рассылать напоминания накануне выплаты
-    'checks' => 'off',      // off | admin | clients
+    'reminders' => false,       // true — рассылать напоминания накануне выплаты
+    'checks' => 'off',          // off | admin | clients
+    'getnews_polling' => false, // true — bin/poll_getnews.php реально пишет в БД
 ];
 ```
 
@@ -155,13 +156,21 @@ return [
   попадать в базу. Иначе по каждой выплате будет тревога «денег нет».
   Порядок: сначала `admin` (списки приходят только администратору — можно
   сверить с реальностью), затем `clients`.
+- `getnews_polling` — ОСТОРОЖНО: включение сразу означает настоящие
+  уведомления клиентам по купонам/погашениям/амортизациям (A2/A4/A6/B1/
+  B2/B4/B5 уведомляют клиентов с первой миграции, отдельно для одного
+  источника не выключить). Сначала несколько раз `--dry-run` (работает
+  всегда, даже без этого флага) — убедиться, что разбор сообщений
+  (`GetNewsMessageMapper`) даёт ожидаемый результат, и только потом
+  включать.
 
-Посмотреть, что было бы отправлено, ничего не создавая:
+Посмотреть, что было бы отправлено/записано, ничего не создавая:
 
 ```
 php bin/payment_reminders.php --dry-run
 php bin/payment_checks.php --at=evening --dry-run
 php bin/payment_checks.php --at=morning --dry-run --date=2026-10-13
+php bin/poll_getnews.php --dry-run
 ```
 
 ## 7. Расписание
@@ -242,11 +251,21 @@ php bin/payment_checks.php --at=morning --dry-run --date=2026-10-13
      выгрузке ведёт себя непоследовательно (то больше `size`, то меньше) —
      сознательно не используется. `GetNewsMessageMapper` сейчас умеет
      только `full`/`none`; `partial` — когда появится реальный пример.
-3. **Скрипт загрузки по расписанию** (получить → перевести → `process()`),
-   с отчётом администратору о сообщениях, которые не удалось привязать.
-   Ядро (`GetNewsClient` + `GetNewsMessageMapper` + `PaymentProcessor`)
-   готово, сам скрипт (`bin/poll_getnews.php` или аналог) — ещё не
-   написан.
+3. ~~**Скрипт загрузки по расписанию**~~ **Сделано 05.10.2026** —
+   `bin/poll_getnews.php`: получить → `GetNewsMessageMapper::map()` →
+   `PaymentProcessor::process()`. Проверен целиком на SQLite с реальным
+   сообщением из тестовой выгрузки (купон ООО «Лизинг-Трейд») — создаёт
+   событие A2, закрывает купон статусом `paid`, повторный проход тем же
+   сообщением корректно даёт `duplicate`. Сообщения по бумагам, которых
+   у нас нет в `securities` (почти вся лента — рынок целиком, не только
+   наши выпуски), — не ошибка, тихо считаются; администратору шлётся
+   список только для «пробелов в графике» (бумага у нас есть, нужной
+   даты выплаты не нашлось). Включается отдельным флагом
+   `getnews_polling` в `config/payments.php` (см. раздел 6) — по
+   умолчанию выключен, `--dry-run` работает всегда.
+   Пока НЕ реализовано: пагинация (`--skip=`, нужна при окне
+   >`--limit=1000`) и расписание в `crontab` — добавится, когда появится
+   боевой (не тестовый) доступ к API.
 
 Не входит в стартовые шаблоны и будет сделано позже:
 
@@ -291,8 +310,9 @@ php bin/payment_checks.php --at=morning --dry-run --date=2026-10-13
 ## 10. Проверки
 
 ```
-php -d extension=mbstring -d extension=pdo_sqlite tests/test_working_calendar.php   # 25 проверок
-php -d extension=mbstring -d extension=pdo_sqlite tests/test_payments.php           # 66 проверок
+php -d extension=mbstring -d extension=pdo_sqlite tests/test_working_calendar.php         # 25 проверок
+php -d extension=mbstring -d extension=pdo_sqlite tests/test_payments.php                 # 66 проверок
+php -d extension=mbstring -d extension=pdo_sqlite tests/test_getnews_message_mapper.php   # 25 проверок, на реальных сообщениях
 ```
 
 `test_payments.php` прогоняет обработку на кейсах из исследования:
