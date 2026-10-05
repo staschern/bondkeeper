@@ -26,12 +26,15 @@ declare(strict_types=1);
  * --from=/--to= с датами из письма:
  *   php bin/debug_getnews.php --from=2026-09-18 --to=2026-10-02 --limit=1000
  *
- * Первый прогон (05.10.2026, --limit=200) вернул РОВНО 200 записей —
- * подозрительно похоже на обрезанный лимит, а не на всё окно; сервис
- * по документации принимает --limit до 1000, сюда и подняли по
- * умолчанию. Если 1000 снова придёт впритык — нужна пагинация через
- * --skip= (параметр есть в API, в этом скрипте пока не реализован,
- * пока хватало одного запроса).
+ * Первый и второй прогоны (05.10.2026, --limit=200, затем --limit=1000)
+ * оба вернули РОВНО по лимиту записей — окно больше одной страницы.
+ * Теперь скрипт сам листает через --skip= (страница = --limit, по
+ * умолчанию 1000 — максимум по документации), пока очередная страница
+ * не придёт короче лимита — это и есть конец окна. Между страницами —
+ * небольшая пауза (0.3 сек), из вежливости к платному API. Предел —
+ * --max-pages (по умолчанию 50, т.е. до 50 000 сообщений при лимите
+ * 1000) — защита от бесконечного цикла, если сервер почему-то всегда
+ * отдаёт полную страницу.
  *
  * ВЫВОД: полный JSON всех новостей всегда сохраняется в файл
  * (var/getnews_debug_ОТ_ДО.json) — слишком много для консоли. В
@@ -43,10 +46,11 @@ declare(strict_types=1);
  *
  * Запуск:
  *   php bin/debug_getnews.php                             (проверка токена + 10 последних новостей по корп. действиям, --days=7 от сегодня)
- *   php bin/debug_getnews.php --from=2026-09-18 --to=2026-10-02 --limit=1000  (тестовый доступ — фиксированное окно)
+ *   php bin/debug_getnews.php --from=2026-09-18 --to=2026-10-02  (тестовый доступ — фиксированное окно, листает все страницы сам)
  *   php bin/debug_getnews.php --days=14                    (альтернатива --from/--to: окно от сегодня, по умолчанию 7)
  *   php bin/debug_getnews.php --category=COMPANY           (CORP_ACTION по умолчанию; также SECURITY/COMPANY)
- *   php bin/debug_getnews.php --limit=1000                 (по умолчанию 10; максимум по документации — 1000)
+ *   php bin/debug_getnews.php --limit=1000                 (размер ОДНОЙ страницы; по умолчанию 1000 — максимум по документации)
+ *   php bin/debug_getnews.php --max-pages=100              (предел страниц, по умолчанию 50)
  *   php bin/debug_getnews.php --raw-all                    (вдобавок печатает в консоль ПОЛНЫЙ JSON КАЖДОЙ новости, не только по одной на комбинацию — обычно не нужно, всё и так в файле)
  */
 
@@ -57,7 +61,8 @@ use BondKeeper\Payments\GetNewsConfig;
 
 $days = 7;
 $category = 'CORP_ACTION';
-$limit = 10;
+$limit = 1000;
+$maxPages = 50;
 $explicitFrom = null;
 $explicitTo = null;
 $rawAll = in_array('--raw-all', $argv, true) || in_array('--raw', $argv, true);
@@ -70,6 +75,9 @@ foreach ($argv as $arg) {
     }
     if (preg_match('/^--limit=(\d+)$/', $arg, $m)) {
         $limit = (int) $m[1];
+    }
+    if (preg_match('/^--max-pages=(\d+)$/', $arg, $m)) {
+        $maxPages = (int) $m[1];
     }
     if (preg_match('/^--from=(\d{4}-\d{2}-\d{2})$/', $arg, $m)) {
         $explicitFrom = $m[1];
@@ -101,18 +109,32 @@ $filter = [
     ],
 ];
 
-echo "\n========== /api/get/news: category={$category}, {$dateFrom}..{$dateTo}, limit={$limit} ==========\n";
-try {
-    $items = $client->fetchNews($filter, $limit, 0);
-} catch (\Throwable $e) {
-    echo 'ОШИБКА запроса новостей: ' . $e->getMessage() . "\n";
-    exit(1);
+echo "\n========== /api/get/news: category={$category}, {$dateFrom}..{$dateTo}, страница={$limit}, максимум страниц={$maxPages} ==========\n";
+$items = [];
+$page = 0;
+$batchCount = $limit;
+while ($batchCount === $limit && $page < $maxPages) {
+    $skip = $page * $limit;
+    try {
+        $batch = $client->fetchNews($filter, $limit, $skip);
+    } catch (\Throwable $e) {
+        echo 'ОШИБКА запроса новостей (страница ' . ($page + 1) . ", skip={$skip}): " . $e->getMessage() . "\n";
+        echo 'Собрано до сбоя: ' . count($items) . " сообщений — продолжаю с ними (лучше частично, чем ничего).\n";
+        break;
+    }
+    $batchCount = count($batch);
+    $items = array_merge($items, $batch);
+    $page++;
+    echo "  страница {$page}: skip={$skip}, получено {$batchCount}, всего собрано: " . count($items) . "\n";
+    if ($batchCount === $limit && $page < $maxPages) {
+        usleep(300000); // 0.3 сек пауза между страницами — вежливость к платному API
+    }
+}
+if ($batchCount === $limit && $page >= $maxPages) {
+    echo "ВНИМАНИЕ: достигнут --max-pages={$maxPages}, и последняя страница была полной — окно, похоже, ещё больше. Увеличьте --max-pages.\n";
 }
 
-echo 'Получено новостей: ' . count($items) . "\n";
-if (count($items) === $limit) {
-    echo "ВНИМАНИЕ: получено ровно --limit={$limit} — возможно, это не всё окно, а обрезанная страница. Увеличьте --limit (максимум 1000).\n";
-}
+echo 'Итого получено новостей: ' . count($items) . " (страниц: {$page})\n";
 if ($items === []) {
     echo "Пусто — попробуйте увеличить --days или сменить --category.\n";
     exit(0);
