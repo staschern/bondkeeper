@@ -141,6 +141,8 @@ src/Payments/GetNewsClientInterface.php — интерфейс клиента Ge
 src/Payments/GetNewsClient.php       — HTTP-клиент GetNews: POST /api/auth/login → Bearer-токен, обновление по /api/auth/refresh на 401, GET /api/get/news (filter/limit/skip); адрес и формат подтверждены вживую 05.10.2026, см. docs/STAGE5_PAYMENTS.md
 config/nsd_api.example.php           — шаблон config/nsd_api.php (login/password от НРД, не коммитить)
 bin/debug_getnews.php                — разведка (без записи в БД): проверка токена + вывод реальных ca_type/data.state.code за выбранное окно — нужно для разбора сообщений в PaymentProcessor (см. STAGE5_PAYMENTS.md, раздел 9)
+src/Payments/GetNewsMessageMapper.php — перевод сырого сообщения GetNews в PaymentMessage: state.code (A/T/N/C), получено/передано по тексту заголовка, ca_type → купон/амортизация/погашение; подтверждён на реальных сообщениях тестового доступа НРД (05.10.2026), см. STAGE5_PAYMENTS.md
+tests/test_getnews_message_mapper.php — офлайн-проверка GetNewsMessageMapper (25 проверок) на урезанных копиях РЕАЛЬНЫХ сообщений (суммы/даты/content_id_out настоящие)
 ```
 
 ## Запуск
