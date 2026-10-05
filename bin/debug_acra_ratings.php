@@ -249,6 +249,7 @@ function httpGet(string $url, string $cookieJar): ?string
         CURLOPT_COOKIEJAR => $cookieJar,
         CURLOPT_COOKIEFILE => $cookieJar,
         CURLOPT_USERAGENT => 'Mozilla/5.0 (compatible; BondKeeperBot/1.0; +data seeding, stage 3)',
+        CURLOPT_CAINFO => __DIR__ . '/certs/cacert_with_globalsign_ov2018.pem',
     ]);
     $body = curl_exec($ch);
     $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
@@ -281,6 +282,12 @@ function httpPost(string $url, string $body, string $cookieJar): ?string
         CURLOPT_HTTPHEADER => [
             'X-Requested-With: XMLHttpRequest',
             'Content-Type: application/x-www-form-urlencoded',
+        //CURLOPT_CAINFO => __DIR__ . '/certs/cacert_with_globalsign_ov2018.pem', 
+        //CURLOPT_SSL_VERIFYPEER => false,
+        //// Также может потребоваться:
+        //CURLOPT_SSL_VERIFYHOST => 0, 
+        //CURLOPT_CAINFO => __DIR__ . '/certs/acra_site.pem', 
+        CURLOPT_CAINFO => __DIR__ . '/certs/acra_chain.pem',
         ],
     ]);
     $response = curl_exec($ch);
@@ -320,7 +327,7 @@ function printSpaDiagnostics(string $body): void
         echo "    .{$class}: {$count}\n";
     }
 
-    if (stripos($body, 'captcha') !== false || stripos($body, 'SmartCaptcha') !== false) {
+    /*if (stripos($body, 'captcha') !== false || stripos($body, 'SmartCaptcha') !== false) {
         echo "\n  --- на странице упоминается капча (captcha/SmartCaptcha) ---\n";
-    }
+    }*/
 }

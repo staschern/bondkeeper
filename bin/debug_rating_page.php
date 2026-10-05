@@ -56,6 +56,7 @@ function debugOneUrl(string $url): void
         // рейтингов/пресс-релизов, не защищённый сервис вроде ФНС — но
         // некоторые сайты всё равно блокируют явно нестандартные UA.
         CURLOPT_USERAGENT => 'Mozilla/5.0 (compatible; BondKeeperBot/1.0; +data seeding, stage 3)',
+        CURLOPT_CAINFO => __DIR__ . '/certs/cacert_with_globalsign_ov2018.pem',
     ]);
     $raw = curl_exec($ch);
     $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);

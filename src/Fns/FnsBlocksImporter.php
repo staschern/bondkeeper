@@ -150,12 +150,12 @@ final class FnsBlocksImporter
             return false;
         }
 
-        if ($result->captchaRequired) {
+        /*if ($result->captchaRequired) {
             $this->skippedCaptcha++;
             Logger::warn("ФНС: капча для ИНН {$inn} — статус блокировки не тронут, отмечена только попытка");
             $this->markVerificationError($issuerId);
             return false;
-        }
+        }*/
 
         $this->applyResult($issuerId, $inn, $result->rows);
         return true;

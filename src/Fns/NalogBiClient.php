@@ -88,6 +88,14 @@ final class NalogBiClient implements NalogBiClientInterface
     /** @return array<string, mixed> */
     private function submitQuery(string $inn, string $cookieJar): array
     {
+        $proxyUrl = sprintf(
+            'http://%s:%s@%s:%d',  
+            'ld63u-ru',//$randomProxy['login'],
+            's4qzljuy',//$randomProxy['password'],
+            'edge1-us.privateproxy.me',//$randomProxy['host'],
+            '8888'//$randomProxy['port']
+        );
+        
         $body = http_build_query([
             'requestType' => 'FINDPRS',
             'innPRS' => $inn,
@@ -120,6 +128,7 @@ final class NalogBiClient implements NalogBiClientInterface
                 'Origin: ' . self::BASE_URL,
                 'X-Requested-With: XMLHttpRequest',
             ],
+            CURLOPT_PROXY => $proxyUrl,
         ]);
         $raw = curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);

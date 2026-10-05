@@ -46,6 +46,7 @@ final class RatingsHttp
             CURLOPT_FOLLOWLOCATION => true,
             CURLOPT_MAXREDIRS => 5,
             CURLOPT_USERAGENT => 'Mozilla/5.0 (compatible; BondKeeperBot/1.0; +data seeding, stage 3)',
+            CURLOPT_CAINFO => __DIR__ . '/certs/cacert_with_globalsign_ov2018.pem',
         ]);
 
         $body = curl_exec($ch);
