@@ -1,7 +1,17 @@
+
 .env
+
 *.log
+
 *.lock
+
 config/telegram_bot.php
+
 config/payments.php
+
 config/nsd_api.php
+
+/data/acra_issuers.json
+
 /var/
+
