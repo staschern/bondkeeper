@@ -13,3 +13,5 @@ config/nsd_api.php
 
 /data/acra_issuers.json
 
+/var/
+
