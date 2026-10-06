@@ -373,15 +373,15 @@ check('B1: заголовок темы — красный (просрочка/о
 check('B1: получено X из Y', str_contains($telegram->sent[0]['text'], 'получено 60.00 ₽ из 100.00 ₽ на бумагу.'));
 check('B1: срок полного дефолта', str_contains($telegram->sent[0]['text'], 'Полный дефолт наступит, если долг не будет закрыт до 24.05.26 (осталось рабочих дней: 10).'));
 
-// --- B2a: вечер дня выплаты, сообщения о получении ещё нет ---
+// --- B2a: полдень следующего рабочего дня после выплаты, сообщения о деньгах от НРД нет ---
 $db->exec("INSERT INTO events (id, security_id, issuer_id, event_type_code, payload_json) VALUES (33, 100, 8, 'B2a', '"
-    . json_encode(['payment_date' => '2026-04-16', 'payments' => [['kind' => 'coupon']], 'check' => 'evening'], JSON_UNESCAPED_UNICODE)
+    . json_encode(['payment_date' => '2026-04-16', 'payments' => [['kind' => 'coupon']], 'check' => 'noon', 'due_date' => '2026-04-16'], JSON_UNESCAPED_UNICODE)
     . "')");
 $telegram->sent = [];
 $dispatcher->dispatchPending();
 check('B2a: заголовок темы — жёлтый (предупреждение)', str_starts_with($telegram->sent[0]['text'], "<b>🟡 Выплаты:</b>\n"));
-check('B2a: "пока не поступили" (вечер, не "до сих пор")', str_contains($telegram->sent[0]['text'], 'пока не поступили в НРД'));
-check('B2a: оговорка про возможное сообщение на следующий рабочий день', str_contains($telegram->sent[0]['text'], 'сообщение о получении может выйти на следующий рабочий день'));
+check('B2a: НРД пока не сообщил о поступлении денег', str_contains($telegram->sent[0]['text'], 'По выплате (купон) за 16.04.26 НРД пока не сообщил о поступлении денег от эмитента'));
+check('B2a: оговорка — это ещё не невыплата, о неисполнении НРД объявит сегодня', str_contains($telegram->sent[0]['text'], 'Это ещё не подтверждённая невыплата: если деньги не пришли, НРД объявит о неисполнении сегодня, чаще после 17:00.'));
 
 // --- Экранирование: название бумаги с "&" тоже идёт через escapeHtml() ---
 $db->exec("INSERT INTO events (id, security_id, issuer_id, event_type_code, payload_json) VALUES (34, 102, 8, 'A2', '"

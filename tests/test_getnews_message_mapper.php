@@ -3,17 +3,27 @@
 declare(strict_types=1);
 
 /**
- * Офлайн-проверка GetNewsMessageMapper на РЕАЛЬНЫХ сообщениях GetNews
- * (тестовый доступ НРД, 05.10.2026, окно 18.09–02.10.2026 — см.
- * докблок класса). Фикстуры ниже — не выдуманные данные, а урезанные
- * (без body_ru/body_en — лишний объём) копии реальных сообщений: суммы,
- * даты, content_id_out, isin — настоящие значения из выгрузки.
+ * Офлайн-проверка разбора сообщений GetNews: GetNewsBody (чтение текста) и
+ * GetNewsMessageMapper (перевод в PaymentMessage).
  *
- * Запуск: php tests/test_getnews_message_mapper.php
+ * Образцы — НАСТОЯЩИЕ сообщения НРД из выгрузки тестового доступа
+ * (18–30.09.2026), tests/fixtures/getnews_messages.json: 31 сообщение, по
+ * одному на каждый встреченный случай (английские поля убраны). Правила
+ * проверены ещё и на всей выгрузке целиком (3798 сообщений → 1554
+ * сообщения о выплатах, ни одного непрочитанного) — см.
+ * docs/STAGE5_PAYMENTS.md, раздел 9.
+ *
+ * Переписан 05.10.2026 вместе с разбором: прежняя версия проверяла
+ * правило «состояние A → выплачено, N → пропустить», которое на данных
+ * оказалось неверным.
+ *
+ * Запуск (из корня репозитория):
+ *   php -d extension=mbstring tests/test_getnews_message_mapper.php
  */
 
 require dirname(__DIR__) . '/bin/bootstrap.php';
 
+use BondKeeper\Payments\GetNewsBody;
 use BondKeeper\Payments\GetNewsMessageMapper;
 use BondKeeper\Payments\PaymentMessage;
 
@@ -32,152 +42,119 @@ function check(string $label, $expected, $actual): void
     }
 }
 
-// --- #1: купон, расписка (первое сообщение пары, action_id=1076442, 29.09 12:00) ---
-// Сумма/ISIN/content_id_out — реальные; состояние N -> ждём второго сообщения.
-$receiptPending = [
-    'ca_type' => 'INTR',
-    'content_id_out' => 16356133147,
-    'id' => 1449166,
-    'pub_date' => '2026-09-29 12:00:53',
-    'announce_ru' => '(INTR) (Выплата купонного дохода) О получении головным депозитарием...',
-    'data' => [
-        'state' => ['id' => 141, 'code' => 'N', 'name' => 'Не состоялось'],
-        'action_date_plan' => '2026-09-30',
-        'action_date_calc' => '2026-09-30',
-        'record_date_plan' => '2026-09-29',
-        'securities' => [['isin' => 'RU000A10CLT1']],
-        'coupon' => ['size' => 51.35, 'payment_size' => 51.35],
-    ],
-];
+/** @var array<string, array<string, mixed>> $fixtures */
+$fixtures = json_decode((string) file_get_contents(__DIR__ . '/fixtures/getnews_messages.json'), true, 512, JSON_THROW_ON_ERROR);
+$map = static fn (string $label): ?PaymentMessage => GetNewsMessageMapper::map($fixtures[$label]);
+$reason = static fn (string $label): ?string => GetNewsMessageMapper::classify($fixtures[$label])['reason'];
+/** Главное в сообщении одной строкой: вид, стадия, исполнение, сумма, пометки. */
+$brief = static function (?PaymentMessage $m): ?string {
+    if ($m === null) {
+        return null;
+    }
 
-// --- #2: тот же купон, "О передаче" (второе сообщение пары, 30.09 09:55, state=A) ---
-$transferConfirmed = [
-    'ca_type' => 'INTR',
-    'content_id_out' => 16369330854,
-    'id' => 1449444,
-    'pub_date' => '2026-09-30 09:55:11',
-    'announce_ru' => '(INTR) (Выплата купонного дохода) О передаче головным депозитарием, осуществляющим обязательное централизованное хранение ценных бумаг своим депонентам...',
-    'data' => [
-        'state' => ['id' => 138, 'code' => 'A', 'name' => 'Состоялось'],
-        'action_date_plan' => '2026-09-30',
-        'action_date_calc' => '2026-09-30',
-        'record_date_plan' => '2026-09-29',
-        'securities' => [['isin' => 'RU000A10CLT1']],
-        'coupon' => ['size' => 51.35, 'payment_size' => 51.35],
-    ],
-];
+    return "{$m->kind} {$m->stage}/{$m->execution} " . ($m->amountPerBond ?? '-') . ' из ' . ($m->plannedPerBond ?? '-')
+        . ($m->late ? ' late' : '') . ($m->beforeDue ? ' before_due' : '');
+};
 
-// --- #3: купон, ОДНО объединённое сообщение "получении и передаче" (ООО «Лизинг-Трейд», state=A) ---
-$combinedReceivedAndTransferred = [
-    'ca_type' => 'INTR',
-    'content_id_out' => 16369851539,
-    'id' => 1449498,
-    'pub_date' => '2026-09-30 10:16:11',
-    'announce_ru' => '(INTR) (Выплата купонного дохода) О получении и передаче головным депозитарием, осуществляющим обязательное централизованное хранение ценных бумаг...',
-    'data' => [
-        'state' => ['id' => 138, 'code' => 'A', 'name' => 'Состоялось'],
-        'action_date_plan' => '2026-09-30',
-        'action_date_calc' => '2026-09-30',
-        'record_date_plan' => '2026-09-29',
-        'securities' => [['isin' => 'RU000A105RF6']],
-        'coupon' => ['size' => 7.95, 'payment_size' => 7.95],
-    ],
-];
+echo "--- чтение текста сообщения ---\n";
+$body = GetNewsBody::currentPayment((string) $fixtures['samolet_redemption_part2']['body_ru']);
+check('блок «Текущая выплата по КД»: сумма перевода на бумагу и дата поступления', ['730.895092532', '2026-09-29', null], [$body['amount'], $body['received'], $body['transferred']]);
+check('формулировка НРД о неисполнении — дословно', 'Не исполнена эмитентом в срок, исполнена ненадлежащим образом', $body['note']);
+$body = GetNewsBody::currentPayment((string) $fixtures['pair_transferred']['body_ru']);
+check('«О передаче»: есть и дата поступления, и дата передачи; пометки нет', ['105.2', '2026-09-25', '2026-09-30', null], array_values($body));
+check('объявление: блока о деньгах нет', ['amount' => null, 'received' => null, 'transferred' => null, 'note' => null], GetNewsBody::currentPayment((string) $fixtures['announcement_state_N']['body_ru']));
+check('дата прописью', ['2026-09-01', '2026-10-12', null], [GetNewsBody::parseDate('01 сентября 2026 г.'), GetNewsBody::parseDate('12 Октября 2026 г.'), GetNewsBody::parseDate('скоро')]);
+check('сумма: точка, запятая, пробелы; не число → null', ['730.895092532', '1000.50', null], [GetNewsBody::parseAmount('730.895092532'), GetNewsBody::parseAmount('1 000,50'), GetNewsBody::parseAmount('—')]);
+check('пустой текст — ничего не найдено, без ошибок', null, GetNewsBody::currentPayment('')['amount']);
 
-// --- #4: погашение по графику (Банк ВТБ, REDM, state=A, 100% номинала) ---
-$redemptionDone = [
-    'ca_type' => 'REDM',
-    'content_id_out' => 16369818035,
-    'id' => 1449492,
-    'pub_date' => '2026-09-30 10:14:22',
-    'announce_ru' => '(REDM) (Погашение облигаций) О получении и передаче головным депозитарием...',
-    'data' => [
-        'state' => ['id' => 138, 'code' => 'A', 'name' => 'Состоялось'],
-        'action_date_plan' => '2026-09-30',
-        'action_date_calc' => '2026-09-30',
-        'record_date_plan' => '2026-09-29',
-        'securities' => [['isin' => 'RU000A10G7W6']],
-        'repayment' => ['size_cur' => 1000, 'size_per_security_cur' => 1000],
-    ],
-];
+echo "\n--- вид сообщения — по заголовку, а не по полю «состояние» ---\n";
+check('«О получении и передаче»', GetNewsMessageMapper::TYPE_RECEIVED_TRANSFERRED, GetNewsMessageMapper::messageType((string) $fixtures['combined_state_A']['title_ru']));
+check('«О получении»', GetNewsMessageMapper::TYPE_RECEIVED, GetNewsMessageMapper::messageType((string) $fixtures['pair_received']['title_ru']));
+check('«О передаче»', GetNewsMessageMapper::TYPE_TRANSFERRED, GetNewsMessageMapper::messageType((string) $fixtures['pair_transferred']['title_ru']));
+check('«О корпоративном действии»', GetNewsMessageMapper::TYPE_ANNOUNCEMENT, GetNewsMessageMapper::messageType((string) $fixtures['announcement_state_N']['title_ru']));
+check('«Об отмене корпоративного действия» — не про выплату', null, GetNewsMessageMapper::messageType((string) $fixtures['cancellation']['title_ru']));
 
-// --- #5: амортизация (PRED, ОФЗ, state=A, доля номинала в $, выплата в рублях) ---
-$amortizationDone = [
-    'ca_type' => 'PRED',
-    'content_id_out' => 16374795713,
-    'id' => 1449647,
-    'pub_date' => '2026-09-30 15:06:15',
-    'announce_ru' => '(PRED) (Частичное погашение без уменьшения номинала) О получении и передаче головным депозитарием...',
-    'data' => [
-        'state' => ['id' => 138, 'code' => 'A', 'name' => 'Состоялось'],
-        'action_date_plan' => '2026-09-30',
-        'action_date_calc' => '2026-09-30',
-        'record_date_plan' => '2026-09-25',
-        'securities' => [['isin' => 'RU000A10A8E8']],
-        'repayment' => ['size_cur' => 0.005, 'size_per_security_cur' => 0.4221415],
-    ],
-];
+echo "\n--- обычная выплата ---\n";
+$m = $map('pair_received');
+check('«О получении» при состоянии «Не состоялось» — деньги получены (раньше такое сообщение пропускалось)', 'coupon received/full 105.2 из 105.2', $brief($m));
+check('даты: выплата 30.09, сообщение 28.09, деньги поступили 25.09', ['2026-09-30', '2026-09-28', '2026-09-25', null], [$m->paymentDate, $m->messageDate, $m->receivedDate, $m->transferredDate]);
+check('ключ повторов — content_id_out, событие — action_id, бумага — ISIN', ['16341148028', '442109', 'RU000A100W45'], [$m->sourceRef, $m->actionRef, $m->isin]);
+check('валюта выплаты и дата фиксации', ['RUB', '2026-09-29'], [$m->currency, $m->recordDate]);
+$m = $map('pair_transferred');
+check('«О передаче» — вторая половина пары: стадия «передано», та же дата поступления', ['coupon transferred/full 105.2 из 105.2', '2026-09-25', '2026-09-30'], [$brief($m), $m->receivedDate, $m->transferredDate]);
+check('«О получении и передаче», состояние «Состоялось»', 'coupon received/full 11.34 из 11.34', $brief($map('combined_state_A')));
+check('«О получении и передаче», состояние «Не состоялось» — то же самое', 'coupon received/full 0.05 из 0.05', $brief($map('combined_state_N')));
+check('амортизация (PRED)', 'amortization received/full 41.6 из 41.6', $brief($map('amortization_ltrade')));
+check('купон той же бумаги и даты — отдельное сообщение', 'coupon received/full 7.95 из 7.95', $brief($map('coupon_ltrade')));
+check('погашение (REDM)', 'redemption received/full 1000 из 1000', $brief($map('invobl_redemption')));
+check('дата выплаты — с переносом на рабочий день (по условиям выпуска суббота 26.09)', ['2026-09-28', '2026-09-26'], [$map('weekend_shift_samolet_p13')->paymentDate, $fixtures['weekend_shift_samolet_p13']['data']['action_date_calc']]);
 
-// --- #6: техдефолт (ООО «ЛКХ», известный проблемный эмитент, state=T) ---
-$technicalDefault = [
-    'ca_type' => 'INTR',
-    'content_id_out' => 47378371594,
-    'id' => 1449346,
-    'pub_date' => '2026-09-29 17:33:34',
-    'title_ru' => '(INTR) О корпоративном действии "Выплата купонного дохода" с ценными бумагами эмитента ООО "ЛКХ" ИНН 9729293827',
-    'data' => [
-        'state' => ['id' => 142, 'code' => 'T', 'name' => 'Техн.дефолт'],
-        'action_date_plan' => '2026-09-28',
-        'action_date_calc' => '2026-09-27',
-        'record_date_plan' => '2026-09-25',
-        'securities' => [['isin' => 'RU000A10AT01']],
-        'coupon' => ['size' => 25.48, 'payment_size' => 25.48],
-    ],
-];
+echo "\n--- объявления ---\n";
+check('объявление в состоянии «Не состоялось» — не выплата', [null, GetNewsMessageMapper::REASON_ANNOUNCEMENT], [$map('announcement_state_N'), $reason('announcement_state_N')]);
+check('объявление в состоянии «Состоялось» — тоже не деньги (раньше засчитывалось как получение)', [null, GetNewsMessageMapper::REASON_ANNOUNCEMENT], [$map('announcement_state_A'), $reason('announcement_state_A')]);
+$m = $map('garant_tech_default_announcement');
+check('объявление в состоянии «Техн.дефолт» — не исполнено в срок, суммы нет', ['coupon received/none - из 8.22', '2026-09-28'], [$brief($m), $m->paymentDate]);
+$m = $map('lkh2_tech_default_announcement');
+check('то же, дата по условиям — воскресенье 27.09, в сообщении — понедельник 28.09', ['coupon received/none - из 25.48', '2026-09-28'], [$brief($m), $m->paymentDate]);
+check('объявление в состоянии «Дефолт» — полный дефолт (купон)', 'coupon received/default - из 21.78', $brief($map('monopoly_default_coupon')));
+check('объявление о погашении идёт с типом REDM/BN — тот же вид выплаты', 'redemption received/default - из 1000', $brief($map('monopoly_default_redemption')));
 
-// --- #7: ca_type без суффикса — то же действие, что и REDM/BN ---
-$redemptionWithSuffix = $redemptionDone;
-$redemptionWithSuffix['ca_type'] = 'REDM/BN';
+echo "\n--- деньги с нарушением ---\n";
+$m = $map('late_full_em_zapad');
+check('ЭМ ЗАПАД: вся сумма, но на день позже срока — выплата полная и поздняя, а не «не выплачено»', 'coupon received/full 12.74 из 12.74 late', $brief($m));
+check('формулировка НРД сохранена', 'Не исполнена эмитентом в срок', $m->sourceNote);
+$m = $map('samolet_redemption_part1');
+check('«Самолёт», первая часть: сумма из текста (269,10), а не плановая 1000 из полей', 'redemption received/partial 269.104907468 из 1000', $brief($m));
+check('состояние у сообщения «Не состоялось», нарушение видно только по пометке', ['N', 'Исполнена ненадлежащим образом'], [$fixtures['samolet_redemption_part1']['data']['state']['code'], $m->sourceNote]);
+check('«Самолёт», вторая часть на следующий день: частичная и поздняя', 'redemption received/partial 730.895092532 из 1000 late', $brief($map('samolet_redemption_part2')));
+$m = $map('mmz_partial_before_due');
+check('ММЗ: часть суммы пришла раньше срока — отдельный признак, не «поздно»', 'coupon received/partial 2.84 из 4.68 before_due', $brief($m));
+check('…деньги поступили 28.09, срок 29.09', ['2026-09-28', '2026-09-29'], [$m->receivedDate, $m->paymentDate]);
+check('ЛКХ: поздняя полная выплата, «О получении»', 'coupon received/full 25.48 из 25.48 late', $brief($map('lkh1_late_received')));
+check('ЛКХ: её же «О передаче»', 'coupon transferred/full 25.48 из 25.48 late', $brief($map('lkh1_late_transferred')));
+check('ЛКХ: выплата после срока полного дефолта (состояние «Дефолт») — деньги всё равно читаются', 'coupon transferred/full 25.48 из 25.48 late', $brief($map('lkh2_transferred_state_D')));
+check('ВЗВТ: частичная выплата на 14-й рабочий день', 'coupon transferred/partial 61.79 из 74.79 late', $brief($map('vzvt_partial_transferred_state_D')));
 
-$r1 = GetNewsMessageMapper::map($receiptPending);
-check('N (пока не наступило) -> null, ждём следующего сообщения', null, $r1);
+echo "\n--- особые случаи ---\n";
+$m = $map('fx_coupon_acron_usd');
+check('валютный выпуск: сумма и плановая — в валюте выплаты (рубли), не в долларах номинала', ['coupon received/full 537.25 из 537.25', 'RUB', 6.37], [$brief($m), $m->currency, $fixtures['fx_coupon_acron_usd']['data']['coupon']['size']]);
+check('два события на одну дату по одной бумаге: «купонный доход»…', ['coupon received/full 0.1 из 0.1', '976513'], [$brief($map('invobl_coupon_fixed')), $map('invobl_coupon_fixed')->actionRef]);
+check('…и «процентный доход» — другое событие НРД', ['coupon received/full 65.21 из 65.21', '1220824'], [$brief($map('invobl_extra_income')), $map('invobl_extra_income')->actionRef]);
+check('MCAL на 100 % номинала — погашение', 'redemption received/full 1000 из 1000', $brief($map('mcal_full_veb')));
+check('MCAL на часть номинала — амортизация', ['amortization received/full 98.77 из 98.77', '2026-09-28'], [$brief($map('mcal_partial_tb3')), $map('mcal_partial_tb3')->paymentDate]);
 
-$r2 = GetNewsMessageMapper::map($transferConfirmed);
-check('"О передаче" без "получении" -> stage=transferred', PaymentMessage::STAGE_TRANSFERRED, $r2?->stage);
-check('"О передаче": execution=full (state=A)', PaymentMessage::EXECUTION_FULL, $r2?->execution);
-check('"О передаче": kind=coupon', PaymentMessage::KIND_COUPON, $r2?->kind);
-check('"О передаче": сумма — payment_size', '51.35', $r2?->amountPerBond);
-check('"О передаче": sourceRef = content_id_out', '16369330854', $r2?->sourceRef);
-check('"О передаче": isin', 'RU000A10CLT1', $r2?->isin);
-check('"О передаче": paymentDate = action_date_plan', '2026-09-30', $r2?->paymentDate);
-check('"О передаче": messageDate = дата из pub_date (без времени)', '2026-09-30', $r2?->messageDate);
+echo "\n--- что пропускается и почему ---\n";
+check('другой вид события (раскрытие информации)', [null, GetNewsMessageMapper::REASON_OTHER_ACTION], [$map('other_action_dscl'), $reason('other_action_dscl')]);
+check('оферта (BPUT) — пока не обрабатывается, даже если это сообщение о деньгах', [null, GetNewsMessageMapper::REASON_OTHER_ACTION], [$map('offer_bput_money'), $reason('offer_bput_money')]);
+check('отмена корпоративного действия', [null, GetNewsMessageMapper::REASON_OTHER_MESSAGE], [$map('cancellation'), $reason('cancellation')]);
 
-$r3 = GetNewsMessageMapper::map($combinedReceivedAndTransferred);
-check('"О получении и передаче" (есть оба слова) -> stage=received', PaymentMessage::STAGE_RECEIVED, $r3?->stage);
-check('объединённое сообщение: execution=full', PaymentMessage::EXECUTION_FULL, $r3?->execution);
-check('объединённое сообщение: сумма купона', '7.95', $r3?->amountPerBond);
+$broken = $fixtures['pair_received'];
+$broken['body_ru'] = str_replace('Текущая выплата по КД', 'Выплата', (string) $broken['body_ru']);
+check('сообщение о деньгах без таблицы «Текущая выплата по КД» — не угадываем, а сообщаем причину', [null, GetNewsMessageMapper::REASON_UNREADABLE], [GetNewsMessageMapper::map($broken), GetNewsMessageMapper::classify($broken)['reason']]);
+$noIsin = $fixtures['pair_received'];
+$noIsin['data']['securities'] = [];
+check('нет ISIN', GetNewsMessageMapper::REASON_NO_KEY_FIELDS, GetNewsMessageMapper::classify($noIsin)['reason']);
+$noId = $fixtures['pair_received'];
+unset($noId['content_id_out'], $noId['id']);
+check('нет идентификатора сообщения', GetNewsMessageMapper::REASON_NO_KEY_FIELDS, GetNewsMessageMapper::classify($noId)['reason']);
+$noPlan = $fixtures['pair_received'];
+unset($noPlan['data']['action_date_plan']);
+check('нет плановой даты — берётся дата по условиям выпуска', '2026-09-30', GetNewsMessageMapper::map($noPlan)->paymentDate);
 
-$r4 = GetNewsMessageMapper::map($redemptionDone);
-check('погашение по графику: kind=redemption', PaymentMessage::KIND_REDEMPTION, $r4?->kind);
-check('погашение: сумма — size_per_security_cur', '1000', $r4?->amountPerBond);
-check('погашение: isin', 'RU000A10G7W6', $r4?->isin);
+echo "\n--- архив ---\n";
+$withEnglish = $fixtures['pair_received'] + ['body_en' => '<table>…</table>', 'title_en' => 'Notification', 'announce_en' => 'Notification'];
+$raw = GetNewsMessageMapper::map($withEnglish)->raw;
+check('в архив идёт сообщение без английских копий текста', [false, false, true, true], [isset($raw['body_en']), isset($raw['title_en']), isset($raw['body_ru']), isset($raw['data'])]);
 
-$r5 = GetNewsMessageMapper::map($amortizationDone);
-check('PRED (НРД зовёт "досрочным", на деле плановая амортизация): kind=amortization', PaymentMessage::KIND_AMORTIZATION, $r5?->kind);
-check('амортизация: сумма в валюте ВЫПЛАТЫ (размер в $ — для графика неважен, платим в рублях)', '0.4221415', $r5?->amountPerBond);
-
-$r6 = GetNewsMessageMapper::map($technicalDefault);
-check('техдефолт (ООО «ЛКХ»): execution=none', PaymentMessage::EXECUTION_NONE, $r6?->execution);
-check('техдефолт: title берётся из title_ru, если announce_ru нет', true, str_contains((string) $r6?->title, 'ЛКХ'));
-check('техдефолт: amountPerBond — плановая сумма (а не ноль/null — размер в сообщении не зависит от исполнения)', '25.48', $r6?->amountPerBond);
-
-$r7 = GetNewsMessageMapper::map($redemptionWithSuffix);
-check('ca_type с суффиксом (REDM/BN) — то же действие, что REDM', PaymentMessage::KIND_REDEMPTION, $r7?->kind);
-
-check('необрабатываемый ca_type (BPUT — оферта, не наша таблица redemptions) -> null', null, GetNewsMessageMapper::map(['ca_type' => 'BPUT', 'data' => ['state' => ['code' => 'A']]]));
-check('необрабатываемый ca_type (DVCA — дивиденды, не облигация) -> null', null, GetNewsMessageMapper::map(['ca_type' => 'DVCA', 'data' => ['state' => ['code' => 'A']]]));
-check('state=C (Отменено) -> null, пока не решаем, что с этим делать', null, GetNewsMessageMapper::map(['ca_type' => 'INTR', 'data' => ['state' => ['code' => 'C']]]));
-check('нет isin -> null, а не падение', null, GetNewsMessageMapper::map(['ca_type' => 'INTR', 'data' => ['state' => ['code' => 'A'], 'action_date_plan' => '2026-09-30', 'securities' => []]]));
+echo "\n--- все образцы разом ---\n";
+$mapped = 0;
+$unreadable = 0;
+foreach ($fixtures as $fixture) {
+    $classified = GetNewsMessageMapper::classify($fixture);
+    $mapped += $classified['message'] !== null ? 1 : 0;
+    $unreadable += $classified['reason'] === GetNewsMessageMapper::REASON_UNREADABLE ? 1 : 0;
+}
+check('из 31 образца 26 — сообщения о выплатах, непрочитанных нет', [31, 26, 0], [count($fixtures), $mapped, $unreadable]);
 
 echo "\n";
 if ($failures === 0) {

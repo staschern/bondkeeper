@@ -225,7 +225,7 @@ final class NotificationDispatcher
             'C5' => $this->buildRatingActionText($payload, $statusText),
             'E1' => $this->buildFnsBlockText($payload, $issuerName, $issuerInn),
             'R1' => $this->buildPaymentReminderText($payload, $issuerName),
-            'A2', 'A4', 'A6', 'B1', 'B2', 'B4', 'B5' => $this->buildPaymentText($eventTypeCode, $payload, $issuerName),
+            'A2', 'A4', 'A6', 'B1', 'B1a', 'B2', 'B4', 'B5', 'C2' => $this->buildPaymentText($eventTypeCode, $payload, $issuerName),
             'B2a' => $this->buildNoReceiptText($payload, $issuerName),
             default => '<b>🔔 Новое событие:</b>' . "\n" . BotFormatting::escapeHtml("Эмитент «{$issuerName}»."),
         };
@@ -244,11 +244,12 @@ final class NotificationDispatcher
      */
     private function buildPaymentReminderText(array $payload, string $issuerName): string
     {
+        $currency = isset($payload['currency']) ? (string) $payload['currency'] : null;
         $parts = [];
         foreach ((array) ($payload['payments'] ?? []) as $payment) {
             $amount = $payment['amount_planned'] ?? null;
             $parts[] = self::paymentKindName((string) ($payment['kind'] ?? ''))
-                . ' — ' . ($amount !== null ? BotFormatting::formatMoney((string) $amount) . ' на бумагу' : 'сумма пока не определена');
+                . ' — ' . ($amount !== null ? self::money((string) $amount, $currency) . ' на бумагу' : 'сумма пока не определена');
         }
         $paymentDate = (string) ($payload['payment_date'] ?? '');
         $effectiveDate = (string) ($payload['effective_date'] ?? $paymentDate);
@@ -262,8 +263,14 @@ final class NotificationDispatcher
     }
 
     /**
-     * Выплата по сообщению НРД: получена (A2/A4/A6), частично (B1), не в
-     * срок (B2), доплата (B4), исполнена после просрочки (B5).
+     * Выплата по сообщению НРД: получена (A2/A4/A6), частично (B1), часть
+     * до срока (B1a), не в срок (B2), доплата (B4), исполнена после
+     * просрочки (B5), объявлен дефолт (C2).
+     *
+     * Суммы — в валюте выплаты из сообщения (payload.currency): у
+     * валютного выпуска деньги обычно приходят в рублях. Если НРД дал
+     * формулировку о неисполнении, она приводится дословно — клиент видит,
+     * как выплату оценил сам депозитарий.
      *
      * @param array<string, mixed> $payload
      */
@@ -277,38 +284,58 @@ final class NotificationDispatcher
         };
         $what = self::mbUcfirst(self::paymentKindName($kind)) . ($kind === 'coupon' ? ' за ' : ' ')
             . BotFormatting::formatDate((string) ($payload['payment_date'] ?? ''));
+        $currency = isset($payload['currency']) ? (string) $payload['currency'] : null;
         $planned = $payload['amount_planned'] ?? null;
         $actual = $payload['amount_actual'] ?? null;
-        $ofPlanned = $planned !== null ? ' из ' . BotFormatting::formatMoney((string) $planned) : '';
+        $tranche = $payload['tranche_amount'] ?? null;
+        $dueDate = (string) ($payload['effective_date'] ?? $payload['payment_date'] ?? '');
+        $ofPlanned = $planned !== null ? ' из ' . self::money((string) $planned, $currency) : '';
+
         $deadline = '';
         if (($payload['full_default_date'] ?? null) !== null) {
-            $deadline = ' Полный дефолт наступит, если долг не будет закрыт до ' . BotFormatting::formatDate((string) $payload['full_default_date']);
-            if (($payload['working_days_to_default'] ?? null) !== null) {
-                $deadline .= ' (осталось рабочих дней: ' . (int) $payload['working_days_to_default'] . ')';
+            $daysLeft = $payload['working_days_to_default'] ?? null;
+            // Сообщение пришло уже после этого срока (старая просрочка, о которой мы узнали поздно).
+            if ((string) ($payload['message_date'] ?? '') > (string) $payload['full_default_date']) {
+                $deadline = ' Срок, после которого наступает полный дефолт, истёк ' . BotFormatting::formatDate((string) $payload['full_default_date']) . '.';
+            } else {
+                $deadline = ' Полный дефолт наступит, если долг не будет закрыт до ' . BotFormatting::formatDate((string) $payload['full_default_date'])
+                    . ($daysLeft !== null ? ' (осталось рабочих дней: ' . (int) $daysLeft . ')' : '') . '.';
             }
-            $deadline .= '.';
+        }
+        $note = ($payload['source_note'] ?? null) !== null && (string) $payload['source_note'] !== ''
+            ? ' Отметка НРД: «' . BotFormatting::escapeHtml(mb_strtolower((string) $payload['source_note'])) . '».'
+            : '';
+        $lateDates = '';
+        if (($payload['received_date'] ?? null) !== null && $dueDate !== '' && (string) $payload['received_date'] > $dueDate) {
+            $lateDates = ' Срок был ' . BotFormatting::formatDate($dueDate) . ', деньги поступили ' . BotFormatting::formatDate((string) $payload['received_date']) . '.';
         }
 
         [$emoji, $body] = match ($eventTypeCode) {
             'B1' => ['🔴', "{$what} выплачен{$ending} частично: получено "
-                . ($actual !== null ? BotFormatting::formatMoney((string) $actual) : 'меньше положенного') . $ofPlanned . ' на бумагу.' . $deadline],
+                . ($actual !== null ? self::money((string) $actual, $currency) : 'меньше положенного') . $ofPlanned . ' на бумагу.' . $note . $deadline],
+            'B1a' => ['🟡', "{$what}: до срока получена часть суммы — "
+                . ($actual !== null ? self::money((string) $actual, $currency) : 'меньше положенного') . $ofPlanned . ' на бумагу.'
+                . ($dueDate !== '' ? ' Срок выплаты — ' . BotFormatting::formatDate($dueDate) . '.' : '') . $note],
             'B2' => ['🔴', "{$what} не выплачен{$ending} в срок." . $deadline],
             'B4' => ['🟡', "{$what}: доплата"
-                . (($payload['tranche_amount'] ?? null) !== null ? ' ' . BotFormatting::formatMoney((string) $payload['tranche_amount']) : '')
-                . ($actual !== null ? ', всего получено ' . BotFormatting::formatMoney((string) $actual) . $ofPlanned . ' на бумагу' : '') . '.' . $deadline],
+                . ($tranche !== null ? ' ' . self::money((string) $tranche, $currency) : '')
+                . ($actual !== null ? ', всего получено ' . self::money((string) $actual, $currency) . $ofPlanned . ' на бумагу' : '') . '.' . $deadline],
             'B5' => ['✅', "{$what} выплачен{$ending} полностью после просрочки"
-                . ($actual !== null ? ': ' . BotFormatting::formatMoney((string) $actual) . ' на бумагу' : '') . '.'],
-            default => ['✅', "{$what} получен{$ending} НРД"
-                . ($actual !== null ? ': ' . BotFormatting::formatMoney((string) $actual) . ' на бумагу' : '') . '.'],
+                . ($actual !== null ? ': ' . self::money((string) $actual, $currency) . ' на бумагу' : '') . '.' . $lateDates],
+            'C2' => ['🔴', "{$what}: НРД объявил дефолт — выплата не исполнена в течение 10 рабочих дней после срока"
+                . ($dueDate !== '' ? ' (' . BotFormatting::formatDate($dueDate) . ')' : '') . '.'],
+            default => ['✅', ($payload['extra'] ?? false) === true
+                ? "{$what}: получена ещё одна выплата" . ($tranche !== null ? ' — ' . self::money((string) $tranche, $currency) . ' на бумагу' : '') . '.'
+                : "{$what} получен{$ending} НРД" . ($actual !== null ? ': ' . self::money((string) $actual, $currency) . ' на бумагу' : '') . '.'],
         };
 
         return "<b>{$emoji} Выплаты:</b>" . "\n" . self::bondHeader($payload, $issuerName) . "\n" . $body;
     }
 
     /**
-     * B2a — к вечеру дня выплаты (и повторно утром) сообщения «получено
-     * НРД» нет. Это ещё не невыплата: НРД вправе сообщить и на следующий
-     * рабочий день — поэтому текст прямо это оговаривает.
+     * B2a — в полдень следующего рабочего дня после выплаты НРД не сообщил
+     * о поступлении денег. Это ещё не невыплата: о неисполнении НРД
+     * объявляет в тот же день, чаще после 17:00, — текст это оговаривает.
      *
      * @param array<string, mixed> $payload
      */
@@ -318,16 +345,26 @@ final class NotificationDispatcher
             static fn (array $payment): string => self::paymentKindName((string) ($payment['kind'] ?? '')),
             (array) ($payload['payments'] ?? []),
         ));
-        $morning = ($payload['check'] ?? '') === 'morning';
-        $still = $morning ? 'до сих пор не поступили' : 'пока не поступили';
-        $caveat = $morning
-            ? 'Это ещё не подтверждённая невыплата: сегодня НРД должен сообщить, исполнена выплата, исполнена частично или не исполнена.'
-            : 'Это ещё не означает невыплату: сообщение о получении может выйти на следующий рабочий день.';
 
-        $body = "Деньги от эмитента по выплате ({$kinds}) за " . BotFormatting::formatDate((string) ($payload['payment_date'] ?? ''))
-            . " {$still} в НРД. {$caveat}";
+        $body = "По выплате ({$kinds}) за " . BotFormatting::formatDate((string) ($payload['payment_date'] ?? ''))
+            . ' НРД пока не сообщил о поступлении денег от эмитента, хотя обычно к этому времени сообщение уже выходит.'
+            . ' Это ещё не подтверждённая невыплата: если деньги не пришли, НРД объявит о неисполнении сегодня, чаще после 17:00.';
 
         return '<b>🟡 Выплаты:</b>' . "\n" . self::bondHeader($payload, $issuerName) . "\n" . $body;
+    }
+
+    /**
+     * Сумма с валютой. Рубли — как везде в боте («1 000.00 ₽»); для
+     * остальных валют — код: в графике суммы валютного выпуска хранятся в
+     * валюте номинала, и подписывать их знаком рубля нельзя.
+     */
+    private static function money(string $amount, ?string $currency): string
+    {
+        if ($currency === null || $currency === '' || $currency === 'RUB' || $currency === 'SUR') {
+            return BotFormatting::formatMoney($amount);
+        }
+
+        return number_format((float) $amount, 2, '.', ' ') . ' ' . BotFormatting::escapeHtml($currency);
     }
 
     /** Название бумаги и ИНН/ISIN внешние (из нашей же БД, но исходно — с сайта Мосбиржи) — экранируются. @param array<string, mixed> $payload */

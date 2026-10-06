@@ -31,7 +31,7 @@ src/Database.php                     — подключение к MySQL (PDO)
 src/Iss/IssClient.php                — HTTP-клиент ISS API Мосбиржи
 src/Iss/SecuritiesImporter.php       — issuers/securities/redemptions(scheduled_maturity)
 src/Iss/IssuerNameShortener.php      — issuers.short_name из full_name (эвристика: сокращение ОПФ — ПАО/ООО/АО/... — по словарю, оба формата ИСС: ОПФ префиксом и хвостом в скобках)
-src/Iss/BondizationImporter.php      — coupons/amortizations
+src/Iss/BondizationImporter.php      — coupons/amortizations; листает `bondization` постранично (limit=100, start по cursor) — один запрос отдавал только первые 20 строк и обрезал график у 1551 бумаги из 2864, см. docs/STAGE5_PAYMENTS.md, раздел 7
 src/Fns/NalogBiClient.php            — HTTP-клиент service.nalog.ru/bi.do (блокировки счетов)
 src/Fns/FnsBlocksImporter.php        — fns_blocks, issuers.is_fns_blocked
 src/Iss/OffersImporter.php           — offers: дата — bondization/offers, has_buyback_date/offer_type put/call/unknown — доска-эндпоинт (переписано 14 сентября 2026, см. docs/STAGE1_POSTPROCESSING.md)
@@ -125,25 +125,33 @@ tests/test_default_grade_clears_outlook.php — офлайн-проверка Ra
 tests/test_root_priority_conflict.php — офлайн-проверка приоритета ИНН/связки над сопоставлением по названию ВНУТРИ одного прогона NkrImporter/ExpertRaImporter/AcraImporter (23 проверки)
 tests/test_acra_news.php             — офлайн-проверка новостей АКРА (46 проверок): AcraNewsTitleParser::extractGrade() — рейтинг только с "(RU)"/после "на уровне"; AcraNewsImporter — листание ленты, ипотечные ЦБ не пишутся; AcraNewsRecheck — разовое исправление уже записанных новостей
 database/027_payment_events.sql      — миграция: типы событий R1 (напоминание о выплате) и B2b (от НРД нет сообщений — только администратору), этап 5, см. docs/STAGE5_PAYMENTS.md
+database/028_payment_events_partial_before_due.sql — миграция: тип события B1a (часть суммы пришла до срока, жёлтое), уточнено название B2a (проверка теперь одна, в 12:02 мск следующего рабочего дня), см. docs/STAGE5_PAYMENTS.md
 config/working_calendar.php          — производственный календарь РФ (2026, 2027): праздничные будни и рабочие субботы; пополняется раз в год
 config/payments.example.php          — образец config/payments.php: включение напоминаний и проверок выплат (по умолчанию всё выключено)
 src/Payments/WorkingCalendar.php     — рабочие дни: день исполнения выплаты (перенос с выходного), +N рабочих дней (срок полного дефолта), рабочих дней между датами
-src/Payments/PaymentMessage.php      — сообщение о выплате в нашем виде (ISIN, вид, дата по графику, этап получено/передано, исполнение полное/частичное/нет, сумма); в него будет переводиться сообщение GetNews
-src/Payments/PaymentProcessor.php    — обработка сообщения о выплате: архив raw_messages, поиск выплаты по ISIN и дате, статус/факт в графике, история выплаты (event_stories), события A2–A7, B1, B2, B4, B5
-src/Payments/PaymentWatch.php        — события, которые считаем сами по графику: R1 накануне выплаты, B2a «денег пока нет» (вечер дня выплаты и утро следующего рабочего дня), B2b «от НРД нет ничего»
+src/Payments/PaymentMessage.php      — сообщение о выплате в нашем виде (ISIN, вид, дата по графику, этап получено/передано, исполнение полное/частичное/не исполнено в срок/дефолт, сумма и валюта выплаты, плановая сумма источника, признаки «позже срока»/«частично до срока», даты поступления/передачи, идентификатор действия НРД)
+src/Payments/PaymentProcessor.php    — обработка сообщения о выплате: архив raw_messages, поиск выплаты по ISIN и дате (locate() — то же самое без записи, для --dry-run), статус/факт в графике, история выплаты (event_stories), события A2–A7, B1, B1a, B2, B4, B5, C2; погашение ищет строку redemptions, а при нулевой сумме — amortizations той же даты; MCAL — погашение, если выплата 100% номинала, иначе амортизация; тихая загрузка (silent) — события пишутся, но клиентам не уходят
+src/Payments/PaymentWatch.php        — события, которые считаем сами по графику: R1 накануне выплаты, B2a «денег пока нет» (одна проверка, в 12:02 мск следующего рабочего дня — раньше было два момента), B2b «от НРД нет ничего» (19:00 мск); тот же фолбэк redemptions→amortizations при нулевой сумме
 src/Payments/PaymentsConfig.php      — чтение config/payments.php (нет файла — всё выключено)
 bin/payment_reminders.php            — напоминания о выплатах на завтра (по расписанию, 10:00 мск; --dry-run — показать список)
-bin/payment_checks.php               — проверки «сообщения о получении денег нет» (--at=evening в 19:00 мск, --at=morning в 10:00 мск; --dry-run)
+bin/payment_checks.php               — проверки «сообщения о получении денег нет»: --at=noon (12:02 мск следующего рабочего дня) и --at=evening (19:00 мск); --at=morning убран — НРД сообщает о деньгах на следующий день, а не вечером дня выплаты
 tests/test_working_calendar.php      — офлайн-проверка WorkingCalendar (25 проверок: 247 рабочих дней в 2026 и 2027, переносы, сроки дефолта на реальных кейсах)
-tests/test_payments.php              — офлайн-проверка этапа 5 на SQLite (66 проверок: PaymentProcessor на кейсах СибАвтоТранс/КЛВЗ/ВЗВТ/ЕвроТранс/Нэппи Клаб, PaymentWatch, тексты и получатели рассылки)
+tests/test_payments.php              — офлайн-проверка этапа 5 на SQLite (64 проверки: PaymentProcessor и PaymentWatch на кейсах из исследования, рассылка — тексты и получатели по бумаге/эмитенту)
 src/Payments/GetNewsConfig.php       — login/password для API НРД (nsddata.ru) из config/nsd_api.php, не коммитится, см. .example рядом
-src/Payments/GetNewsClientInterface.php — интерфейс клиента GetNews (для подмены фейком в будущих офлайн-тестах разбора сообщений)
+src/Payments/GetNewsClientInterface.php — интерфейс клиента GetNews (для подмены фейком в офлайн-тестах разбора сообщений и для --replay у bin/poll_getnews.php)
 src/Payments/GetNewsClient.php       — HTTP-клиент GetNews: POST /api/auth/login → Bearer-токен, обновление по /api/auth/refresh на 401, GET /api/get/news (filter/limit/skip); адрес и формат подтверждены вживую 05.10.2026, см. docs/STAGE5_PAYMENTS.md
 config/nsd_api.example.php           — шаблон config/nsd_api.php (login/password от НРД, не коммитить)
-bin/debug_getnews.php                — разведка (без записи в БД): проверка токена + вывод реальных ca_type/data.state.code за выбранное окно — нужно для разбора сообщений в PaymentProcessor (см. STAGE5_PAYMENTS.md, раздел 9)
-src/Payments/GetNewsMessageMapper.php — перевод сырого сообщения GetNews в PaymentMessage: state.code (A/T/N/C), получено/передано по тексту заголовка, ca_type → купон/амортизация/погашение; подтверждён на реальных сообщениях тестового доступа НРД (05.10.2026), см. STAGE5_PAYMENTS.md
-tests/test_getnews_message_mapper.php — офлайн-проверка GetNewsMessageMapper (25 проверок) на урезанных копиях РЕАЛЬНЫХ сообщений (суммы/даты/content_id_out настоящие)
-bin/poll_getnews.php                 — опрос GetNews: получить → GetNewsMessageMapper → PaymentProcessor::process(); --dry-run всегда доступен и ничего не пишет, реальная запись — только при config/payments.php: getnews_polling=true (настоящие уведомления клиентам по A2/A4/A6/B1/B2/B4/B5), см. STAGE5_PAYMENTS.md
+bin/debug_getnews.php                — разведка (без записи в БД): проверка токена + вывод реальных ca_type/data.state.code за выбранное окно, листает страницы через --skip
+src/Payments/GetNewsPager.php        — постраничная загрузка ленты GetNews (до 1000 сообщений за запрос — больше API не отдаёт); отсекает повторы на стыке страниц по content_id_out, если новое сообщение сдвинуло окно между запросами
+bin/dump_getnews.php                 — исчерпывающая выгрузка окна дат через GetNewsPager в var/getnews_dump_*.json (части), для исследования; английские поля по умолчанию убраны
+src/Payments/GetNewsBody.php         — разбор текста сообщения (body_ru, HTML-таблицы): сумма/даты поступления-передачи из таблицы «Текущая выплата по КД», формулировка неисполнения из «Сведения о неисполнении»
+src/Payments/GetNewsMessageMapper.php — перевод сырого сообщения GetNews в PaymentMessage: вид сообщения — по заголовку («О получении…»/«О получении и передаче…»/«О передаче…»/«О корпоративном действии…»), сумма и даты — из GetNewsBody, data.state только для объявлений (T — не исполнено в срок, D — дефолт); переписан 05.10.2026 — прежняя версия судила по data.state и не видела 26% реальных выплат (снимок состояния на момент публикации, не признак получения денег), см. docs/STAGE5_PAYMENTS.md, раздел 3
+tests/test_getnews_message_mapper.php — офлайн-проверка GetNewsMessageMapper (54 проверки) на 31 настоящем сообщении НРД из tests/fixtures/getnews_messages.json
+tests/test_getnews_pager.php         — офлайн-проверка GetNewsPager (18 проверок): предохранитель maxPages, размер страницы, повторы на стыке страниц, повторное использование объекта
+tests/test_getnews_pipeline.php      — офлайн-проверка всего пути GetNews-сообщение → PaymentProcessor → текст уведомления клиенту (66 проверок)
+tests/test_bondization_paging.php    — офлайн-проверка пагинации BondizationImporter по графику с биржи (11 проверок: несколько страниц, граничные случаи с cursor и без)
+tests/fixtures/getnews_messages.json — 31 настоящее сообщение НРД из выгрузки тестового доступа (английские поля убраны), общие образцы для тестов разбора и конвейера
+bin/poll_getnews.php                 — опрос GetNews: GetNewsPager → GetNewsMessageMapper → PaymentProcessor::process(); закладка var/getnews_poll_state.json (читает только на OVERLAP_HOURS глубже последнего обработанного сообщения), сообщения сортируются старые→новые перед обработкой; --dry-run (сверка по базе, ничего не пишет), --quiet (первая загрузка без уведомлений клиентам), --replay=файл1,файл2 (прогон по сохранённой выгрузке); реальная запись — только при config/payments.php: getnews_polling=true, см. docs/STAGE5_PAYMENTS.md
 ```
 
 ## Запуск
@@ -181,6 +189,7 @@ php bin/apply_2026_09_review_decisions.php --apply   # разовые решен
 mysql -u root -p bondkeeper < database/026_outlook_indefinite.sql
 php bin/normalize_stored_ratings.php --apply   # разовое выравнивание сохранённых рейтингов: кириллица, отзыв НРА прочерком, прогноз у отозванных
 mysql -u root -p bondkeeper < database/027_payment_events.sql   # типы событий выплат R1/B2b, этап 5, см. docs/STAGE5_PAYMENTS.md
+mysql -u root -p bondkeeper < database/028_payment_events_partial_before_due.sql   # тип события B1a, уточнено B2a, см. docs/STAGE5_PAYMENTS.md
 
 php bin/seed_market.php        # issuers, securities, redemptions(scheduled_maturity)
 php bin/seed_bondization.php   # coupons, amortizations

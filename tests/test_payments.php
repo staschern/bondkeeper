@@ -82,14 +82,14 @@ $db->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
 $db->sqliteCreateFunction('NOW', static fn (): string => date('Y-m-d H:i:s'), 0);
 
 $db->exec('CREATE TABLE issuers (id INTEGER PRIMARY KEY, short_name TEXT, inn TEXT)');
-$db->exec("CREATE TABLE securities (id INTEGER PRIMARY KEY, isin TEXT, issuer_id INTEGER, short_name TEXT, status TEXT DEFAULT 'active')");
+$db->exec("CREATE TABLE securities (id INTEGER PRIMARY KEY, isin TEXT, issuer_id INTEGER, short_name TEXT, currency TEXT DEFAULT 'RUB', status TEXT DEFAULT 'active')");
 $schedule = "id INTEGER PRIMARY KEY AUTOINCREMENT, security_id INTEGER, issuer_id INTEGER, %s TEXT, value_per_bond TEXT, actual_value_per_bond TEXT, full_default_date_planned TEXT, status TEXT DEFAULT 'planned'";
 $db->exec('CREATE TABLE coupons (' . sprintf($schedule, 'period_end_date') . ')');
 $db->exec('CREATE TABLE amortizations (' . sprintf($schedule, 'payment_date_planned') . ')');
 $db->exec('CREATE TABLE redemptions (' . sprintf($schedule, 'payment_date_planned') . ", redemption_type TEXT DEFAULT 'scheduled_maturity')");
 $db->exec("CREATE TABLE event_types (code TEXT PRIMARY KEY, default_priority TEXT, notify_client INTEGER)");
 $db->exec("INSERT INTO event_types VALUES ('A2','green',1),('A3','green',0),('A4','info',1),('A5','info',0),('A6','info',1),('A7','info',0),
-    ('B1','red',1),('B2','red',1),('B2a','yellow',1),('B2b','yellow',0),('B4','yellow',1),('B5','green',1),('R1','info',1),('C5','yellow',1)");
+    ('B1','red',1),('B1a','yellow',1),('B2','red',1),('B2a','yellow',1),('B2b','yellow',0),('B4','yellow',1),('B5','green',1),('C2','critical',1),('R1','info',1),('C5','yellow',1)");
 $db->exec("CREATE TABLE raw_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT, source_ref TEXT, isin TEXT, raw_payload TEXT, processed_at TEXT,
     processing_status TEXT, processing_error TEXT, retry_count INTEGER DEFAULT 0, last_retry_at TEXT)");
 $db->exec("CREATE TABLE event_stories (id INTEGER PRIMARY KEY AUTOINCREMENT, security_id INTEGER, coupon_id INTEGER, amortization_id INTEGER, redemption_id INTEGER,
@@ -199,7 +199,7 @@ check('срок полного дефолта — 26.01.2026', '2026-01-26', $co
 $r = $processor->process($message('RU000A000005', 'coupon', '2026-01-12', 'received', 'full', null, '2026-01-19'));
 check('19.01 выплата без суммы в сообщении → B5, факт = плану', [['B5'], '20.7500'], [$r['events'], $coupon(50, '2026-01-12')['actual_value_per_bond']]);
 
-echo "\n--- привязка к графику, повторы, неизвестная бумага ---\n";
+echo "\n--- привязка к графику, повторы, чужая бумага ---\n";
 $addCoupon(60, '2026-10-10', null); // суббота, флоатер: сумма в графике ещё не известна
 $r = $processor->process($message('RU000A000006', 'coupon', '2026-10-12', 'received', 'full', '11.5', '2026-10-12', 'msg-weekend'));
 check('в графике суббота 10.10, источник назвал понедельник 12.10 → та же выплата', ['processed', ['A2']], [$r['result'], $r['events']]);
@@ -208,14 +208,14 @@ $r = $processor->process($message('RU000A000006', 'coupon', '2026-10-12', 'recei
 check('то же сообщение второй раз → повтор, событий нет', ['duplicate', []], [$r['result'], $r['events']]);
 $r = $processor->process($message('RU000A000006', 'coupon', '2026-10-12', 'received', 'full', '11.5', '2026-10-13'));
 check('другое сообщение о том же получении → изменений нет', 'no_change', $r['result']);
-$r = $processor->process($message('RU000A000006', 'coupon', '2027-03-15', 'received', 'full', '11.5', '2027-03-15'));
-check('выплаты на такую дату в графике нет → не сопоставлено', 'unmatched', $r['result']);
-$r = $processor->process($message('RU000A999999', 'coupon', '2026-10-12', 'received', 'full', '1', '2026-10-12', 'msg-unknown'));
-check('неизвестный ISIN → не сопоставлено, сообщение сохранено с причиной', ['unmatched', 'failed'], [$r['result'], $db->query("SELECT processing_status FROM raw_messages WHERE source_ref = 'msg-unknown'")->fetchColumn()]);
-$db->exec("INSERT INTO securities (id, isin, issuer_id, short_name) VALUES (61, 'RU000A999999', 6, 'Новая БО-01')");
-$db->exec("INSERT INTO coupons (security_id, issuer_id, period_end_date, value_per_bond) VALUES (61, 6, '2026-10-12', '1.0000')");
-$r = $processor->process($message('RU000A999999', 'coupon', '2026-10-12', 'received', 'full', '1', '2026-10-12', 'msg-unknown'));
-check('бумага появилась в базе → то же сообщение обрабатывается со второй попытки', ['processed', 1], [$r['result'], (int) $db->query("SELECT retry_count FROM raw_messages WHERE source_ref = 'msg-unknown'")->fetchColumn()]);
+$r = $processor->process($message('RU000A999999', 'coupon', '2026-10-12', 'received', 'full', '1', '2026-10-12', 'msg-foreign'));
+check('бумаги нет в базе → «чужая»: не ошибка, в архив не пишется', ['foreign', 0], [$r['result'], (int) $db->query("SELECT COUNT(*) FROM raw_messages WHERE source_ref = 'msg-foreign'")->fetchColumn()]);
+$r = $processor->process($message('RU000A000006', 'coupon', '2027-03-15', 'received', 'full', '11.5', '2027-03-15', 'msg-gap'));
+check('бумага наша, выплаты на такую дату в графике нет → не сопоставлено, сообщение сохранено с причиной', ['unmatched', false, 'failed'],
+    [$r['result'], $r['retry'], $db->query("SELECT processing_status FROM raw_messages WHERE source_ref = 'msg-gap'")->fetchColumn()]);
+$db->exec("INSERT INTO coupons (security_id, issuer_id, period_end_date, value_per_bond) VALUES (60, 6, '2027-03-15', '11.5000')");
+$r = $processor->process($message('RU000A000006', 'coupon', '2027-03-15', 'received', 'full', '11.5', '2027-03-15', 'msg-gap'));
+check('выплата появилась в графике → то же сообщение обрабатывается со второй попытки', ['processed', 1], [$r['result'], (int) $db->query("SELECT retry_count FROM raw_messages WHERE source_ref = 'msg-gap'")->fetchColumn()]);
 check('в архиве сырых сообщений — исходный вид и отметка источника', ['nsd', '{"example":true}'], array_values($db->query("SELECT source, raw_payload FROM raw_messages WHERE source_ref = 'msg-weekend'")->fetch()));
 
 echo "\n--- напоминание накануне выплаты ---\n";
@@ -239,27 +239,27 @@ check('в четверг напоминаний о субботе нет (сут
 check('понедельник 12.10: напоминание о вторнике — купон и погашение', ['coupon', 'redemption'], array_column($watch->remind('2026-10-12', false)['items'][0]['payments'], 'kind'));
 $watch->remind('2026-10-12');
 
-echo "\n--- денег пока нет: вечер, утро, сообщение администратору ---\n";
-check('суббота 10.10 — нерабочий день, вечерняя проверка ничего не делает', 0, count($watch->checkNoReceipt('2026-10-10', PaymentWatch::CHECK_EVENING, true)['items']));
-$adminOnly = $watch->checkNoReceipt('2026-10-12', PaymentWatch::CHECK_EVENING, false);
-check('режим «только администратору»: бумага в списке, событий клиентам нет', [[70], 0], [array_map('intval', array_column($adminOnly['items'], 'security_id')), (int) $db->query("SELECT COUNT(*) FROM events WHERE event_type_code = 'B2a'")->fetchColumn()]);
-$evening = $watch->checkNoReceipt('2026-10-12', PaymentWatch::CHECK_EVENING, true);
-check('понедельник 12.10, 19:00: субботняя выплата исполняется сегодня, денег нет → жёлтое B2a', [1, 'evening'], [$evening['created'], json_decode((string) $db->query("SELECT payload_json FROM events WHERE event_type_code = 'B2a'")->fetchColumn(), true)['check']]);
-check('повторный запуск вечером — без дублей', 0, $watch->checkNoReceipt('2026-10-12', PaymentWatch::CHECK_EVENING, true)['created']);
-check('в понедельник вечером администратору ещё не о чем сообщать (пятничных выплат без сообщений нет)', 0, $watch->checkSilence('2026-10-12')['created']);
-$morning = $watch->checkNoReceipt('2026-10-13', PaymentWatch::CHECK_MORNING, true);
-check('вторник 13.10, утро: денег всё ещё нет → B2a повторно', [1, 2], [$morning['created'], (int) $db->query("SELECT COUNT(*) FROM events WHERE event_type_code = 'B2a' AND security_id = 70")->fetchColumn()]);
+echo "\n--- НРД не сообщил о деньгах: полдень следующего рабочего дня, вечером — администратору ---\n";
+check('суббота 10.10 — нерабочий день, проверка ничего не делает', 0, count($watch->checkNoReceipt('2026-10-10', true)['items']));
+check('понедельник 12.10 — день исполнения субботней выплаты: проверять ещё рано, НРД сообщает на следующий день', 0, count($watch->checkNoReceipt('2026-10-12', true)['items']));
+$adminOnly = $watch->checkNoReceipt('2026-10-13', false);
+check('вторник 13.10, режим «только администратору»: бумага в списке, событий клиентам нет', [[70], 0],
+    [array_map('intval', array_column($adminOnly['items'], 'security_id')), (int) $db->query("SELECT COUNT(*) FROM events WHERE event_type_code = 'B2a'")->fetchColumn()]);
+$noon = $watch->checkNoReceipt('2026-10-13', true);
+$b2a = json_decode((string) $db->query("SELECT payload_json FROM events WHERE event_type_code = 'B2a'")->fetchColumn(), true);
+check('вторник 13.10, 12:02: по субботней выплате (исполнение в понедельник) сообщения нет → жёлтое B2a', [1, 'noon', '2026-10-12', '2026-10-10'],
+    [$noon['created'], $b2a['check'], $b2a['due_date'], $b2a['payment_date']]);
+check('повторный запуск — без дублей', [0, 1], [$watch->checkNoReceipt('2026-10-13', true)['created'], $watch->checkNoReceipt('2026-10-13', true)['existing']]);
 
-// Во вторник по купону приходит «не исполнена в срок», по амортизации — ничего.
+// Во вторник после 17:00 НРД объявляет: купон не исполнен в срок. По амортизации — ничего.
 $processor->process($message('RU000A000007', 'coupon', '2026-10-10', 'received', 'none', null, '2026-10-13'));
 $silence = $watch->checkSilence('2026-10-13');
-check('вторник вечером: по амортизации от НРД нет вообще ничего → B2b и строка администратору', [1, ['amortization']], [$silence['created'], array_column($silence['items'][0]['payments'], 'kind')]);
+check('вторник, 19:00: по амортизации от НРД нет вообще ничего → B2b и строка администратору', [1, ['amortization']], [$silence['created'], array_column($silence['items'][0]['payments'], 'kind')]);
 check('строка для администратора называет бумагу и вид выплаты', true, str_contains(PaymentWatch::adminLines($silence['items'])[0], 'Тихий БО-01 (RU000A000007), Тихий эмитент: амортизация'));
 check('повторная проверка — администратору второй раз не сообщается', [0, []], [$watch->checkSilence('2026-10-13')['created'], $watch->checkSilence('2026-10-13')['items']]);
-$tuesdayEvening = $watch->checkNoReceipt('2026-10-13', PaymentWatch::CHECK_EVENING, false);
-check('вторник вечером: в списке «денег пока нет» — вторничные выплаты второй бумаги', [71], array_map('intval', array_column($tuesdayEvening['items'], 'security_id')));
+check('в среду 14.10 в списке — вторничные выплаты второй бумаги', [71], array_map('intval', array_column($watch->checkNoReceipt('2026-10-14', false)['items'], 'security_id')));
 $processor->process($message('RU000A000071', 'coupon', '2026-10-13', 'received', 'full', '8.5', '2026-10-13'));
-check('после «получено» по купону в списке остаётся только погашение', ['redemption'], array_column($watch->checkNoReceipt('2026-10-13', PaymentWatch::CHECK_EVENING, false)['items'][0]['payments'], 'kind'));
+check('после «получено» по купону в списке остаётся только погашение', ['redemption'], array_column($watch->checkNoReceipt('2026-10-14', false)['items'][0]['payments'], 'kind'));
 check('календарь без нужного года — предупреждение администратору', [null, true], [$watch->calendarGapWarning('2026-10-13'), str_contains((string) $watch->calendarGapWarning('2027-12-20'), '2028')]);
 
 echo "\n--- рассылка: тексты и получатели ---\n";
@@ -285,10 +285,8 @@ check('напоминание: заголовок с эмитентом, бум�
 check('напоминание о выплате в выходной называет день поступления денег', true, str_contains($find('Завтра, 10.10.26'), 'Дата выпадает на выходной — деньги должны поступить 12.10.26.'));
 check('напоминание о выплате в рабочий день — без оговорки про выходной', false, str_contains($find('Завтра, 13.10.26'), 'выходной'));
 check('«купон получен»', true, str_contains($all, "<b>✅ Выплаты:</b>\nТихий эмитент · Тихий БО-02 (RU000A000071)\nКупон за 13.10.26 получен НРД: 8.50 ₽ на бумагу."));
-check('жёлтое вечернее: «пока не поступили» и оговорка, что это ещё не невыплата', true,
-    str_contains($find('пока не поступили'), 'Деньги от эмитента по выплате (купон, амортизация) за 10.10.26 пока не поступили в НРД. Это ещё не означает невыплату'));
-check('жёлтое утреннее: «до сих пор не поступили» и ожидание раскрытия НРД сегодня', true,
-    str_contains($find('до сих пор не поступили'), 'до сих пор не поступили в НРД. Это ещё не подтверждённая невыплата: сегодня НРД должен сообщить'));
+check('жёлтое: НРД не сообщил о деньгах, с оговоркой, что это ещё не невыплата', true,
+    str_contains($find('пока не сообщил'), "<b>🟡 Выплаты:</b>\nТихий эмитент · Тихий БО-01 (RU000A000007)\nПо выплате (купон, амортизация) за 10.10.26 НРД пока не сообщил о поступлении денег от эмитента, хотя обычно к этому времени сообщение уже выходит. Это ещё не подтверждённая невыплата: если деньги не пришли, НРД объявит о неисполнении сегодня, чаще после 17:00."));
 check('красное «не выплачен в срок» со сроком полного дефолта', true,
     str_contains($find('Купон за 10.10.26 не выплачен'), 'Купон за 10.10.26 не выплачен в срок. Полный дефолт наступит, если долг не будет закрыт до 26.10.26 (осталось рабочих дней: 9).'));
 check('B2b клиентам не уходит', '', $find('Нет сообщений НРД'));

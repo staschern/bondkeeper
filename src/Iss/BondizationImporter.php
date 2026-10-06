@@ -42,6 +42,11 @@ use PDO;
  */
 final class BondizationImporter
 {
+    /** Больше 100 строк на страницу bondization не отдаёт (допустимые значения limit: 20, 50, 100). */
+    private const SCHEDULE_PAGE_SIZE = 100;
+    /** Предохранитель: 2000 выплат на бумагу — заведомо больше любого реального графика. */
+    private const SCHEDULE_MAX_PAGES = 20;
+
     private int $processed = 0;
     private int $couponsUpserted = 0;
     private int $amortizationsUpserted = 0;
@@ -152,13 +157,7 @@ final class BondizationImporter
      */
     private function importOne(int $securityId, string $isin, int $issuerId): void
     {
-        $response = $this->iss->getJson(
-            "/statistics/engines/stock/markets/bonds/bondization/{$isin}.json",
-            ['iss.only' => 'coupons,amortizations']
-        );
-
-        $coupons = IssClient::block($response, 'coupons');
-        $amortizations = IssClient::block($response, 'amortizations');
+        [$coupons, $amortizations] = $this->fetchSchedule($isin);
 
         $this->db->beginTransaction();
         try {
@@ -255,6 +254,75 @@ final class BondizationImporter
             $this->db->rollBack();
             throw $e;
         }
+    }
+
+    /**
+     * График бумаги целиком, все страницы. Найдено 5 октября 2026 при сверке
+     * с сообщениями НРД: bondization отдаёт каждый блок страницами, по
+     * умолчанию по 20 строк, а запрос шёл один и без параметров — в базу
+     * попадали только первые 20 купонов и первые 20 амортизаций бумаги. У
+     * выпуска с ежемесячным купоном это меньше двух лет: по RU000A105RF6
+     * биржа отдаёт 60 купонов и 24 амортизации, в базе было 20 и 20, график
+     * обрывался на сентябре 2024. Так обрезаны были 1551 бумага из 2864, у
+     * 516 бумаг в обращении не было ни одного будущего купона.
+     *
+     * Теперь: limit=100 (больше биржа не даёт) и листание через start,
+     * пока блок *.cursor (INDEX, TOTAL, PAGESIZE) показывает, что строки
+     * ещё остались. start общий для обоих блоков; блок, который уже
+     * закончился, на следующих страницах приходит пустым.
+     *
+     * Бумаги с уже обрезанным графиком в обычный ночной отбор не попадают
+     * (все 20 строк у них с суммами) — после установки нужен один полный
+     * пересев: php bin/seed_bondization.php --force
+     *
+     * @return array{0: array<int, array<string, mixed>>, 1: array<int, array<string, mixed>>} купоны, амортизации
+     */
+    private function fetchSchedule(string $isin): array
+    {
+        $coupons = [];
+        $amortizations = [];
+
+        for ($page = 0; $page < self::SCHEDULE_MAX_PAGES; $page++) {
+            $response = $this->iss->getJson(
+                "/statistics/engines/stock/markets/bonds/bondization/{$isin}.json",
+                [
+                    'iss.only' => 'coupons,amortizations,coupons.cursor,amortizations.cursor',
+                    'limit' => self::SCHEDULE_PAGE_SIZE,
+                    'start' => $page * self::SCHEDULE_PAGE_SIZE,
+                ]
+            );
+
+            $pageCoupons = IssClient::block($response, 'coupons');
+            $pageAmortizations = IssClient::block($response, 'amortizations');
+            foreach ($pageCoupons as $row) {
+                $coupons[] = $row;
+            }
+            foreach ($pageAmortizations as $row) {
+                $amortizations[] = $row;
+            }
+
+            $more = false;
+            $cursorSeen = false;
+            foreach (['coupons.cursor', 'amortizations.cursor'] as $cursorBlock) {
+                $cursor = IssClient::block($response, $cursorBlock)[0] ?? null;
+                if ($cursor === null) {
+                    continue;
+                }
+                $cursorSeen = true;
+                if ((int) ($cursor['INDEX'] ?? 0) + (int) ($cursor['PAGESIZE'] ?? 0) < (int) ($cursor['TOTAL'] ?? 0)) {
+                    $more = true;
+                }
+            }
+            // Курсора в ответе нет — судим по тому, пришла ли страница полной.
+            if (!$cursorSeen) {
+                $more = count($pageCoupons) >= self::SCHEDULE_PAGE_SIZE || count($pageAmortizations) >= self::SCHEDULE_PAGE_SIZE;
+            }
+            if (!$more) {
+                break;
+            }
+        }
+
+        return [$coupons, $amortizations];
     }
 
     /**
