@@ -83,7 +83,7 @@ $db->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
 $db->sqliteCreateFunction('NOW', static fn (): string => date('Y-m-d H:i:s'), 0);
 
 $db->exec('CREATE TABLE issuers (id INTEGER PRIMARY KEY, short_name TEXT, inn TEXT)');
-$db->exec("CREATE TABLE securities (id INTEGER PRIMARY KEY AUTOINCREMENT, isin TEXT, issuer_id INTEGER, short_name TEXT, currency TEXT DEFAULT 'RUB', status TEXT DEFAULT 'active')");
+$db->exec("CREATE TABLE securities (id INTEGER PRIMARY KEY AUTOINCREMENT, isin TEXT, issuer_id INTEGER, short_name TEXT, currency TEXT DEFAULT 'RUB', is_structured INTEGER DEFAULT 0, status TEXT DEFAULT 'active')");
 $schedule = "id INTEGER PRIMARY KEY AUTOINCREMENT, security_id INTEGER, issuer_id INTEGER, %s TEXT, value_per_bond TEXT, actual_value_per_bond TEXT, full_default_date_planned TEXT, status TEXT DEFAULT 'planned'";
 $db->exec('CREATE TABLE coupons (' . sprintf($schedule, 'period_end_date') . ')');
 $db->exec('CREATE TABLE amortizations (' . sprintf($schedule, 'payment_date_planned') . ')');
@@ -250,6 +250,32 @@ $db->exec("INSERT INTO coupons (security_id, issuer_id, period_end_date, value_p
 check('график дозагружен → то же сообщение обрабатывается', 'processed', $processor->process(GetNewsMessageMapper::map($gap))['result']);
 check('архив: сообщение без английских полей', false, str_contains((string) $db->query('SELECT raw_payload FROM raw_messages ORDER BY id LIMIT 1')->fetchColumn(), 'body_en'));
 
+echo "\n--- структурный выпуск: графика купонов у биржи нет ---\n";
+$db->exec("INSERT INTO securities (isin, issuer_id, short_name, is_structured) VALUES ('RU000A10STRU1', 1, 'СбКИБ1P999', 1)");
+$structured = (int) $db->lastInsertId();
+$asStructured = static function (string $label, int $id) use ($fixtures): array {
+    $raw = $fixtures[$label];
+    $raw['content_id_out'] = $id;
+    $raw['data']['securities'][0]['isin'] = 'RU000A10STRU1';
+
+    return $raw;
+};
+check('просмотр: купон будет создан по сообщению', 'build', $processor->locate(GetNewsMessageMapper::map($asStructured('invobl_extra_income', 3)))['structured']);
+$r = $processor->process(GetNewsMessageMapper::map($asStructured('invobl_extra_income', 3)));
+check('купон берётся прямо из сообщения НРД → клиенту «получено»', ['processed', ['A2']], [$r['result'], $r['events']]);
+check('в графике появилась строка купона: дата и сумма из сообщения, выплачен', ['65.2100', 'paid', '65.2100'], array_values($db->query(
+    "SELECT value_per_bond, status, actual_value_per_bond FROM coupons WHERE security_id = {$structured} AND period_end_date = '2026-10-02'"
+)->fetch()));
+$r = $processor->process(GetNewsMessageMapper::map($asStructured('invobl_coupon_fixed', 4)));
+check('вторая выплата на ту же дату от другого события НРД — ещё одно «получено», строка та же', [['A2'], 1], [$r['events'], (int) $db->query("SELECT COUNT(*) FROM coupons WHERE security_id = {$structured}")->fetchColumn()]);
+check('просмотр: погашение вне графика будет пропущено', 'skip', $processor->locate(GetNewsMessageMapper::map($asStructured('invobl_redemption', 5)))['structured']);
+$r = $processor->process(GetNewsMessageMapper::map($asStructured('invobl_redemption', 5)));
+check('погашение структурного выпуска вне графика → пропущено без шума, в архиве помечено', ['skipped', 'ignored'], [$r['result'], $db->query("SELECT processing_status FROM raw_messages WHERE source_ref = '5'")->fetchColumn()]);
+check('следующий опрос к нему не возвращается', 'duplicate', $processor->process(GetNewsMessageMapper::map($asStructured('invobl_redemption', 5)))['result']);
+$r = $processor->process(GetNewsMessageMapper::map($asStructured('garant_tech_default_announcement', 6)));
+check('объявление о техдефолте по выплате, которой нет в графике, купон не создаёт', ['skipped', 1], [$r['result'], (int) $db->query("SELECT COUNT(*) FROM coupons WHERE security_id = {$structured}")->fetchColumn()]);
+check('обычный (не структурный) выпуск без строки в графике — по-прежнему пробел для администратора', null, $processor->locate(GetNewsMessageMapper::map($gap + ['content_id_out' => 7]))['structured']);
+
 echo "\n--- просмотр без записи (--dry-run) ---\n";
 $located = $processor->locate(GetNewsMessageMapper::map($fixtures['samolet_redemption_part1']));
 check('куда ляжет погашение: таблица amortizations, точная дата', ['amortizations', 'exact', '2026-09-28'], [$located['payment']['table'], $located['payment']['match'], $located['payment']['payment_date']]);
@@ -308,6 +334,7 @@ check('вторая выплата по тому же купону', true, str_c
 check('валютный выпуск: получено в рублях', true, str_contains($find('Акрон Б1P9', 'получен НРД'), 'Купон за 29.09.26 получен НРД: 537.25 ₽ на бумагу.'));
 check('напоминание по валютному выпуску: сумма в валюте номинала, не со знаком рубля', true, str_contains($find('Акрон Б1P9', 'Завтра'), 'Завтра, 23.10.26, выплата: купон — 6.37 USD на бумагу.'));
 check('напоминание в день погашения', true, str_contains($find('ВЭБ2Р-К749', 'Завтра'), 'Завтра, 23.10.26, выплата: купон — 5.27 ₽ на бумагу; погашение — 1 000.00 ₽ на бумагу.'));
+check('структурный выпуск: купон из сообщения НРД', true, str_contains($find('СбКИБ1P999', 'получен НРД'), 'Купон за 02.10.26 получен НРД: 65.21 ₽ на бумагу.'));
 check('«передано депонентам» клиенту не уходит', '', $find('передано'));
 check('тихая загрузка: по «Тихому эмитенту» клиенту ничего не ушло', '', $find('Тихий БО-01'));
 

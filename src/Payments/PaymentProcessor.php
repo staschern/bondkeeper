@@ -56,6 +56,8 @@ use PDO;
  *       нарушался, иначе B5;
  *   объявление «не исполнено в срок»        → B2, один раз на выплату;
  *   объявление «дефолт»                     → C2, один раз на выплату;
+ *   структурный выпуск без графика купонов на бирже → купон создаётся по
+ *       сообщению НРД о деньгах (см. canBuildFromMessage());
  *   «передано депонентам» по уже учтённым деньгам → A3 / A5 / A7 (клиенту
  *       не рассылается); если получение мы не видели — засчитывается как
  *       получение;
@@ -83,6 +85,8 @@ final class PaymentProcessor
     public const RESULT_NO_CHANGE = 'no_change';
     /** Бумаги нет в нашей базе — сообщение не сохраняется. */
     public const RESULT_FOREIGN = 'foreign';
+    /** Структурный выпуск: выплаты в графике нет и построить её по сообщению нельзя — пропущено без шума. */
+    public const RESULT_SKIPPED = 'skipped';
 
     public const SILENT_REASON = 'тихая загрузка: уведомление не отправлялось';
 
@@ -129,15 +133,29 @@ final class PaymentProcessor
         }
 
         $payment = $this->findPayment($message, (int) $security['id']);
+        $buildFromMessage = false;
         if ($payment === null) {
-            $reason = 'выплата (' . PaymentMessage::kindLabel($message->kind) . " на {$message->paymentDate}) не найдена в графике бумаги {$message->isin}";
-            $this->markRaw($rawId, 'failed', $reason);
+            if ((int) ($security['is_structured'] ?? 0) === 1) {
+                if (!self::canBuildFromMessage($message)) {
+                    $reason = 'структурный выпуск: выплаты (' . PaymentMessage::kindLabel($message->kind) . " на {$message->paymentDate}) нет в графике — пропущено";
+                    $this->markRaw($rawId, 'ignored', $reason);
 
-            return ['result' => self::RESULT_UNMATCHED, 'events' => [], 'note' => $reason, 'retry' => $isRetry];
+                    return ['result' => self::RESULT_SKIPPED, 'events' => [], 'note' => $reason];
+                }
+                $buildFromMessage = true;
+            } else {
+                $reason = 'выплата (' . PaymentMessage::kindLabel($message->kind) . " на {$message->paymentDate}) не найдена в графике бумаги {$message->isin}";
+                $this->markRaw($rawId, 'failed', $reason);
+
+                return ['result' => self::RESULT_UNMATCHED, 'events' => [], 'note' => $reason, 'retry' => $isRetry];
+            }
         }
 
         $this->db->beginTransaction();
         try {
+            if ($buildFromMessage) {
+                $payment = $this->createCouponFromMessage($message, $security);
+            }
             $result = $this->apply($message, $security, $payment, $rawId);
             $this->markRaw($rawId, 'processed', null);
             $this->db->commit();
@@ -153,17 +171,63 @@ final class PaymentProcessor
     /**
      * Куда ляжет сообщение, без записи в базу — для просмотра (--dry-run).
      *
-     * @return array{security: ?array<string, mixed>, payment: ?array<string, mixed>}
-     *         payment: строка графика с ключами table (в какой таблице) и match (exact | shifted)
+     * @return array{security: ?array<string, mixed>, payment: ?array<string, mixed>, structured: ?string}
+     *         payment: строка графика с ключами table (в какой таблице) и match (exact | shifted);
+     *         structured (только когда выплаты в графике нет, а выпуск структурный):
+     *         build — купон будет создан по сообщению, skip — сообщение будет пропущено
      */
     public function locate(PaymentMessage $message): array
     {
         $security = $this->findSecurity($message->isin);
+        $payment = $security !== null ? $this->findPayment($message, (int) $security['id']) : null;
+        $structured = null;
+        if ($security !== null && $payment === null && (int) ($security['is_structured'] ?? 0) === 1) {
+            $structured = self::canBuildFromMessage($message) ? 'build' : 'skip';
+        }
 
-        return [
-            'security' => $security,
-            'payment' => $security !== null ? $this->findPayment($message, (int) $security['id']) : null,
-        ];
+        return ['security' => $security, 'payment' => $payment, 'structured' => $structured];
+    }
+
+    /**
+     * Структурные выпуски (securities.is_structured = 1; на 06.10.2026 это
+     * в основном ноты Сбербанк КИБ): графика купонов у биржи для них нет
+     * вообще — bondization отдаёт 0 купонов, купон там условный. Из 50
+     * сообщений НРД, не нашедших выплату после полного пересева, 37 —
+     * такие. Решение пользователя (06.10.2026): купон брать прямо из
+     * сообщения НРД о деньгах — клиент получит «купон получен», без
+     * напоминания накануне. Остальное по таким выпускам (объявления,
+     * погашения вне графика) — пробел, на который мы повлиять не можем:
+     * пропускается без сообщения администратору.
+     */
+    private static function canBuildFromMessage(PaymentMessage $message): bool
+    {
+        return $message->kind === PaymentMessage::KIND_COUPON
+            && in_array($message->execution, [PaymentMessage::EXECUTION_FULL, PaymentMessage::EXECUTION_PARTIAL], true)
+            && $message->amountPerBond !== null;
+    }
+
+    /**
+     * Строка купона по сообщению НРД: дата — из сообщения, плановая сумма —
+     * плановая по данным НРД (если её нет — сумма перевода).
+     *
+     * @param array{id: int|string, issuer_id: int|string} $security
+     * @return array<string, mixed> строка графика в том же виде, что из findPayment()
+     */
+    private function createCouponFromMessage(PaymentMessage $message, array $security): array
+    {
+        $this->db->prepare('INSERT INTO coupons (security_id, issuer_id, period_end_date, value_per_bond) VALUES (:security_id, :issuer_id, :payment_date, :value)')
+            ->execute([
+                'security_id' => (int) $security['id'],
+                'issuer_id' => (int) $security['issuer_id'],
+                'payment_date' => $message->paymentDate,
+                'value' => self::money((float) ($message->plannedPerBond ?? $message->amountPerBond)),
+            ]);
+        $payment = $this->findRow(PaymentMessage::KIND_COUPON, (int) $security['id'], $message->paymentDate);
+        if ($payment === null) {
+            throw new \RuntimeException("Не удалось создать купон по сообщению НРД для {$message->isin} на {$message->paymentDate}");
+        }
+
+        return $payment;
     }
 
     /**
@@ -413,10 +477,10 @@ final class PaymentProcessor
             ->execute(['status' => $status, 'error' => $error, 'now' => date('Y-m-d H:i:s'), 'id' => $rawId]);
     }
 
-    /** @return array{id: int|string, issuer_id: int|string, short_name: string, isin: string}|null */
+    /** @return array{id: int|string, issuer_id: int|string, short_name: string, isin: string, is_structured: int|string|null}|null */
     private function findSecurity(string $isin): ?array
     {
-        $stmt = $this->db->prepare('SELECT id, issuer_id, short_name, isin FROM securities WHERE isin = :isin');
+        $stmt = $this->db->prepare('SELECT id, issuer_id, short_name, isin, is_structured FROM securities WHERE isin = :isin');
         $stmt->execute(['isin' => $isin]);
         $row = $stmt->fetch();
 

@@ -104,7 +104,7 @@ final class BondizationImporter
         $this->amortizationsUpserted = 0;
         $this->failed = 0;
 
-        $sql = 'SELECT s.id, s.isin, s.issuer_id FROM securities s WHERE s.status = "active"';
+        $sql = 'SELECT s.id, s.isin, s.secid, s.issuer_id FROM securities s WHERE s.status = "active"';
         if (!$forceAll) {
             $sql .= ' AND (
                 NOT EXISTS (SELECT 1 FROM coupons c WHERE c.security_id = s.id)
@@ -130,7 +130,7 @@ final class BondizationImporter
         while ($row = $stmt->fetch()) {
             $this->processed++;
             try {
-                $this->importOne((int) $row['id'], (string) $row['isin'], (int) $row['issuer_id']);
+                $this->importOne((int) $row['id'], self::requestCode($row['secid'] ?? null, (string) $row['isin']), (int) $row['issuer_id']);
             } catch (\Throwable $e) {
                 $this->failed++;
                 Logger::warn("Пропущен график выплат для {$row['isin']}: {$e->getMessage()}");
@@ -145,6 +145,21 @@ final class BondizationImporter
     }
 
     /**
+     * Код бумаги для запроса графика. Биржа ждёт свой код (secid), а не
+     * ISIN: у корпоративных облигаций они совпадают, у ОФЗ — нет (ISIN
+     * RU000A0JXFM1, код SU26221RMFS0), и по ISIN биржа отдаёт пустой график.
+     * Найдено 06.10.2026 по сообщениям НРД: у всех 93 ОФЗ в базе не было ни
+     * одного купона. Проверено прямым запросом: по ISIN — 0 купонов, по
+     * коду — 32. Если код в базе не заполнен, остаётся ISIN.
+     */
+    public static function requestCode(?string $secid, string $isin): string
+    {
+        $secid = trim((string) $secid);
+
+        return $secid !== '' ? $secid : $isin;
+    }
+
+    /**
      * Апсерт вместо DELETE+INSERT: и coupons, и amortizations теперь имеют
      * UNIQUE KEY на естественном ключе (security_id, дата), поэтому нет
      * нужды удалять весь график перед перезаписью — ON DUPLICATE KEY UPDATE
@@ -155,9 +170,9 @@ final class BondizationImporter
      * необязательны (см. класс-докблок). Пропускается только полностью
      * бесполезная строка без даты вообще.
      */
-    private function importOne(int $securityId, string $isin, int $issuerId): void
+    private function importOne(int $securityId, string $code, int $issuerId): void
     {
-        [$coupons, $amortizations] = $this->fetchSchedule($isin);
+        [$coupons, $amortizations] = $this->fetchSchedule($code);
 
         $this->db->beginTransaction();
         try {
@@ -277,14 +292,14 @@ final class BondizationImporter
      *
      * @return array{0: array<int, array<string, mixed>>, 1: array<int, array<string, mixed>>} купоны, амортизации
      */
-    private function fetchSchedule(string $isin): array
+    private function fetchSchedule(string $code): array
     {
         $coupons = [];
         $amortizations = [];
 
         for ($page = 0; $page < self::SCHEDULE_MAX_PAGES; $page++) {
             $response = $this->iss->getJson(
-                "/statistics/engines/stock/markets/bonds/bondization/{$isin}.json",
+                "/statistics/engines/stock/markets/bonds/bondization/{$code}.json",
                 [
                     'iss.only' => 'coupons,amortizations,coupons.cursor,amortizations.cursor',
                     'limit' => self::SCHEDULE_PAGE_SIZE,

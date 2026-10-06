@@ -16,8 +16,12 @@ declare(strict_types=1);
  * амортизациям и погашениям. Поэтому:
  *   - --dry-run работает ВСЕГДА, даже если опрос выключен: ничего не
  *     пишет, показывает, как сообщения ложатся на наш график;
- *   - запись в базу требует config/payments.php: 'getnews_polling' => true;
- *   - первую загрузку делать с --quiet (см. ниже).
+ *   - обычная запись в базу требует config/payments.php: 'getnews_polling' => true;
+ *   - --quiet («тихий» прогон) пишет статусы и события, но клиентам не
+ *     отправляет ничего; работает и при выключенном опросе. Нужен дважды:
+ *     один раз заранее — проверить запись в боевую базу, и один раз в день
+ *     перехода на боевой доступ — дочитать накопившееся, чтобы клиентам не
+ *     ушли уведомления о выплатах за прошлые дни.
  *
  * === Что читаем ===
  * Переписано 05.10.2026. В сутки выходит 320–570 сообщений по
@@ -41,6 +45,9 @@ declare(strict_types=1);
  *     весь рынок);
  *   - бумага наша, а выплаты на эту дату в графике нет — администратору
  *     (один раз на сообщение): повод проверить график с Мосбиржи;
+ *   - структурный выпуск (у биржи нет графика его купонов): купон
+ *     создаётся по сообщению НРД о деньгах, остальное пропускается без
+ *     сообщения администратору (решение пользователя, 06.10.2026);
  *   - сообщение о деньгах не удалось прочитать — администратору: признак
  *     того, что НРД изменил формат.
  *
@@ -106,7 +113,9 @@ foreach ($argv as $arg) {
 }
 
 $paymentsConfig = PaymentsConfig::fromFile(__DIR__ . '/../config/payments.php');
-if (!$paymentsConfig->getNewsPolling && !$dryRun) {
+// Тихий прогон разрешён и при выключенном опросе: клиентам он ничего не отправляет, а включать
+// ради него общий флаг опасно — если в кроне уже стоит строка опроса, пошли бы настоящие уведомления.
+if (!$paymentsConfig->getNewsPolling && !$dryRun && !$quiet) {
     Logger::info('Опрос GetNews выключен (config/payments.php: getnews_polling). Ничего не делаю. Проверить вывод можно через --dry-run.');
     exit(0);
 }
@@ -235,7 +244,8 @@ if ($dryRun) {
         ? new PaymentProcessor($db, new EventPublisher($db), WorkingCalendar::fromFile(__DIR__ . '/../config/working_calendar.php'))
         : null;
 
-    $stats = ['чужая бумага' => 0, 'найдено: точная дата' => 0, 'найдено: по дню исполнения' => 0, 'наша бумага, выплаты в графике нет' => 0];
+    $stats = ['чужая бумага' => 0, 'найдено: точная дата' => 0, 'найдено: по дню исполнения' => 0,
+        'структурный выпуск: купон по сообщению НРД' => 0, 'структурный выпуск: пропущено' => 0, 'наша бумага, выплаты в графике нет' => 0];
     foreach ($messages as [, $message]) {
         $where = '';
         if ($processor !== null) {
@@ -244,7 +254,13 @@ if ($dryRun) {
                 $stats['чужая бумага']++;
                 continue;
             }
-            if ($located['payment'] === null) {
+            if ($located['structured'] === 'build') {
+                $stats['структурный выпуск: купон по сообщению НРД']++;
+                $where = ' → структурный выпуск, графика нет: купон будет создан по сообщению';
+            } elseif ($located['structured'] === 'skip') {
+                $stats['структурный выпуск: пропущено']++;
+                continue;
+            } elseif ($located['payment'] === null) {
                 $stats['наша бумага, выплаты в графике нет']++;
                 $where = ' → В ГРАФИКЕ НЕТ';
             } else {
@@ -289,6 +305,7 @@ $counts = [
     PaymentProcessor::RESULT_DUPLICATE => 0,
     PaymentProcessor::RESULT_NO_CHANGE => 0,
     PaymentProcessor::RESULT_FOREIGN => 0,
+    PaymentProcessor::RESULT_SKIPPED => 0,
     PaymentProcessor::RESULT_UNMATCHED => 0,
 ];
 /** @var array<string, int> $eventCounts */
@@ -317,11 +334,12 @@ foreach ($messages as [, $message]) {
 
 ksort($eventCounts);
 Logger::info(sprintf(
-    'Обработано: %d; повторы: %d; без изменений: %d; чужие бумаги: %d; наша бумага, выплаты в графике нет: %d',
+    'Обработано: %d; повторы: %d; без изменений: %d; чужие бумаги: %d; структурные выпуски, пропущено: %d; наша бумага, выплаты в графике нет: %d',
     $counts[PaymentProcessor::RESULT_PROCESSED],
     $counts[PaymentProcessor::RESULT_DUPLICATE],
     $counts[PaymentProcessor::RESULT_NO_CHANGE],
     $counts[PaymentProcessor::RESULT_FOREIGN],
+    $counts[PaymentProcessor::RESULT_SKIPPED],
     $counts[PaymentProcessor::RESULT_UNMATCHED],
 ));
 Logger::info('События: ' . ($eventCounts === [] ? 'нет' : implode(', ', array_map(static fn (string $c, int $n): string => "{$c} — {$n}", array_keys($eventCounts), $eventCounts))));

@@ -24,6 +24,8 @@ final class PagedIssClient extends IssClient
 {
     /** @var array<int, array<string, scalar>> */
     public array $queries = [];
+    /** @var array<int, string> */
+    public array $paths = [];
 
     public function __construct(private readonly int $coupons, private readonly int $amortizations, private readonly bool $withCursor = true)
     {
@@ -31,6 +33,7 @@ final class PagedIssClient extends IssClient
 
     public function getJson(string $path, array $query = []): array
     {
+        $this->paths[] = $path;
         $this->queries[] = $query;
         $limit = (int) ($query['limit'] ?? 20); // без limit биржа отдаёт 20
         $start = (int) ($query['start'] ?? 0);
@@ -75,13 +78,13 @@ function check(string $label, $expected, $actual): void
 }
 
 /** @return array{0: array<int, array<string, mixed>>, 1: array<int, array<string, mixed>>} */
-function fetchSchedule(IssClient $client): array
+function fetchSchedule(IssClient $client, string $code = 'RU000A105RF6'): array
 {
     $importer = new BondizationImporter($client, new PDO('sqlite::memory:'));
     $method = new ReflectionMethod($importer, 'fetchSchedule');
     $method->setAccessible(true);
 
-    return $method->invoke($importer, 'RU000A105RF6');
+    return $method->invoke($importer, $code);
 }
 
 echo "--- выпуск с ежемесячным купоном: 60 купонов, 24 амортизации (как у RU000A105RF6) ---\n";
@@ -115,6 +118,14 @@ check('ответ без блока курсора — листаем, пока 
 $client = new PagedIssClient(100, 0, false);
 [$coupons] = fetchSchedule($client);
 check('без курсора и ровно 100 строк — лишний пустой запрос, данные те же', [100, 2], [count($coupons), count($client->queries)]);
+
+echo "\n--- по какому коду запрашивается график ---\n";
+check('ОФЗ: биржевой код, а не ISIN (по ISIN биржа отдаёт пустой график)', 'SU26221RMFS0', BondizationImporter::requestCode('SU26221RMFS0', 'RU000A0JXFM1'));
+check('корпоративная облигация: код совпадает с ISIN', 'RU000A105RF6', BondizationImporter::requestCode('RU000A105RF6', 'RU000A105RF6'));
+check('код в базе не заполнен — остаётся ISIN', ['RU000A105RF6', 'RU000A105RF6'], [BondizationImporter::requestCode(null, 'RU000A105RF6'), BondizationImporter::requestCode('  ', 'RU000A105RF6')]);
+$client = new PagedIssClient(32, 1);
+fetchSchedule($client, 'SU26221RMFS0');
+check('код подставляется в адрес запроса', '/statistics/engines/stock/markets/bonds/bondization/SU26221RMFS0.json', $client->paths[0]);
 
 echo "\n";
 if ($failures === 0) {
