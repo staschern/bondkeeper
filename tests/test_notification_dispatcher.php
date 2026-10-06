@@ -348,7 +348,7 @@ $db->exec("INSERT INTO events (id, security_id, issuer_id, event_type_code, payl
 $telegram->sent = [];
 $dispatcher->dispatchPending();
 check('R1: заголовок темы жирным', str_starts_with($telegram->sent[0]['text'], "<b>⏰ Выплаты:</b>\n"));
-check('R1: заголовок бумаги — эмитент · бумага (ISIN)', str_contains($telegram->sent[0]['text'], 'ПАО «СибАвтоТранс» · СибАвтоТранс-БО-01 (RU000A1ABCD1)'));
+check('R1: заголовок бумаги — эмитент | ИНН · бумага (ISIN)', str_contains($telegram->sent[0]['text'], 'ПАО «СибАвтоТранс» | ИНН 5400001234 · СибАвтоТранс-БО-01 (RU000A1ABCD1)'));
 check('R1: дата и сумма купона', str_contains($telegram->sent[0]['text'], 'Завтра, 16.04.26, выплата: купон — 41.10 ₽ на бумагу.'));
 
 // --- A2: купон получен НРД ---

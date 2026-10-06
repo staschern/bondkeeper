@@ -31,6 +31,17 @@
 Если НРД дал формулировку о неисполнении, она приводится в уведомлении
 дословно («Отметка НРД: «исполнена ненадлежащим образом»»).
 
+Вид уведомления: первая строка — тема жирным («Выплаты»), вторая —
+эмитент, его ИНН, бумага и ISIN («ООО «Образец» | ИНН 7700000000 ·
+Образец БО-01 (RU000A0SAMPL1)»), дальше — текст. ИНН после названия — по
+просьбе пользователя (06.10.2026), в том же виде, что в уведомлениях о
+блокировках ФНС.
+
+Образцы всех уведомлений (17 клиентских и 4 служебных) можно отправить
+администратору в Telegram: `php bin/send_payment_samples.php` (в базу не
+пишет, клиентам не шлёт; `--dry-run` — показать в консоли). Тексты строит
+тот же код, что и настоящие уведомления.
+
 ## 2. Две даты: по графику и день исполнения
 
 - **Дата по графику** — `coupons.period_end_date`,
@@ -331,6 +342,7 @@ php -d extension=mbstring -d extension=pdo_sqlite tests/test_getnews_pager.php  
 php -d extension=mbstring -d extension=pdo_sqlite tests/test_bondization_paging.php      # 11: листание графика с биржи
 php -d extension=mbstring -d extension=pdo_sqlite tests/test_payments.php                # 64: кейсы из исследования, напоминания, проверки
 php -d extension=mbstring -d extension=pdo_sqlite tests/test_working_calendar.php        # 25
+php -d extension=mbstring -d extension=pdo_sqlite tests/test_payment_notification_samples.php  # 19: образец есть на каждый вид уведомления
 ```
 
 Образцы сообщений — `tests/fixtures/getnews_messages.json` (31 настоящее

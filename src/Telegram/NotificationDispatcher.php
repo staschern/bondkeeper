@@ -201,6 +201,18 @@ final class NotificationDispatcher
     }
 
     /**
+     * Текст уведомления по виду события и его данным — ровно тот, что уйдёт
+     * клиенту. Для образцов (bin/send_payment_samples.php): посмотреть и
+     * поправить формулировки, не дожидаясь настоящих событий.
+     *
+     * @param array<string, mixed> $payload
+     */
+    public function renderText(string $eventTypeCode, array $payload, string $issuerName, string $issuerInn = '', string $statusText = ''): string
+    {
+        return $this->buildMessageText($eventTypeCode, $payload, $issuerName, $issuerInn, $statusText);
+    }
+
+    /**
      * C5/E1 — рейтинговые действия и блокировки ФНС (Этап 4); R1/A2/A4/A6/
      * B1/B2/B4/B5/B2a — напоминания и события о выплатах (Этап 5, см.
      * docs/STAGE5_PAYMENTS.md; A3/A5/A7 "передано депонентам" клиенту не
@@ -224,9 +236,9 @@ final class NotificationDispatcher
         return match ($eventTypeCode) {
             'C5' => $this->buildRatingActionText($payload, $statusText),
             'E1' => $this->buildFnsBlockText($payload, $issuerName, $issuerInn),
-            'R1' => $this->buildPaymentReminderText($payload, $issuerName),
-            'A2', 'A4', 'A6', 'B1', 'B1a', 'B2', 'B4', 'B5', 'C2' => $this->buildPaymentText($eventTypeCode, $payload, $issuerName),
-            'B2a' => $this->buildNoReceiptText($payload, $issuerName),
+            'R1' => $this->buildPaymentReminderText($payload, $issuerName, $issuerInn),
+            'A2', 'A4', 'A6', 'B1', 'B1a', 'B2', 'B4', 'B5', 'C2' => $this->buildPaymentText($eventTypeCode, $payload, $issuerName, $issuerInn),
+            'B2a' => $this->buildNoReceiptText($payload, $issuerName, $issuerInn),
             default => '<b>🔔 Новое событие:</b>' . "\n" . BotFormatting::escapeHtml("Эмитент «{$issuerName}»."),
         };
     }
@@ -242,7 +254,7 @@ final class NotificationDispatcher
      *
      * @param array<string, mixed> $payload
      */
-    private function buildPaymentReminderText(array $payload, string $issuerName): string
+    private function buildPaymentReminderText(array $payload, string $issuerName, string $issuerInn): string
     {
         $currency = isset($payload['currency']) ? (string) $payload['currency'] : null;
         $parts = [];
@@ -259,7 +271,7 @@ final class NotificationDispatcher
             $body .= ' Дата выпадает на выходной — деньги должны поступить ' . BotFormatting::formatDate($effectiveDate) . '.';
         }
 
-        return '<b>⏰ Выплаты:</b>' . "\n" . self::bondHeader($payload, $issuerName) . "\n" . $body;
+        return '<b>⏰ Выплаты:</b>' . "\n" . self::bondHeader($payload, $issuerName, $issuerInn) . "\n" . $body;
     }
 
     /**
@@ -274,7 +286,7 @@ final class NotificationDispatcher
      *
      * @param array<string, mixed> $payload
      */
-    private function buildPaymentText(string $eventTypeCode, array $payload, string $issuerName): string
+    private function buildPaymentText(string $eventTypeCode, array $payload, string $issuerName, string $issuerInn): string
     {
         $kind = (string) ($payload['kind'] ?? '');
         $ending = match ($kind) {
@@ -329,7 +341,7 @@ final class NotificationDispatcher
                 : "{$what} получен{$ending} НРД" . ($actual !== null ? ': ' . self::money((string) $actual, $currency) . ' на бумагу' : '') . '.'],
         };
 
-        return "<b>{$emoji} Выплаты:</b>" . "\n" . self::bondHeader($payload, $issuerName) . "\n" . $body;
+        return "<b>{$emoji} Выплаты:</b>" . "\n" . self::bondHeader($payload, $issuerName, $issuerInn) . "\n" . $body;
     }
 
     /**
@@ -339,7 +351,7 @@ final class NotificationDispatcher
      *
      * @param array<string, mixed> $payload
      */
-    private function buildNoReceiptText(array $payload, string $issuerName): string
+    private function buildNoReceiptText(array $payload, string $issuerName, string $issuerInn): string
     {
         $kinds = implode(', ', array_map(
             static fn (array $payment): string => self::paymentKindName((string) ($payment['kind'] ?? '')),
@@ -350,7 +362,7 @@ final class NotificationDispatcher
             . ' НРД пока не сообщил о поступлении денег от эмитента, хотя обычно к этому времени сообщение уже выходит.'
             . ' Это ещё не подтверждённая невыплата: если деньги не пришли, НРД объявит о неисполнении сегодня, чаще после 17:00.';
 
-        return '<b>🟡 Выплаты:</b>' . "\n" . self::bondHeader($payload, $issuerName) . "\n" . $body;
+        return '<b>🟡 Выплаты:</b>' . "\n" . self::bondHeader($payload, $issuerName, $issuerInn) . "\n" . $body;
     }
 
     /**
@@ -367,14 +379,24 @@ final class NotificationDispatcher
         return number_format((float) $amount, 2, '.', ' ') . ' ' . BotFormatting::escapeHtml($currency);
     }
 
-    /** Название бумаги и ИНН/ISIN внешние (из нашей же БД, но исходно — с сайта Мосбиржи) — экранируются. @param array<string, mixed> $payload */
-    private static function bondHeader(array $payload, string $issuerName): string
+    /**
+     * Строка «кто и какая бумага»: эмитент, его ИНН, бумага, ISIN. ИНН после
+     * названия — по просьбе пользователя (6 октября 2026), в том же виде,
+     * что в уведомлениях о блокировках ФНС («Название | ИНН …»): по ИНН
+     * эмитента однозначно находят в любом справочнике. Название бумаги и
+     * ИНН/ISIN внешние (из нашей же БД, но исходно — с сайта Мосбиржи) —
+     * экранируются.
+     *
+     * @param array<string, mixed> $payload
+     */
+    private static function bondHeader(array $payload, string $issuerName, string $issuerInn): string
     {
         $name = BotFormatting::escapeHtml($issuerName);
+        $inn = trim($issuerInn) !== '' ? ' | ИНН ' . BotFormatting::escapeHtml(trim($issuerInn)) : '';
         $security = BotFormatting::escapeHtml((string) ($payload['security_name'] ?? 'облигация'));
         $isin = BotFormatting::escapeHtml((string) ($payload['isin'] ?? '—'));
 
-        return "{$name} · {$security} ({$isin})";
+        return "{$name}{$inn} · {$security} ({$isin})";
     }
 
     private static function paymentKindName(string $kind): string
