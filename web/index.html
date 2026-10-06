@@ -140,6 +140,20 @@
   p.lead{font-family:var(--font-raleway);color:#404040;line-height:1.55;margin:0;font-size:16px;}
   @media(min-width:768px){p.lead{font-size:19px;}}
 
+  /* Shared frosted panel behind every text block — the sphere field roams
+     underneath text at any scroll position, so legibility can't depend on
+     what color happens to be back there. Muted and uniform on purpose. */
+  .text-panel{
+    display:inline-block;max-width:100%;
+    background:rgba(247,250,252,.74);
+    backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);
+    border:1px solid rgba(255,255,255,.55);
+    border-radius:22px;
+    padding:20px 22px;
+    box-shadow:0 14px 40px -12px rgba(14,42,197,.15);
+  }
+  @media(min-width:768px){.text-panel{padding:30px 36px;border-radius:28px;}}
+
   /* ----- hero ----- */
   #hero{display:flex;align-items:flex-end;padding-bottom:48px;}
   @media(min-width:768px){#hero{padding-bottom:56px;}}
@@ -295,15 +309,19 @@
     <div class="hero-inner" id="hero-inner">
       <div class="hero-row">
         <div class="hero-left">
-          <div class="eyebrow" id="hero-eyebrow">[ Сервис мониторинга рисков ]</div>
-          <h1 class="hero-headline" id="hero-headline">Меньше шума. Больше сигнала.</h1>
+          <div class="text-panel">
+            <div class="eyebrow" id="hero-eyebrow">[ Сервис мониторинга рисков ]</div>
+            <h1 class="hero-headline" id="hero-headline">Меньше шума. Больше сигнала.</h1>
+          </div>
         </div>
         <div class="hero-right" id="hero-right">
-          <p>Мы переводим НРД, e&#8209;disclosure, ФНС и рейтинговые агентства в один точный сигнал по вашему портфелю облигаций.</p>
-          <p class="hero-credit">© 2026 — Мониторинг рисков по облигациям РФ</p>
-          <div class="scroll-cue">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M19 12l-7 7-7-7"/></svg>
-            <span>Листайте</span>
+          <div class="text-panel">
+            <p>Мы переводим НРД, e&#8209;disclosure, ФНС и рейтинговые агентства в один точный сигнал по вашему портфелю облигаций.</p>
+            <p class="hero-credit">© 2026 — Мониторинг рисков по облигациям РФ</p>
+            <div class="scroll-cue">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M19 12l-7 7-7-7"/></svg>
+              <span>Листайте</span>
+            </div>
           </div>
         </div>
       </div>
@@ -313,11 +331,13 @@
   <section class="story" id="sources">
     <div class="grid12">
       <div class="col-7">
-        <div class="eyebrow reveal">[ 02 — Источники ]</div>
-        <h2 class="sec-heading reveal" style="transition-delay:.1s">Пять источников.<br>Ноль синтеза.</h2>
-        <p class="lead sec-lead reveal" style="transition-delay:.2s">
-          Продолжайте скроллить — поле распадается на реальные источники данных: Мосбиржа, НРД, e&#8209;disclosure, ФНС, четыре рейтинговых агентства. У каждого свой формат, свой логин и свой код события — <code>INTR</code>, <code>PRED</code>, <code>REDM</code>.
-        </p>
+        <div class="text-panel reveal">
+          <div class="eyebrow">[ 02 — Источники ]</div>
+          <h2 class="sec-heading">Пять источников.<br>Ноль синтеза.</h2>
+          <p class="lead sec-lead">
+            Продолжайте скроллить — поле распадается на реальные источники данных: Мосбиржа, НРД, e&#8209;disclosure, ФНС, четыре рейтинговых агентства. У каждого свой формат, свой логин и свой код события — <code>INTR</code>, <code>PRED</code>, <code>REDM</code>.
+          </p>
+        </div>
       </div>
       <div class="col-5">
         <div class="cards reveal" style="transition-delay:.25s">
@@ -343,27 +363,33 @@
 
   <section class="story" id="synthesis">
     <div class="top">
-      <div class="eyebrow reveal">[ 03 — Форма ]</div>
-      <h2 class="sec-heading narrow reveal" style="transition-delay:.1s">Хаос, затем — форма.</h2>
+      <div class="text-panel reveal">
+        <div class="eyebrow">[ 03 — Форма ]</div>
+        <h2 class="sec-heading narrow">Хаос, затем — форма.</h2>
+      </div>
     </div>
     <div class="bottom">
-      <p class="lead reveal" style="transition-delay:.15s">
-        Из свободного падения источники собираются в одно целое — каждое событие находит своё место в вашем личном потоке. Двигайте курсор и смотрите, как порядок держится, несмотря на шум вокруг.
-      </p>
-      <div class="pill reveal" style="transition-delay:.28s">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4l7.07 17 2.51-7.39L21 11.07z"/></svg>
-        <span>Настройте список бумаг</span>
+      <div class="text-panel reveal">
+        <p class="lead">
+          Из свободного падения источники собираются в одно целое — каждое событие находит своё место в вашем личном потоке. Двигайте курсор и смотрите, как порядок держится, несмотря на шум вокруг.
+        </p>
+        <div class="pill">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4l7.07 17 2.51-7.39L21 11.07z"/></svg>
+          <span>Настройте список бумаг</span>
+        </div>
       </div>
     </div>
   </section>
 
   <section class="story" id="delivery">
     <div class="inner">
-      <div class="eyebrow reveal">[ 04 — Доставка ]</div>
-      <h2 class="release-heading reveal" style="transition-delay:.12s">И вот —<br>в Telegram.</h2>
-      <p class="lead release-lead reveal" style="transition-delay:.24s">
-        Поле проходит сквозь фильтр вашего портфеля и долетает до вас точным сообщением — без шума остального рынка. Меньше шума. Больше сигнала.
-      </p>
+      <div class="text-panel reveal">
+        <div class="eyebrow">[ 04 — Доставка ]</div>
+        <h2 class="release-heading">И вот —<br>в Telegram.</h2>
+        <p class="lead release-lead">
+          Поле проходит сквозь фильтр вашего портфеля и долетает до вас точным сообщением — без шума остального рынка. Меньше шума. Больше сигнала.
+        </p>
+      </div>
     </div>
   </section>
 
