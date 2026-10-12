@@ -5,17 +5,20 @@ declare(strict_types=1);
 namespace BondKeeper\Payments;
 
 use BondKeeper\Events\EventPublisher;
+use BondKeeper\Securities\SecurityStatus;
 use PDO;
 
 /**
  * События по выплатам, которые мы считаем сами по графику, без сообщения
  * источника (Этап 5, см. docs/STAGE5_PAYMENTS.md).
  *
- *   1. Напоминание R1 — накануне выплаты. Сутки считаются от даты ПО
- *      ГРАФИКУ, а не от дня, когда деньги придут на деле: смысл — дать
- *      клиенту возможность продать бумагу до выплаты (решение
- *      пользователя, 04.10.2026). Если дата по графику — выходной, в
- *      тексте называется и день исполнения.
+ *   1. Напоминание R1 — в последний рабочий день перед выплатой: смысл —
+ *      дать клиенту возможность продать бумагу до выплаты, а в выходной
+ *      он её уже не продаст (решение пользователя, 11.10.2026; раньше —
+ *      за календарные сутки до даты по графику). Дата по графику в
+ *      субботу, воскресенье или понедельник — напоминание в пятницу; перед
+ *      праздниками — в последний рабочий день. В нерабочий день
+ *      напоминания не создаются.
  *   2. Следующий рабочий день после дня исполнения, 12:02 мск: сообщения
  *      о деньгах от НРД нет → жёлтое B2a.
  *   3. Тот же день, 19:00 мск: от НРД нет вообще ничего (ни денег, ни
@@ -45,6 +48,15 @@ use PDO;
  * докблок PaymentProcessor). Поэтому строка redemptions с нулём выплатой
  * не считается, а амортизация на дату погашения называется погашением.
  *
+ * Бумаги с нарушением — в техдефолте или дефолте (решения пользователя,
+ * 11.10.2026):
+ *   - в напоминании клиенту прямо сказано, что бумага в техдефолте
+ *     (дефолте) и выплата под вопросом;
+ *   - администратору по ним не уходит ни список полуденной проверки
+ *     (режим admin), ни вечернее «от НРД нет сообщений»: по купонам таких
+ *     бумаг НРД молчит чаще, чем сообщает, и это уже не новость.
+ *     Клиентское жёлтое уведомление (режим clients) остаётся.
+ *
  * Оферты сюда не входят (решение пользователя: вернёмся позже).
  * Переносимый SQL — офлайн-тест: tests/test_payments.php.
  */
@@ -58,22 +70,30 @@ final class PaymentWatch
     }
 
     /**
-     * Напоминания о выплатах с датой по графику «завтра» ($today + 1 день).
-     * $createEvents = false — только показать список, ничего не создавая.
+     * Напоминания о выплатах, для которых $today — последний рабочий день
+     * перед датой по графику (см. WorkingCalendar::scheduleDatesRemindedOn):
+     * обычно это одна дата — завтра, в пятницу — три. В нерабочий день
+     * ничего не делает. $createEvents = false — только показать список,
+     * ничего не создавая.
      *
      * @return array{created: int, existing: int, items: array<int, array<string, mixed>>}
      */
     public function remind(string $today, bool $createEvents = true): array
     {
-        $tomorrow = date('Y-m-d', strtotime($today . ' +1 day'));
         $result = ['created' => 0, 'existing' => 0, 'items' => []];
+        $dates = $this->calendar->scheduleDatesRemindedOn($today);
+        if ($dates === []) {
+            return $result;
+        }
+        $tomorrow = date('Y-m-d', (int) strtotime($today . ' +1 day'));
 
-        foreach ($this->plannedPayments([$tomorrow]) as $group) {
+        foreach ($this->plannedPayments($dates) as $group) {
+            $paymentDate = (string) $group['payment_date'];
             $result['items'][] = $group;
             if (!$createEvents) {
                 continue;
             }
-            if ($this->eventExists('R1', (int) $group['security_id'], $tomorrow)) {
+            if ($this->eventExists('R1', (int) $group['security_id'], $paymentDate)) {
                 $result['existing']++;
                 continue;
             }
@@ -81,9 +101,13 @@ final class PaymentWatch
                 eventTypeCode: 'R1',
                 issuerId: (int) $group['issuer_id'],
                 securityId: (int) $group['security_id'],
-                eventDate: $tomorrow,
-                statusText: 'Завтра выплата: ' . self::kindsText($group['payments']),
-                payload: $this->payload($group),
+                eventDate: $paymentDate,
+                statusText: ($paymentDate === $tomorrow ? 'Завтра выплата: ' : 'Выплата ' . date('d.m.Y', (int) strtotime($paymentDate)) . ': ')
+                    . self::kindsText($group['payments']),
+                // reminder_date — день напоминания: по нему текст решает, уместно ли слово «завтра».
+                // security_status — только у бумаги с нарушением: текст добавит, что выплата под вопросом.
+                payload: $this->payload($group) + ['reminder_date' => $today]
+                    + (self::isTroubled($group) ? ['security_status' => $group['security_status']] : []),
                 amountPlanned: self::totalPlanned($group['payments']),
             );
             $result['created']++;
@@ -109,10 +133,14 @@ final class PaymentWatch
         $dueDay = $this->calendar->previousWorkingDay($today);
 
         foreach ($this->plannedPayments($this->calendar->scheduleDatesDueOn($dueDay)) as $group) {
-            $result['items'][] = $group;
             if (!$createEvents) {
+                // Режим «только администратору»: бумаги, которые и так в техдефолте, ему не показываем.
+                if (!self::isTroubled($group)) {
+                    $result['items'][] = $group;
+                }
                 continue;
             }
+            $result['items'][] = $group;
             if ($this->eventExists('B2a', (int) $group['security_id'], $today)) {
                 $result['existing']++;
                 continue;
@@ -150,6 +178,9 @@ final class PaymentWatch
         $dueDay = $this->calendar->previousWorkingDay($today);
 
         foreach ($this->plannedPayments($this->calendar->scheduleDatesDueOn($dueDay)) as $group) {
+            if (self::isTroubled($group)) {
+                continue; // молчание НРД по бумаге в техдефолте — не сбой: администратору не сообщаем
+            }
             if (!$createEvents) {
                 $result['items'][] = $group;
                 continue;
@@ -209,7 +240,7 @@ final class PaymentWatch
      * обычных); погашенные, дефолтные и снятые с торгов не берутся.
      *
      * @param array<int, string> $dates
-     * @return array<int, array{security_id: int|string, issuer_id: int|string, isin: string, security_name: string, issuer_name: string, currency: ?string, payment_date: string, payments: array<int, array{kind: string, amount_planned: ?string}>}>
+     * @return array<int, array{security_id: int|string, issuer_id: int|string, isin: string, security_name: string, issuer_name: string, currency: ?string, security_status: string, payment_date: string, payments: array<int, array{kind: string, amount_planned: ?string}>}>
      */
     private function plannedPayments(array $dates): array
     {
@@ -217,7 +248,7 @@ final class PaymentWatch
             return [];
         }
         $in = implode(',', array_fill(0, count($dates), '?'));
-        $select = 'p.security_id, p.issuer_id, p.value_per_bond, s.isin, s.short_name AS security_name, s.currency, i.short_name AS issuer_name';
+        $select = 'p.security_id, p.issuer_id, p.value_per_bond, s.isin, s.short_name AS security_name, s.currency, s.status AS security_status, i.short_name AS issuer_name';
         $joins = 'JOIN securities s ON s.id = p.security_id JOIN issuers i ON i.id = p.issuer_id';
         $where = "p.status = 'planned' AND s.status IN ('active', 'tech_default')";
 
@@ -253,6 +284,7 @@ final class PaymentWatch
                     'security_name' => (string) $row['security_name'],
                     'issuer_name' => (string) $row['issuer_name'],
                     'currency' => $row['currency'] !== null ? (string) $row['currency'] : null,
+                    'security_status' => (string) $row['security_status'],
                     'payment_date' => (string) $row['payment_date'],
                     'payments' => [],
                 ];
@@ -265,6 +297,16 @@ final class PaymentWatch
         ksort($groups);
 
         return array_values($groups);
+    }
+
+    /**
+     * Бумага с нарушением: в техдефолте или дефолте.
+     *
+     * @param array<string, mixed> $group
+     */
+    private static function isTroubled(array $group): bool
+    {
+        return in_array($group['security_status'] ?? null, [SecurityStatus::TECH_DEFAULT, SecurityStatus::DEFAULTED], true);
     }
 
     private function eventExists(string $eventTypeCode, int $securityId, string $eventDate): bool

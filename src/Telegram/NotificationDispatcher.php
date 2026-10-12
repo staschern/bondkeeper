@@ -244,9 +244,12 @@ final class NotificationDispatcher
     }
 
     /**
-     * R1 — напоминание накануне выплаты (Этап 5, docs/STAGE5_PAYMENTS.md).
-     * Сутки считаются от даты по графику; если она выпала на выходной,
-     * отдельно называется день, когда деньги должны поступить на деле.
+     * R1 — напоминание о выплате (Этап 5, docs/STAGE5_PAYMENTS.md). Уходит
+     * в последний рабочий день перед датой по графику. Слово «завтра» —
+     * только когда выплата действительно на следующий календарный день
+     * (в пятницу о субботе — да, о воскресенье и понедельнике — нет, там
+     * просто дата). Оговорки про выходной нет (решение пользователя,
+     * 11.10.2026: «это все и так понимают»).
      * Заголовок темы жирным, как у остальных видов уведомлений (см.
      * buildMessageText()); "Выплаты" — одна общая тема на весь Этап 5
      * (R1/A2-A6/B1-B5/B2a), смайл перед темой меняется по характеру
@@ -264,14 +267,20 @@ final class NotificationDispatcher
                 . ' — ' . ($amount !== null ? self::money((string) $amount, $currency) . ' на бумагу' : 'сумма пока не определена');
         }
         $paymentDate = (string) ($payload['payment_date'] ?? '');
-        $effectiveDate = (string) ($payload['effective_date'] ?? $paymentDate);
+        // У напоминаний, созданных до 11.10.2026, дня напоминания в payload нет — они всегда создавались накануне.
+        $reminderDate = (string) ($payload['reminder_date'] ?? '');
+        $isTomorrow = $reminderDate === '' || date('Y-m-d', (int) strtotime($reminderDate . ' +1 day')) === $paymentDate;
 
-        $body = 'Завтра, ' . BotFormatting::formatDate($paymentDate) . ', выплата: ' . BotFormatting::escapeHtml(implode('; ', $parts)) . '.';
-        if ($effectiveDate !== $paymentDate) {
-            $body .= ' Дата выпадает на выходной — деньги должны поступить ' . BotFormatting::formatDate($effectiveDate) . '.';
-        }
+        $body = ($isTomorrow ? 'Завтра, ' . BotFormatting::formatDate($paymentDate) . ', выплата: ' : BotFormatting::formatDate($paymentDate) . ' выплата: ')
+            . BotFormatting::escapeHtml(implode('; ', $parts)) . '.';
+        // Решение пользователя (11.10.2026): если бумага в техдефолте или дефолте, это стоит указать — как и то, что выплата под вопросом.
+        $warning = match ((string) ($payload['security_status'] ?? '')) {
+            'tech_default' => "\n" . '⚠️ Бумага в техническом дефолте — выплата под вопросом.',
+            'default' => "\n" . '⚠️ Бумага в дефолте — выплата под вопросом.',
+            default => '',
+        };
 
-        return '<b>⏰ Выплаты:</b>' . "\n" . self::bondHeader($payload, $issuerName, $issuerInn) . "\n" . $body;
+        return '<b>⏰ Выплаты:</b>' . "\n" . self::bondHeader($payload, $issuerName, $issuerInn) . "\n" . $body . $warning;
     }
 
     /**
@@ -294,8 +303,15 @@ final class NotificationDispatcher
             'redemption' => 'о',
             default => '',
         };
-        $what = self::mbUcfirst(self::paymentKindName($kind)) . ($kind === 'coupon' ? ' за ' : ' ')
+        // Досрочное погашение выпуска по решению эмитента (payload.early, 12.10.2026): называем его прямо
+        // и напоминаем, каким был срок по графику, — клиент ждал погашения в другой день.
+        $early = ($payload['early'] ?? false) === true;
+        $what = ($early ? 'Досрочное погашение' : self::mbUcfirst(self::paymentKindName($kind))) . ($kind === 'coupon' ? ' за ' : ' ')
             . BotFormatting::formatDate((string) ($payload['payment_date'] ?? ''));
+        $earlyNote = $early
+            ? ' Выпуск погашен досрочно' . (($payload['maturity_date'] ?? null) !== null
+                ? ': срок по графику был ' . BotFormatting::formatDate((string) $payload['maturity_date']) : '') . '.'
+            : '';
         $currency = isset($payload['currency']) ? (string) $payload['currency'] : null;
         $planned = $payload['amount_planned'] ?? null;
         $actual = $payload['amount_actual'] ?? null;
@@ -333,12 +349,12 @@ final class NotificationDispatcher
                 . ($tranche !== null ? ' ' . self::money((string) $tranche, $currency) : '')
                 . ($actual !== null ? ', всего получено ' . self::money((string) $actual, $currency) . $ofPlanned . ' на бумагу' : '') . '.' . $deadline],
             'B5' => ['✅', "{$what} выплачен{$ending} полностью после просрочки"
-                . ($actual !== null ? ': ' . self::money((string) $actual, $currency) . ' на бумагу' : '') . '.' . $lateDates],
+                . ($actual !== null ? ': ' . self::money((string) $actual, $currency) . ' на бумагу' : '') . '.' . $lateDates . $earlyNote],
             'C2' => ['🔴', "{$what}: НРД объявил дефолт — выплата не исполнена в течение 10 рабочих дней после срока"
                 . ($dueDate !== '' ? ' (' . BotFormatting::formatDate($dueDate) . ')' : '') . '.'],
             default => ['✅', ($payload['extra'] ?? false) === true
                 ? "{$what}: получена ещё одна выплата" . ($tranche !== null ? ' — ' . self::money((string) $tranche, $currency) . ' на бумагу' : '') . '.'
-                : "{$what} получен{$ending} НРД" . ($actual !== null ? ': ' . self::money((string) $actual, $currency) . ' на бумагу' : '') . '.'],
+                : "{$what} получен{$ending} НРД" . ($actual !== null ? ': ' . self::money((string) $actual, $currency) . ' на бумагу' : '') . '.' . $earlyNote],
         };
 
         return "<b>{$emoji} Выплаты:</b>" . "\n" . self::bondHeader($payload, $issuerName, $issuerInn) . "\n" . $body;

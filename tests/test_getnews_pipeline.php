@@ -83,11 +83,12 @@ $db->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
 $db->sqliteCreateFunction('NOW', static fn (): string => date('Y-m-d H:i:s'), 0);
 
 $db->exec('CREATE TABLE issuers (id INTEGER PRIMARY KEY, short_name TEXT, inn TEXT)');
-$db->exec("CREATE TABLE securities (id INTEGER PRIMARY KEY AUTOINCREMENT, isin TEXT, issuer_id INTEGER, short_name TEXT, currency TEXT DEFAULT 'RUB', is_structured INTEGER DEFAULT 0, status TEXT DEFAULT 'active')");
+$db->exec("CREATE TABLE securities (id INTEGER PRIMARY KEY AUTOINCREMENT, isin TEXT, issuer_id INTEGER, short_name TEXT, currency TEXT DEFAULT 'RUB', is_structured INTEGER DEFAULT 0, status TEXT DEFAULT 'active', maturity_date TEXT, status_reason TEXT, status_changed_at TEXT, ended_at TEXT, missing_since TEXT, has_offer INTEGER DEFAULT 0)");
+$db->exec('CREATE TABLE offers (id INTEGER PRIMARY KEY AUTOINCREMENT, security_id INTEGER, execution_date_planned TEXT, offer_type TEXT)');
 $schedule = "id INTEGER PRIMARY KEY AUTOINCREMENT, security_id INTEGER, issuer_id INTEGER, %s TEXT, value_per_bond TEXT, actual_value_per_bond TEXT, full_default_date_planned TEXT, status TEXT DEFAULT 'planned'";
 $db->exec('CREATE TABLE coupons (' . sprintf($schedule, 'period_end_date') . ')');
 $db->exec('CREATE TABLE amortizations (' . sprintf($schedule, 'payment_date_planned') . ')');
-$db->exec('CREATE TABLE redemptions (' . sprintf($schedule, 'payment_date_planned') . ", redemption_type TEXT DEFAULT 'scheduled_maturity')");
+$db->exec('CREATE TABLE redemptions (' . sprintf($schedule, 'payment_date_planned') . ", redemption_type TEXT DEFAULT 'scheduled_maturity', triggered_by_event_id INTEGER)");
 $db->exec('CREATE TABLE event_types (code TEXT PRIMARY KEY, default_priority TEXT, notify_client INTEGER)');
 $db->exec("INSERT INTO event_types VALUES ('A2','green',1),('A3','green',0),('A4','info',1),('A5','info',0),('A6','info',1),('A7','info',0),
     ('B1','red',1),('B1a','yellow',1),('B2','red',1),('B2a','yellow',1),('B2b','yellow',0),('B4','yellow',1),('B5','green',1),('C2','critical',1),('R1','info',1)");
@@ -123,7 +124,8 @@ $addBond = static function (string $isin, string $name, array $rows, string $cur
             'coupon' => $insert('coupons', 'period_end_date', $date, $value),
             'amortization' => $insert('amortizations', 'payment_date_planned', $date, $value),
             'redemption' => $insert('redemptions', 'payment_date_planned', $date, $value),
-            'final' => [$insert('amortizations', 'payment_date_planned', $date, $value), $insert('redemptions', 'payment_date_planned', $date, '0.0000')],
+            'final' => [$insert('amortizations', 'payment_date_planned', $date, $value), $insert('redemptions', 'payment_date_planned', $date, '0.0000'),
+                $db->exec("UPDATE securities SET maturity_date = '{$date}' WHERE id = {$securityId}")],
         };
     }
 
@@ -145,7 +147,9 @@ $invobl = $addBond('RU000A109QT1', 'ИнвОбл11', [['coupon', '2026-10-02', '
 $acronUsd = $addBond('RU000A10BRM5', 'Акрон Б1P9', [['coupon', '2026-09-29', '6.3700']], 'USD');
 $ltrade = $addBond('RU000A105RF6', 'ЛТрейд 1P6', [['coupon', '2026-09-30', '7.9500'], ['amortization', '2026-09-30', '41.6000']]);
 $veb = $addBond('RU000A10FS15', 'ВЭБ2Р-К749', [['coupon', '2026-09-23', '5.2700'], ['final', '2026-09-23', '1000.0000']]);
-$tb3 = $addBond('RU000A10B7T7', 'ТБ-3_01', [['amortization', '2026-09-26', '98.7700']]); // 26.09 — суббота
+// ТБ-3_01: срок погашения — 26.03.2030; 26.09 — суббота, день исполнения — понедельник 28.09.
+$tb3 = $addBond('RU000A10B7T7', 'ТБ-3_01', [['coupon', '2026-09-26', '12.5000'], ['amortization', '2026-09-26', '30.0000'], ['coupon', '2026-10-26', '12.5000'],
+    ['amortization', '2026-10-26', '30.0000'], ['coupon', '2030-03-26', '1.0000'], ['final', '2030-03-26', '38.7700']]);
 $samoletP13 = $addBond('RU000A107RZ0', 'СамолетP13', [['coupon', '2026-09-26', '17.2600']]); // суббота
 $quiet = $addBond('RU000A0QUIET0', 'Тихий БО-01', [['coupon', '2026-09-30', '10.0000']], 'RUB', 2);
 
@@ -184,8 +188,30 @@ check('бумаги нет в базе (оферта не разбирается
 
 echo "\n--- погашение: в графике оно лежит строкой amortizations, в redemptions — ноль ---\n";
 check('MCAL на 100 % номинала → «погашение получено»', ['processed', ['A6']], $feed('mcal_full_veb'));
-check('…сумма записана в строку amortizations, нулевая строка redemptions не тронута', ['paid', '1000.0000', 'planned'], [$amortization($veb, '2026-09-23')['status'], $amortization($veb, '2026-09-23')['actual'], $redemption($veb, '2026-09-23')['status']]);
-check('MCAL на часть номинала → амортизация (в графике суббота 26.09)', [['processed', ['A4']], 'paid'], [$feed('mcal_partial_tb3'), $amortization($tb3, '2026-09-26')['status']]);
+check('…сумма записана в строку amortizations; нулевая строка redemptions повторяет её статус, факт по ней — 0 (номинал не считается дважды)',
+    ['paid', '1000.0000', 'paid', '0.0000'],
+    [$amortization($veb, '2026-09-23')['status'], $amortization($veb, '2026-09-23')['actual'], $redemption($veb, '2026-09-23')['status'], $redemption($veb, '2026-09-23')['actual']]);
+
+echo "\n--- досрочное погашение выпуска: ТБ-3_01, НРД гасит остаток номинала (9,877 %) 28.09.2026 при сроке 26.03.2030 ---\n";
+$tb3Result = $processor->process(GetNewsMessageMapper::map($fixtures['mcal_partial_tb3']));
+check('MCAL раньше срока → это погашение выпуска, а не амортизация: клиенту «получено» по погашению', ['processed', ['A6'], true],
+    [$tb3Result['result'], $tb3Result['events'], $tb3Result['early_redemption'] ?? false]);
+$earlyRow = $db->query("SELECT * FROM redemptions WHERE security_id = {$tb3} AND redemption_type = 'early_issuer_call'")->fetch();
+check('создана строка погашения «досрочно по решению эмитента»: дата, сумма остатка, факт, статус', ['2026-09-28', '98.7700', '98.7700', 'paid'],
+    [$earlyRow['payment_date_planned'], $earlyRow['value_per_bond'], $earlyRow['actual_value_per_bond'], $earlyRow['status']]);
+check('в строке — ссылка на событие, по которому она создана', 'A6',
+    $db->query('SELECT event_type_code FROM events WHERE id = ' . (int) $earlyRow['triggered_by_event_id'])->fetchColumn());
+check('в событии — признак досрочного погашения и срок по графику', [true, '2030-03-26', 'redemption'],
+    [$lastPayload($tb3)['early'], $lastPayload($tb3)['maturity_date'], $lastPayload($tb3)['kind']]);
+check('бумага погашена досрочно, дата окончания — день погашения', ['matured', 'early_redemption_nsd', '2026-09-28'],
+    array_values($db->query("SELECT status, status_reason, ended_at FROM securities WHERE id = {$tb3}")->fetch()));
+check('купон на день погашения (в графике суббота 26.09, исполнение 28.09) остаётся — он выплачивается вместе с погашением', 'planned', $coupon($tb3, '2026-09-26')['status']);
+check('плановая амортизация того же дня отменена — её заменило погашение остатка', 'cancelled', $amortization($tb3, '2026-09-26')['status']);
+check('купоны, амортизации и плановое погашение после этой даты отменены', ['cancelled', 'cancelled', 'cancelled', 'cancelled', 'cancelled'],
+    [$coupon($tb3, '2026-10-26')['status'], $amortization($tb3, '2026-10-26')['status'], $coupon($tb3, '2030-03-26')['status'],
+        $amortization($tb3, '2030-03-26')['status'], $db->query("SELECT status FROM redemptions WHERE security_id = {$tb3} AND redemption_type = 'scheduled_maturity'")->fetchColumn()]);
+check('то же сообщение ещё раз → повтор, второй строки погашения нет', ['duplicate', 1],
+    [$feed('mcal_partial_tb3')[0], (int) $db->query("SELECT COUNT(*) FROM redemptions WHERE security_id = {$tb3} AND redemption_type = 'early_issuer_call'")->fetchColumn()]);
 
 echo "\n--- деньги пришли полностью, но позже срока: ЭМ ЗАПАД и ЛКХ ---\n";
 check('ЭМ ЗАПАД: срок 29.09, деньги 30.09 → «выплачено после просрочки», а не «не выплачено»', ['processed', ['B5']], $feed('late_full_em_zapad'));
@@ -211,11 +237,11 @@ check('остаток пришёл в срок → обычное «получе
 
 echo "\n--- не выплачено в срок и дефолт: объявления НРД ---\n";
 check('«Гарант-Инвест»: объявление в состоянии «Техн.дефолт» → красное «не выплачено в срок»', ['processed', ['B2']], $feed('garant_tech_default_announcement'));
-check('срок полного дефолта: 28.09 + 10 рабочих дней', ['status' => 'not_paid', 'actual' => null, 'deadline' => '2026-10-12'], $coupon($garant, '2026-09-28'));
-check('ЛКХ-02: в объявлении понедельник 28.09, в графике воскресенье 27.09 → та же выплата', [['processed', ['B2']], 'not_paid'], [$feed('lkh2_tech_default_announcement'), $coupon($lkh2, '2026-09-27')['status']]);
+check('срок полного дефолта: 28.09 + 10 рабочих дней', ['status' => 'tech_default', 'actual' => null, 'deadline' => '2026-10-12'], $coupon($garant, '2026-09-28'));
+check('ЛКХ-02: в объявлении понедельник 28.09, в графике воскресенье 27.09 → та же выплата', [['processed', ['B2']], 'tech_default'], [$feed('lkh2_tech_default_announcement'), $coupon($lkh2, '2026-09-27')['status']]);
 check('ВЗВТ: частичная выплата на 14-й рабочий день, получение мы не видели → «частично» и отметка «передано»', ['processed', ['B1', 'A3']], $feed('vzvt_partial_transferred_state_D'));
 check('«Монополия»: объявление в состоянии «Дефолт» по купону → событие «дефолт»', ['processed', ['C2']], $feed('monopoly_default_coupon'));
-check('…и по погашению (ложится на строку amortizations)', [['processed', ['C2']], 'not_paid'], [$feed('monopoly_default_redemption'), $amortization($monopoly, '2026-09-08')['status']]);
+check('…и по погашению (ложится на строку amortizations)', [['processed', ['C2']], 'default'], [$feed('monopoly_default_redemption'), $amortization($monopoly, '2026-09-08')['status']]);
 check('история выплаты закрыта как «дефолт»', ['resolved', 'defaulted'], array_values($db->query("SELECT status, resolution_type FROM event_stories WHERE security_id = {$monopoly} ORDER BY id LIMIT 1")->fetch()));
 $again = $fixtures['monopoly_default_coupon'];
 $again['content_id_out'] = 47330186521;
@@ -296,6 +322,19 @@ $names = array_column($noReceipt['items'], 'security_name');
 check('вторник 29.09, 12:02: по выплатам понедельника в списке только те, о ком НРД молчит', [], array_values(array_intersect($names, ['СамолетP20', 'СамолетP13', 'ГПБ004Р52', 'ГарИнв2P05', 'ЛКХ-02', 'ТБ-3_01'])));
 $reminder = $watch->remind('2026-10-01', false);
 check('напоминание на 02.10 по ИнвОбл11 не создаётся: купон и погашение уже получены НРД', [], $reminder['items']);
+echo "\n--- статус бумаги после сообщений НРД ---\n";
+$statusOf = static fn (int $id): array => array_values($db->query("SELECT status, status_reason FROM securities WHERE id = {$id}")->fetch());
+check('погашение получено полностью → бумага погашена (ВЭБ2Р-К749)', ['matured', 'scheduled_maturity'], $statusOf($veb));
+check('…у неё стоит дата окончания выпуска — день поступления денег', '2026-09-23', $db->query("SELECT ended_at FROM securities WHERE id = {$veb}")->fetchColumn());
+check('погашение пришло частями и закрыто после просрочки → тоже погашена (СамолетP20)', 'matured', $statusOf($samolet)[0]);
+check('купон не выплачен в срок → техдефолт (ГарИнв2P05)', ['tech_default', 'payment_missed'], $statusOf($garant));
+check('НРД объявил дефолт → дефолт (МОНОП 1P04)', ['default', 'nsd_default'], $statusOf($monopoly));
+check('обычный купон получен → бумага по-прежнему в обращении (РЖД 1Р-13R)', 'active', $statusOf($rzd)[0]);
+check('поздняя полная выплата без объявленной просрочки статус не трогает (ЭМ ЗАПАД)', 'active', $statusOf($emZapad)[0]);
+check('часть купона до срока — не нарушение, статус не меняется (ММЗ001P-01)', 'active', $statusOf($mmz)[0]);
+
+// Дальше та же бумага ВЭБ служит образцом «напоминание в день погашения»: возвращаем её в обращение вручную.
+$db->exec("UPDATE securities SET status = 'active', status_reason = NULL, ended_at = NULL WHERE id = {$veb}");
 $db->exec("INSERT INTO coupons (security_id, issuer_id, period_end_date, value_per_bond) VALUES ({$veb}, 1, '2026-10-23', '5.2700')");
 $db->exec("UPDATE amortizations SET payment_date_planned = '2026-10-23', status = 'planned', actual_value_per_bond = NULL WHERE security_id = {$veb}");
 $db->exec("UPDATE redemptions SET payment_date_planned = '2026-10-23' WHERE security_id = {$veb}");

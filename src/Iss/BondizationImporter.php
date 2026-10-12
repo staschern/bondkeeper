@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace BondKeeper\Iss;
 
+use BondKeeper\Securities\SecurityStatus;
 use BondKeeper\Support\Logger;
 use PDO;
 
@@ -104,7 +105,8 @@ final class BondizationImporter
         $this->amortizationsUpserted = 0;
         $this->failed = 0;
 
-        $sql = 'SELECT s.id, s.isin, s.secid, s.issuer_id FROM securities s WHERE s.status = "active"';
+        // Бумаги в обращении — не только active: у выпуска в техдефолте или дефолте график тоже нужен.
+        $sql = 'SELECT s.id, s.isin, s.secid, s.issuer_id FROM securities s WHERE s.status IN (' . SecurityStatus::inCirculationSql() . ')';
         if (!$forceAll) {
             $sql .= ' AND (
                 NOT EXISTS (SELECT 1 FROM coupons c WHERE c.security_id = s.id)

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace BondKeeper\Payments;
 
 use BondKeeper\Events\EventPublisher;
+use BondKeeper\Securities\SecurityStatus;
 use PDO;
 
 /**
@@ -67,6 +68,34 @@ use PDO;
  * Учтён ли перевод, определяется по дате поступления и сумме (они есть в
  * каждом сообщении НРД о деньгах), а не по порядку сообщений.
  *
+ * === Статусы строки графика (12.10.2026, миграция 031) ===
+ * planned → paid / partial / tech_default → default — «лестница»,
+ * согласованная с пользователем 11.10.2026:
+ *   tech_default — НРД объявил «не исполнено в срок» (раньше — not_paid);
+ *   default      — НРД объявил дефолт (раньше статус не менялся);
+ *   partial      — получена часть; после объявленного дефолта частичная
+ *                  доплата статус default не понижает;
+ *   paid         — получено полностью; срок полного дефолта при этом
+ *                  очищается (раньше оставался и после поздней выплаты).
+ * Строки unconfirmed («дата прошла, сообщения нет») и cancelled («выплаты
+ * не будет») для входящего сообщения равны planned: деньги по ним
+ * засчитываются как обычно (ScheduleStatuses).
+ *
+ * === Досрочное погашение (12.10.2026) ===
+ * Сообщение НРД с кодом MCAL и датой раньше срока погашения — погашение
+ * всего остатка номинала по решению эмитента, какой бы ни была доля (ТБ-3_01
+ * — 9,877 %, ДОМРФИА 1P — 3,605 %: это остаток после амортизаций; все семь
+ * таких выпусков из выгрузки 18–30.09.2026 после этого ушли с биржи). В
+ * графике такой выплаты нет. Раньше сообщение либо оставалось без строки
+ * («не нашлось выплаты»), либо — при доле меньше 100 % — ложилось на
+ * плановую амортизацию той же даты, и бумага оставалась в обращении.
+ * Теперь: создаётся строка redemptions с redemption_type =
+ * early_issuer_call, фактической датой и суммой; событие A6 уходит
+ * клиентам как «досрочное погашение»; ссылка на событие —
+ * triggered_by_event_id; бумага получает статус matured; хвост графика и
+ * плановое погашение отменяются. То же — у структурных выпусков.
+ * MCAL на дату срока — обычное погашение (ВЭБ.РФ, ВТБ), как и было.
+ *
  * $silent = true — «тихая» загрузка: события и статусы пишутся как обычно,
  * но клиентам не рассылаются (для первой загрузки истории). В той же
  * транзакции, что и событие, для каждого подписчика создаётся строка
@@ -106,19 +135,27 @@ final class PaymentProcessor
     /** События, означающие, что срок выплаты нарушен. */
     private const VIOLATION_CODES = ['B1', 'B2', 'B4', 'C2'];
 
+    private const EARLY_REDEMPTION_TYPE = 'early_issuer_call';
+
+    private readonly SecurityStatus $securityStatus;
+    private readonly ScheduleStatuses $schedule;
+
     public function __construct(
         private readonly PDO $db,
         private readonly EventPublisher $publisher,
         private readonly WorkingCalendar $calendar,
         private readonly bool $silent = false,
     ) {
+        $this->securityStatus = new SecurityStatus($db);
+        $this->schedule = new ScheduleStatuses($db, $calendar);
     }
 
     /**
-     * @return array{result: string, events: array<int, string>, note: ?string, retry?: bool}
+     * @return array{result: string, events: array<int, string>, note: ?string, retry?: bool, early_redemption?: bool, security_name?: string}
      *         events — коды созданных событий по порядку; note — пояснение для лога;
      *         retry (только у unmatched) — это повторная попытка по сообщению, которое
-     *         уже не удалось привязать раньше: администратору о нём сообщалось
+     *         уже не удалось привязать раньше: администратору о нём сообщалось;
+     *         early_redemption — сообщение обработано как досрочное погашение выпуска
      */
     public function process(PaymentMessage $message): array
     {
@@ -132,9 +169,14 @@ final class PaymentProcessor
             return ['result' => self::RESULT_DUPLICATE, 'events' => [], 'note' => 'сообщение уже обработано'];
         }
 
-        $payment = $this->findPayment($message, (int) $security['id']);
+        $early = self::isEarlyRedemption($message, $security);
+        // Досрочное погашение — всегда «погашение», даже когда НРД называет долю меньше 100 % (остаток номинала).
+        $kind = $early ? PaymentMessage::KIND_REDEMPTION : $message->kind;
+        $payment = $early ? $this->findEarlyRedemption((int) $security['id']) : $this->findPayment($message, (int) $security['id']);
         $buildFromMessage = false;
-        if ($payment === null) {
+        if ($payment === null && !$early) {
+            // Выплаты в графике нет, но само погашение — факт: статус бумаги меняется, даже если сообщение не к чему привязать.
+            $this->markRedeemed($message, $kind, $security, $message->execution === PaymentMessage::EXECUTION_FULL);
             if ((int) ($security['is_structured'] ?? 0) === 1) {
                 if (!self::canBuildFromMessage($message)) {
                     $reason = 'структурный выпуск: выплаты (' . PaymentMessage::kindLabel($message->kind) . " на {$message->paymentDate}) нет в графике — пропущено";
@@ -155,8 +197,28 @@ final class PaymentProcessor
         try {
             if ($buildFromMessage) {
                 $payment = $this->createCouponFromMessage($message, $security);
+            } elseif ($payment === null) {
+                $payment = $this->createEarlyRedemption($message, $security);
             }
-            $result = $this->apply($message, $security, $payment, $rawId);
+            $result = $this->apply($message, $kind, $security, $payment, $rawId, $early);
+            // Статус бумаги: не выплачено в срок → техдефолт, дефолт от НРД → дефолт, долг закрыт → снова в обращении.
+            $this->securityStatus->applyPaymentEvents((int) $security['id'], $result['events']);
+            // «Получено» (A6) или «выплачено полностью после просрочки» (B5) по погашению — номинал возвращён целиком.
+            $paidInFull = array_intersect([self::KINDS[PaymentMessage::KIND_REDEMPTION][3], 'B5'], $result['events']) !== [];
+            $this->markRedeemed($message, $kind, $security, $paidInFull);
+            if ($early) {
+                if ($result['event_ids'] !== []) {
+                    $this->db->prepare('UPDATE redemptions SET triggered_by_event_id = :event_id WHERE id = :id AND triggered_by_event_id IS NULL')
+                        ->execute(['event_id' => $result['event_ids'][0], 'id' => (int) $payment['id']]);
+                }
+                if ($paidInFull) {
+                    // Выпуск закончился: купоны после этой даты, амортизации и плановое погашение не состоятся.
+                    $this->schedule->cancelAfterEarlyRedemption((int) $security['id'], (string) $payment['payment_date']);
+                }
+            } elseif ($payment['table'] === 'amortizations') {
+                // Последняя амортизация — это выплата номинала в конце срока: строка планового погашения повторяет её статус.
+                $this->schedule->mirrorFinalAmortization((int) $security['id']);
+            }
             $this->markRaw($rawId, 'processed', null);
             $this->db->commit();
         } catch (\Throwable $e) {
@@ -164,28 +226,117 @@ final class PaymentProcessor
             $this->markRaw($rawId, 'failed', $e->getMessage());
             throw $e;
         }
+        unset($result['event_ids']);
 
-        return $result;
+        return $result + ($early ? ['early_redemption' => true, 'security_name' => (string) $security['short_name']] : []);
+    }
+
+    /**
+     * Сообщение НРД о досрочном погашении выпуска: код MCAL и дата раньше
+     * срока по графику (см. докблок класса). У бумаги без срока любая дата
+     * MCAL — досрочная.
+     *
+     * @param array<string, mixed> $security
+     */
+    private static function isEarlyRedemption(PaymentMessage $message, array $security): bool
+    {
+        return $message->caType === 'MCAL'
+            && SecurityStatus::isEarly($message->paymentDate, isset($security['maturity_date']) ? (string) $security['maturity_date'] : null);
+    }
+
+    /**
+     * Строка досрочного погашения бумаги, если она уже создана (первым
+     * сообщением: «получено», затем приходит «передано»).
+     *
+     * @return array<string, mixed>|null
+     */
+    private function findEarlyRedemption(int $securityId): ?array
+    {
+        $stmt = $this->db->prepare(
+            "SELECT id, payment_date_planned AS payment_date, value_per_bond, actual_value_per_bond, full_default_date_planned, status
+             FROM redemptions WHERE security_id = :security_id AND redemption_type = '" . self::EARLY_REDEMPTION_TYPE . "' ORDER BY id DESC LIMIT 1"
+        );
+        $stmt->execute(['security_id' => $securityId]);
+        $row = $stmt->fetch();
+
+        return $row !== false ? $row + ['table' => 'redemptions', 'story_column' => 'redemption_id', 'match' => 'exact'] : null;
+    }
+
+    /**
+     * Строка redemptions для досрочного погашения: дата и плановая сумма —
+     * из сообщения НРД (остаток номинала на бумагу).
+     *
+     * @param array{id: int|string, issuer_id: int|string} $security
+     * @return array<string, mixed> строка в том же виде, что из findPayment()
+     */
+    private function createEarlyRedemption(PaymentMessage $message, array $security): array
+    {
+        $this->db->prepare(
+            "INSERT INTO redemptions (security_id, issuer_id, payment_date_planned, value_per_bond, redemption_type)
+             VALUES (:security_id, :issuer_id, :payment_date, :value, '" . self::EARLY_REDEMPTION_TYPE . "')"
+        )->execute([
+            'security_id' => (int) $security['id'],
+            'issuer_id' => (int) $security['issuer_id'],
+            'payment_date' => $message->paymentDate,
+            'value' => self::money((float) ($message->plannedPerBond ?? $message->amountPerBond ?? 0)),
+        ]);
+        $payment = $this->findEarlyRedemption((int) $security['id']);
+        if ($payment === null) {
+            throw new \RuntimeException("Не удалось создать строку досрочного погашения для {$message->isin} на {$message->paymentDate}");
+        }
+
+        return $payment;
+    }
+
+    /**
+     * Погашение получено полностью — выпуск закончился: бумага получает
+     * статус matured (11.10.2026, docs/SECURITY_STATUS.md). Досрочное оно
+     * или по сроку, видно по дате: раньше срока по графику больше чем на
+     * SecurityStatus::EARLY_REDEMPTION_DAYS дней — досрочное (ГИДРОМАШБ3: погашена
+     * 25.09.2026 при сроке 20.09.2030). Раньше такая бумага оставалась
+     * active, и по ней продолжали создаваться напоминания о купонах.
+     *
+     * @param array<string, mixed> $security
+     * @param bool $paidInFull номинал получен целиком (для сообщения без строки в графике — НРД сообщил о полном исполнении)
+     */
+    private function markRedeemed(PaymentMessage $message, string $kind, array $security, bool $paidInFull): void
+    {
+        if ($kind !== PaymentMessage::KIND_REDEMPTION || !$paidInFull) {
+            return;
+        }
+        $maturity = isset($security['maturity_date']) ? (string) $security['maturity_date'] : '';
+        $early = $maturity !== '' && SecurityStatus::isEarly($message->paymentDate, $maturity);
+        $this->securityStatus->set(
+            (int) $security['id'],
+            SecurityStatus::MATURED,
+            $early ? SecurityStatus::REASON_EARLY_NSD : SecurityStatus::REASON_SCHEDULED,
+            // Дата окончания выпуска — день погашения; если деньги пришли позже него — день поступления.
+            max($message->paymentDate, $message->receivedDate ?? $message->paymentDate),
+        );
     }
 
     /**
      * Куда ляжет сообщение, без записи в базу — для просмотра (--dry-run).
      *
-     * @return array{security: ?array<string, mixed>, payment: ?array<string, mixed>, structured: ?string}
+     * @return array{security: ?array<string, mixed>, payment: ?array<string, mixed>, structured: ?string, early: bool}
      *         payment: строка графика с ключами table (в какой таблице) и match (exact | shifted);
      *         structured (только когда выплаты в графике нет, а выпуск структурный):
-     *         build — купон будет создан по сообщению, skip — сообщение будет пропущено
+     *         build — купон будет создан по сообщению, skip — сообщение будет пропущено;
+     *         early — это досрочное погашение выпуска: строка погашения будет создана по сообщению
      */
     public function locate(PaymentMessage $message): array
     {
         $security = $this->findSecurity($message->isin);
+        if ($security !== null && self::isEarlyRedemption($message, $security)) {
+            return ['security' => $security, 'payment' => $this->findEarlyRedemption((int) $security['id']), 'structured' => null, 'early' => true];
+        }
         $payment = $security !== null ? $this->findPayment($message, (int) $security['id']) : null;
         $structured = null;
         if ($security !== null && $payment === null && (int) ($security['is_structured'] ?? 0) === 1) {
             $structured = self::canBuildFromMessage($message) ? 'build' : 'skip';
         }
 
-        return ['security' => $security, 'payment' => $payment, 'structured' => $structured];
+        return ['security' => $security, 'payment' => $payment, 'structured' => $structured, 'early' => false];
     }
 
     /**
@@ -233,11 +384,12 @@ final class PaymentProcessor
     /**
      * @param array{id: int|string, issuer_id: int|string, short_name: string, isin: string} $security
      * @param array<string, mixed> $payment строка графика из findPayment()
-     * @return array{result: string, events: array<int, string>, note: ?string}
+     * @param string $kind вид выплаты; у досрочного погашения — всегда «погашение», что бы ни стояло в сообщении
+     * @return array{result: string, events: array<int, string>, note: ?string, event_ids: array<int, int>}
      */
-    private function apply(PaymentMessage $message, array $security, array $payment, int $rawId): array
+    private function apply(PaymentMessage $message, string $kind, array $security, array $payment, int $rawId, bool $early = false): array
     {
-        [, , , $receivedCode, $transferredCode] = self::KINDS[$message->kind];
+        [, , , $receivedCode, $transferredCode] = self::KINDS[$kind];
         $status = (string) $payment['status'];
         $ourPlanned = $payment['value_per_bond'] !== null ? (float) $payment['value_per_bond'] : null;
         $planned = $message->plannedPerBond !== null ? (float) $message->plannedPerBond : $ourPlanned;
@@ -245,9 +397,9 @@ final class PaymentProcessor
         $amount = $message->amountPerBond !== null ? (float) $message->amountPerBond : null;
         $effectiveDate = $this->calendar->effectiveDate((string) $payment['payment_date']);
         $fullDefaultDate = $payment['full_default_date_planned'] ?? null;
-        $wasDeviated = in_array($status, ['partial', 'not_paid', 'tech_default'], true);
+        $wasDeviated = in_array($status, ['partial', 'tech_default', 'default'], true);
 
-        $storyId = $this->findOrOpenStory($security, $payment, $message->kind);
+        $storyId = $this->findOrOpenStory($security, $payment, $kind, $early);
         $history = $this->storyEvents($storyId);
         $violated = array_intersect(array_column($history, 'code'), self::VIOLATION_CODES) !== [];
 
@@ -264,7 +416,7 @@ final class PaymentProcessor
             } elseif (in_array('C2', array_column($history, 'code'), true)) {
                 $note = 'о дефолте по этой выплате уже сообщалось';
             } else {
-                $newStatus = $wasDeviated ? $status : 'not_paid';
+                $newStatus = 'default';
                 $fullDefaultDate ??= $this->calendar->addWorkingDays($effectiveDate, self::DEFAULT_GRACE_WORKING_DAYS);
                 $resolution = 'defaulted';
                 $events[] = 'C2';
@@ -275,7 +427,7 @@ final class PaymentProcessor
             } elseif (in_array('B2', array_column($history, 'code'), true)) {
                 $note = 'о неисполнении по этой выплате уже сообщалось';
             } else {
-                $newStatus = $wasDeviated ? $status : 'not_paid';
+                $newStatus = $wasDeviated ? $status : 'tech_default';
                 $fullDefaultDate ??= $this->calendar->addWorkingDays($effectiveDate, self::DEFAULT_GRACE_WORKING_DAYS);
                 $events[] = 'B2';
             }
@@ -309,7 +461,8 @@ final class PaymentProcessor
                 $resolution = 'paid';
                 $events[] = $violated || $message->late ? 'B5' : $receivedCode;
             } else {
-                $newStatus = 'partial';
+                // После объявленного дефолта частичная доплата статус не понижает.
+                $newStatus = $status === 'default' ? 'default' : 'partial';
                 if ($message->beforeDue && !$message->late && !$violated) {
                     // Часть пришла раньше срока: срок не нарушен, отсчёта до дефолта нет.
                     $events[] = $wasDeviated ? 'B4' : 'B1a';
@@ -325,7 +478,11 @@ final class PaymentProcessor
         }
 
         if ($events === []) {
-            return ['result' => self::RESULT_NO_CHANGE, 'events' => [], 'note' => $note];
+            return ['result' => self::RESULT_NO_CHANGE, 'events' => [], 'note' => $note, 'event_ids' => []];
+        }
+        if ($newStatus === 'paid') {
+            // Долг закрыт — срока полного дефолта у выплаты больше нет.
+            $fullDefaultDate = null;
         }
 
         $this->updatePayment((string) $payment['table'], (int) $payment['id'], $newActual, $newStatus, $fullDefaultDate);
@@ -334,7 +491,7 @@ final class PaymentProcessor
         }
 
         $payload = [
-            'kind' => $message->kind,
+            'kind' => $kind,
             'isin' => (string) $security['isin'],
             'security_name' => (string) $security['short_name'],
             'payment_date' => (string) $payment['payment_date'],
@@ -352,8 +509,10 @@ final class PaymentProcessor
             'late' => $message->late,
             'before_due' => $message->beforeDue,
             'extra' => $extra,
-            'full_default_date' => $newStatus === 'paid' ? null : $fullDefaultDate,
-            'working_days_to_default' => $newStatus === 'paid' || $fullDefaultDate === null
+            'early' => $early,
+            'maturity_date' => $early && isset($security['maturity_date']) ? (string) $security['maturity_date'] : null,
+            'full_default_date' => $fullDefaultDate,
+            'working_days_to_default' => $fullDefaultDate === null
                 ? null
                 : $this->calendar->workingDaysBetween($message->messageDate, $fullDefaultDate),
             'source' => self::SOURCE,
@@ -362,25 +521,27 @@ final class PaymentProcessor
             'action_ref' => $message->actionRef,
         ];
 
+        $eventIds = [];
         foreach ($events as $code) {
             $eventId = $this->publisher->publishPaymentEvent(
                 eventTypeCode: $code,
                 issuerId: (int) $security['issuer_id'],
                 securityId: (int) $security['id'],
                 eventDate: $message->messageDate,
-                statusText: self::statusText($code, $message->kind, $payload),
+                statusText: self::statusText($code, $kind, $payload),
                 payload: $payload,
                 storyId: $storyId,
                 rawMessageId: $rawId,
                 amountPlanned: self::money($planned),
                 amountActual: self::money($newActual),
             );
+            $eventIds[] = $eventId;
             if ($this->silent) {
                 $this->suppressNotifications($eventId, (int) $security['issuer_id']);
             }
         }
 
-        return ['result' => self::RESULT_PROCESSED, 'events' => $events, 'note' => $note];
+        return ['result' => self::RESULT_PROCESSED, 'events' => $events, 'note' => $note, 'event_ids' => $eventIds];
     }
 
     /**
@@ -395,7 +556,7 @@ final class PaymentProcessor
     private function alreadyCounted(PaymentMessage $message, string $status, array $history): bool
     {
         if ($message->receivedDate === null || $message->amountPerBond === null) {
-            return $message->stage === PaymentMessage::STAGE_TRANSFERRED && $status !== 'planned';
+            return $message->stage === PaymentMessage::STAGE_TRANSFERRED && !in_array($status, ScheduleStatuses::NOT_RECEIVED, true);
         }
 
         foreach ($history as $event) {
@@ -480,7 +641,7 @@ final class PaymentProcessor
     /** @return array{id: int|string, issuer_id: int|string, short_name: string, isin: string, is_structured: int|string|null}|null */
     private function findSecurity(string $isin): ?array
     {
-        $stmt = $this->db->prepare('SELECT id, issuer_id, short_name, isin, is_structured FROM securities WHERE isin = :isin');
+        $stmt = $this->db->prepare('SELECT id, issuer_id, short_name, isin, is_structured, maturity_date FROM securities WHERE isin = :isin');
         $stmt->execute(['isin' => $isin]);
         $row = $stmt->fetch();
 
@@ -545,7 +706,7 @@ final class PaymentProcessor
      * @param array{id: int|string, short_name: string} $security
      * @param array<string, mixed> $payment
      */
-    private function findOrOpenStory(array $security, array $payment, string $kind): int
+    private function findOrOpenStory(array $security, array $payment, string $kind, bool $early = false): int
     {
         $column = (string) $payment['story_column'];
         $stmt = $this->db->prepare("SELECT id FROM event_stories WHERE {$column} = :payment_id ORDER BY id DESC LIMIT 1");
@@ -555,7 +716,7 @@ final class PaymentProcessor
             return (int) $storyId;
         }
 
-        $title = self::ucfirst(PaymentMessage::kindLabel($kind)) . ' ' . self::formatDate((string) $payment['payment_date']) . ': ' . $security['short_name'];
+        $title = ($early ? 'Досрочное погашение' : self::ucfirst(PaymentMessage::kindLabel($kind))) . ' ' . self::formatDate((string) $payment['payment_date']) . ': ' . $security['short_name'];
         $this->db->prepare("INSERT INTO event_stories (security_id, {$column}, title, status) VALUES (:security_id, :payment_id, :title, 'open')")
             ->execute(['security_id' => (int) $security['id'], 'payment_id' => (int) $payment['id'], 'title' => mb_substr($title, 0, 255)]);
 
@@ -612,7 +773,8 @@ final class PaymentProcessor
     /** @param array<string, mixed> $payload */
     private static function statusText(string $code, string $kind, array $payload): string
     {
-        $what = self::ucfirst(PaymentMessage::kindLabel($kind)) . ' ' . self::formatDate((string) $payload['payment_date']);
+        $what = (($payload['early'] ?? false) === true ? 'Досрочное погашение' : self::ucfirst(PaymentMessage::kindLabel($kind)))
+            . ' ' . self::formatDate((string) $payload['payment_date']);
 
         return match ($code) {
             'A2', 'A4', 'A6' => "{$what}: получено НРД",

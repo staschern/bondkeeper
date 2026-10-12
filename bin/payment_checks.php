@@ -45,19 +45,25 @@ declare(strict_types=1);
  * (рабочая суббота в крон «1-5» не попадает — такие дни редки, 20.02.2027;
  * при желании поставить «* * *»: в нерабочий день скрипт сам ничего не
  * делает.) Повторный запуск за тот же день событий не дублирует.
+ *
+ * Если скрипт упал, сообщение уходит разработчику в Telegram (CronGuard).
+ * Перед работой проверяется, что в базе есть типы событий B2a и B2b.
  */
 
 require __DIR__ . '/bootstrap.php';
 
 use BondKeeper\Database;
 use BondKeeper\Events\EventPublisher;
+use BondKeeper\Payments\PaymentSchemaCheck;
 use BondKeeper\Payments\PaymentsConfig;
 use BondKeeper\Payments\PaymentWatch;
 use BondKeeper\Payments\WorkingCalendar;
+use BondKeeper\Support\CronGuard;
 use BondKeeper\Support\Logger;
 use BondKeeper\Telegram\AdminNotifier;
 
 $dryRun = in_array('--dry-run', $argv, true);
+CronGuard::install('payment_checks', !$dryRun);
 $at = null;
 $today = (new DateTimeImmutable('now', new DateTimeZone('Europe/Moscow')))->format('Y-m-d');
 foreach ($argv as $arg) {
@@ -89,6 +95,15 @@ if (!$calendar->isWorkingDay($today)) {
 $db = Database::connection();
 $watch = new PaymentWatch($db, new EventPublisher($db), $calendar);
 $prefix = $dryRun ? '=== ПРОСМОТР (ничего не создано и не отправлено) === ' : '';
+
+// Без этих типов событий база не даст создать ни жёлтое уведомление, ни отметку «тишины».
+$missing = PaymentSchemaCheck::missingEventTypes($db, ['B2a', 'B2b']);
+if ($missing !== []) {
+    if (!$dryRun) {
+        throw new RuntimeException(PaymentSchemaCheck::describe($missing));
+    }
+    Logger::warn(PaymentSchemaCheck::describe($missing) . ' Настоящий запуск с этим упадёт.');
+}
 $dueDay = $calendar->previousWorkingDay($today);
 
 if ($at === 'noon') {

@@ -35,6 +35,16 @@ use PDO;
  */
 final class SecuritiesImporter
 {
+    /**
+     * Доски по умолчанию — все режимы основных торгов облигациями, проверено по списку рынка от 11.10.2026
+     * (3161 бумага): TQCB — корпоративные, TQOB — ОФЗ, TQIR — повышенный риск (на 11.10 пуста),
+     * TQRD — «Облигации Д» (выпуски в дефолте), TQOD и TQOY — расчёты в долларах и юанях.
+     * До 11.10.2026 обходились только первые три: бумаги, которые биржа перевела в режим «Д», переставали
+     * обновляться (22 бумаги), а 53 выпуска этого режима и 12 выпусков, торгуемых только за валюту,
+     * в базу не попадали вовсе.
+     */
+    public const DEFAULT_BOARDS = ['TQCB', 'TQIR', 'TQOB', 'TQRD', 'TQOD', 'TQOY'];
+
     private int $securitiesSeen = 0;
     private int $securitiesImported = 0;
     private int $skippedNotFoundInSearch = 0;
@@ -53,19 +63,17 @@ final class SecuritiesImporter
      * Точка входа: обходит все доски рынка облигаций, для каждой найденной
      * бумаги подтягивает справочные параметры и апсертит issuer+security.
      *
-     * Доски (boardid) для рынка облигаций на MOEX ISS: TQCB/TQIR — корп.
-     * облигации в режиме Т+; TQOB — ОФЗ; EQOB/EQIR/PSBB — прочие режимы,
-     * куда бумаги попадают эпизодически. Список досок стоит свериться
-     * с реальным ответом /iss/engines/stock/markets/bonds/boards.json —
-     * см. README, этот список задан по общим конвенциям ISS API и не
-     * проверен вживую в этой среде разработки.
+     * Доски — см. DEFAULT_BOARDS. Статус бумаги импортёр не трогает: новая
+     * бумага получает `active`, а «техдефолт» бумагам режима «Д» ставит
+     * ежедневная сверка (SecurityStatusSync) — она идёт перед импортом.
      *
      * @param string[] $boards
      */
-    public function importMarket(array $boards = ['TQCB', 'TQIR', 'TQOB']): void
+    public function importMarket(array $boards = self::DEFAULT_BOARDS): void
     {
         $isinList = $this->discoverIsinList($boards);
-        Logger::info('Обнаружено бумаг для импорта: ' . count($isinList));
+        Logger::info('Обнаружено бумаг для импорта: ' . count($isinList) . ' (доски: ' . implode(', ', $boards) . ')');
+        $before = $this->tableSizes();
 
         foreach ($isinList as $isin) {
             $this->securitiesSeen++;
@@ -77,7 +85,18 @@ final class SecuritiesImporter
             }
         }
 
+        $after = $this->tableSizes();
+        Logger::info('Новых бумаг в базе: ' . ($after['securities'] - $before['securities']) . '; новых эмитентов: ' . ($after['issuers'] - $before['issuers']));
         $this->printReport();
+    }
+
+    /** @return array{securities: int, issuers: int} */
+    private function tableSizes(): array
+    {
+        return [
+            'securities' => (int) $this->db->query('SELECT COUNT(*) FROM securities')->fetchColumn(),
+            'issuers' => (int) $this->db->query('SELECT COUNT(*) FROM issuers')->fetchColumn(),
+        ];
     }
 
     /**
@@ -90,6 +109,7 @@ final class SecuritiesImporter
 
         foreach ($boards as $board) {
             $start = 0;
+            $previous = null;
             do {
                 $response = $this->iss->getJson(
                     "/engines/stock/markets/bonds/boards/{$board}/securities.json",
@@ -100,6 +120,13 @@ final class SecuritiesImporter
                     ]
                 );
                 $rows = IssClient::block($response, 'securities');
+                // Биржа отдаёт доску целиком и параметр start не учитывает (проверено 11.10.2026: TQCB — 3013
+                // строк одним ответом, TQOD — те же 221 при любом start). Без этой проверки доска, на которой
+                // ровно 100 бумаг, запрашивалась бы бесконечно.
+                if ($rows === $previous) {
+                    break;
+                }
+                $previous = $rows;
 
                 foreach ($rows as $row) {
                     $isin = trim((string) ($row['ISIN'] ?? ''));
@@ -308,11 +335,10 @@ final class SecuritiesImporter
         // HTTP-запросов не требуется.
         $tradingStartDate = $this->nullableDate($this->firstPresent($description, ['ISSUEDATE', 'STARTDATEMOEX']));
         $securityType = $this->mapSecurityType($identity['type'] ?? null);
-        // BUYBACKDATE — то же самое, что даёт description-эндпоинт (не путать
-        // с OFFERDATE из доска-специфичного marketdata, который импортёр
-        // пока не запрашивает — см. STAGE1_POSTPROCESSING.md, has_offer
-        // остаётся рабочей гипотезой до проверки на бумаге с активной офертой).
-        $hasOffer = $this->nullableDate($this->firstPresent($description, ['BUYBACKDATE'])) !== null;
+        // securities.has_offer здесь больше не пишется (11.10.2026, docs/OFFERS.md). Раньше признак ставился
+        // по полю BUYBACKDATE, а оно заполнено и там, где оферты нет (у всех ипотечных выпусков — ожидаемая
+        // дата погашения). Теперь признак ставит только импортёр оферт: бумага торгуется и у неё есть
+        // предстоящая оферта. У новой бумаги — 0 до ближайшего запуска импортёра оферт.
         $issuerTitle = $identity['emitent_title'] ?? null;
         $isMortgageBacked = $this->isMortgageBacked($bondType, is_string($issuerTitle) ? $issuerTitle : null);
 
@@ -368,13 +394,13 @@ final class SecuritiesImporter
                  nominal_value, initial_nominal_value, currency, maturity_date, initial_issue_volume,
                  listing_level, moex_board, coupon_type, coupon_frequency,
                  is_qualified_investors_only, is_structured, is_amortized, trading_start_date,
-                 security_type, has_offer, is_mortgage_backed, last_synced_at)
+                 security_type, is_mortgage_backed, last_synced_at)
              VALUES
                 (:isin, :secid, :reg_number, :issuer_id, :short_name, :full_name,
                  :nominal_value, :initial_nominal_value, :currency, :maturity_date, :issue_volume,
                  :listing_level, :moex_board, :coupon_type, :coupon_frequency,
                  :is_qualified_only, :is_structured, :looks_amortized, :trading_start_date,
-                 :security_type, :has_offer, :is_mortgage_backed, NOW())
+                 :security_type, :is_mortgage_backed, NOW())
              ON DUPLICATE KEY UPDATE
                 secid = VALUES(secid),
                 reg_number = VALUES(reg_number),
@@ -394,7 +420,6 @@ final class SecuritiesImporter
                 is_amortized = GREATEST(is_amortized, VALUES(is_amortized)),
                 trading_start_date = VALUES(trading_start_date),
                 security_type = VALUES(security_type),
-                has_offer = VALUES(has_offer),
                 is_mortgage_backed = VALUES(is_mortgage_backed),
                 last_synced_at = NOW()'
         );
@@ -419,7 +444,6 @@ final class SecuritiesImporter
             'looks_amortized' => (int) $looksAmortized,
             'trading_start_date' => $tradingStartDate,
             'security_type' => $securityType,
-            'has_offer' => (int) $hasOffer,
             'is_mortgage_backed' => (int) $isMortgageBacked,
         ]);
 

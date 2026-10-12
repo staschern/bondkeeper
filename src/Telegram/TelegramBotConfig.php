@@ -23,6 +23,14 @@ final class TelegramBotConfig
          * решить, что делать в этом случае — не задача конфига).
          */
         public readonly int $adminTelegramId,
+        /**
+         * Telegram ID разработчика — получатель сообщений о технических
+         * сбоях (упал скрипт по расписанию, в базе нет нужной структуры,
+         * ошибка запроса к НРД — см. AdminNotifier::sendTech()). 0 — не
+         * настроено: такие сообщения уходят администратору, чтобы сбой
+         * не остался только в логе.
+         */
+        public readonly int $techTelegramId = 0,
     ) {
     }
 
@@ -42,6 +50,6 @@ final class TelegramBotConfig
             throw new RuntimeException("config/telegram_bot.php не содержит непустой 'bot_token' — см. {$path} рядом (.example.php) для образца.");
         }
 
-        return new self($token, (int) ($config['admin_telegram_id'] ?? 0));
+        return new self($token, (int) ($config['admin_telegram_id'] ?? 0), (int) ($config['tech_telegram_id'] ?? 0));
     }
 }

@@ -143,6 +143,7 @@ final class GetNewsMessageMapper
             'plannedPerBond' => $planned,
             'currency' => $currency,
             'actionRef' => isset($rawMessage['action_id']) ? (string) $rawMessage['action_id'] : null,
+            'caType' => explode('/', (string) ($rawMessage['ca_type'] ?? ''))[0],
         ];
 
         if ($type === self::TYPE_ANNOUNCEMENT) {

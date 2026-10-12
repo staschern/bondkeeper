@@ -157,6 +157,31 @@ final class WorkingCalendar
         return $dates;
     }
 
+    /**
+     * Даты по графику, о которых напоминают в $workingDay: все дни после
+     * него до следующего рабочего дня включительно (в пятницу — суббота,
+     * воскресенье и понедельник). Так напоминание всегда уходит в
+     * последний рабочий день перед выплатой (решение пользователя,
+     * 11.10.2026: в выходной клиент бумагу уже не продаст). Для нерабочего
+     * дня — пусто.
+     *
+     * @return array<int, string>
+     */
+    public function scheduleDatesRemindedOn(string $workingDay): array
+    {
+        if (!$this->isWorkingDay($workingDay)) {
+            return [];
+        }
+        $dates = [];
+        $day = self::parse($workingDay);
+        do {
+            $day = $day->modify('+1 day');
+            $dates[] = $day->format('Y-m-d');
+        } while (!$this->isWorkingDay($day->format('Y-m-d')));
+
+        return $dates;
+    }
+
     private static function parse(string $date): DateTimeImmutable
     {
         $parsed = DateTimeImmutable::createFromFormat('!Y-m-d', $date);

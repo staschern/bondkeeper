@@ -34,9 +34,10 @@ final class PaymentNotificationSamples
      */
     public static function client(): array
     {
-        $schedule = static fn (string $date, string $effective, array $payments, ?string $currency = 'RUB'): array => self::BOND + [
+        // $reminder — день, когда уходит напоминание: последний рабочий день перед датой выплаты.
+        $schedule = static fn (string $date, string $effective, array $payments, ?string $currency = 'RUB', ?string $reminder = null): array => self::BOND + [
             'payment_date' => $date, 'effective_date' => $effective, 'currency' => $currency, 'payments' => $payments,
-        ];
+        ] + ($reminder !== null ? ['reminder_date' => $reminder] : []);
         $payment = static fn (string $kind, array $fields): array => self::BOND + $fields + [
             'kind' => $kind, 'payment_date' => '2026-10-15', 'effective_date' => '2026-10-15', 'message_date' => '2026-10-15',
             'currency' => 'RUB', 'amount_planned' => null, 'amount_actual' => null, 'tranche_amount' => null,
@@ -47,19 +48,29 @@ final class PaymentNotificationSamples
         return [
             ['code' => 'R1', 'title' => 'напоминание накануне: купон', 'payload' => $schedule('2026-10-15', '2026-10-15', [
                 ['kind' => 'coupon', 'amount_planned' => '12.3300'],
-            ])],
-            ['code' => 'R1', 'title' => 'напоминание: купон и амортизация, дата выпала на выходной', 'payload' => $schedule('2026-10-17', '2026-10-19', [
+            ], 'RUB', '2026-10-14')],
+            ['code' => 'R1', 'title' => 'напоминание в пятницу о выплате в субботу: купон и амортизация', 'payload' => $schedule('2026-10-17', '2026-10-19', [
                 ['kind' => 'coupon', 'amount_planned' => '12.3300'], ['kind' => 'amortization', 'amount_planned' => '250.0000'],
+            ], 'RUB', '2026-10-16')],
+            ['code' => 'R1', 'title' => 'напоминание в пятницу о выплате в понедельник (без слова «завтра»)', 'payload' => $schedule('2026-10-19', '2026-10-19', [
+                ['kind' => 'coupon', 'amount_planned' => '12.3300'],
+            ], 'RUB', '2026-10-16')],
+            ['code' => 'R1', 'title' => 'напоминание по бумаге в техническом дефолте', 'payload' => $schedule('2026-10-15', '2026-10-15', [
+                ['kind' => 'coupon', 'amount_planned' => '14.7900'],
+            ], 'RUB', '2026-10-14') + ['security_status' => 'tech_default']],
+            ['code' => 'A6', 'title' => 'выпуск погашен досрочно по решению эмитента', 'payload' => $payment('redemption', [
+                'amount_planned' => '1000.0000', 'amount_actual' => '1000.0000', 'tranche_amount' => '1000.0000', 'received_date' => '2026-10-15',
+                'early' => true, 'maturity_date' => '2030-09-20',
             ])],
             ['code' => 'R1', 'title' => 'напоминание: купон и погашение', 'payload' => $schedule('2026-10-15', '2026-10-15', [
                 ['kind' => 'coupon', 'amount_planned' => '12.3300'], ['kind' => 'redemption', 'amount_planned' => '1000.0000'],
-            ])],
+            ], 'RUB', '2026-10-14')],
             ['code' => 'R1', 'title' => 'напоминание: валютный выпуск (сумма в валюте номинала)', 'payload' => $schedule('2026-10-15', '2026-10-15', [
                 ['kind' => 'coupon', 'amount_planned' => '6.3700'],
-            ], 'USD')],
+            ], 'USD', '2026-10-14')],
             ['code' => 'R1', 'title' => 'напоминание: сумма купона биржей ещё не объявлена (плавающая ставка)', 'payload' => $schedule('2026-10-15', '2026-10-15', [
                 ['kind' => 'coupon', 'amount_planned' => null],
-            ])],
+            ], 'RUB', '2026-10-14')],
 
             ['code' => 'A2', 'title' => 'купон получен НРД', 'payload' => $payment('coupon', [
                 'amount_planned' => '12.3300', 'amount_actual' => '12.3300', 'tranche_amount' => '12.3300', 'received_date' => '2026-10-14',

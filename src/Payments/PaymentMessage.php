@@ -85,6 +85,8 @@ final class PaymentMessage
         public readonly ?string $transferredDate = null,
         public readonly ?string $sourceNote = null,
         public readonly ?string $actionRef = null,
+        /** Код вида корпоративного действия у источника (у НРД: INTR, PRED, REDM, MCAL). */
+        public readonly ?string $caType = null,
     ) {
         if (!in_array($kind, [self::KIND_COUPON, self::KIND_AMORTIZATION, self::KIND_REDEMPTION], true)) {
             throw new InvalidArgumentException("Неизвестный вид выплаты: {$kind}");

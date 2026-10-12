@@ -51,6 +51,13 @@ declare(strict_types=1);
  *   - сообщение о деньгах не удалось прочитать — администратору: признак
  *     того, что НРД изменил формат.
  *
+ * === Оферты (11.10.2026, docs/OFFERS.md) ===
+ * Из той же ленты берутся два вида сообщений об офертах: объявление о
+ * досрочном погашении по решению эмитента (MCAL) и отмена оферты или
+ * досрочного погашения. Они меняют таблицу offers и признак оферты у
+ * бумаги; клиентам по ним ничего не уходит, администратор получает
+ * короткую сводку (в тихом прогоне — нет).
+ *
  * Запуск:
  *   php bin/poll_getnews.php --dry-run                           (просмотр последних 3 дней со сверкой по базе)
  *   php bin/poll_getnews.php --dry-run --from=2026-09-18         (просмотр окна; тестовый доступ)
@@ -76,17 +83,27 @@ use BondKeeper\Payments\GetNewsClient;
 use BondKeeper\Payments\GetNewsClientInterface;
 use BondKeeper\Payments\GetNewsConfig;
 use BondKeeper\Payments\GetNewsMessageMapper;
+use BondKeeper\Iss\OffersImporter;
 use BondKeeper\Payments\GetNewsPager;
+use BondKeeper\Payments\OfferNotice;
+use BondKeeper\Payments\OfferNoticeProcessor;
 use BondKeeper\Payments\PaymentProcessor;
+use BondKeeper\Payments\PaymentSchemaCheck;
 use BondKeeper\Payments\PaymentsConfig;
+use BondKeeper\Payments\PollLock;
+use BondKeeper\Payments\ScheduleStatuses;
 use BondKeeper\Payments\WorkingCalendar;
+use BondKeeper\Support\CronGuard;
 use BondKeeper\Support\Logger;
 use BondKeeper\Telegram\AdminNotifier;
 
 const OVERLAP_HOURS = 6;
 const STATE_FILE = __DIR__ . '/../var/getnews_poll_state.json';
+const LOCK_FILE = __DIR__ . '/../var/getnews_poll.lock';
+const STUCK_AFTER_MIN = 30; // запуск, который держит замок дольше, считаем зависшим
 
 $dryRun = in_array('--dry-run', $argv, true);
+CronGuard::install('poll_getnews', !$dryRun);
 $quiet = in_array('--quiet', $argv, true);
 $full = in_array('--full', $argv, true);
 $days = 3;
@@ -118,6 +135,21 @@ $paymentsConfig = PaymentsConfig::fromFile(__DIR__ . '/../config/payments.php');
 if (!$paymentsConfig->getNewsPolling && !$dryRun && !$quiet) {
     Logger::info('Опрос GetNews выключен (config/payments.php: getnews_polling). Ничего не делаю. Проверить вывод можно через --dry-run.');
     exit(0);
+}
+
+// Замок от наложения запусков: при опросе раз в минуту новый запуск может начаться, пока прежний ещё
+// работает, и одно сообщение НРД обработалось бы дважды. Просмотр (--dry-run) ничего не пишет — ему замок не нужен.
+$lock = null;
+if (!$dryRun) {
+    $lock = PollLock::acquire(LOCK_FILE);
+    if ($lock === null) {
+        $minutes = PollLock::heldMinutes(LOCK_FILE);
+        Logger::info('Предыдущий опрос GetNews ещё не закончился — этот запуск пропущен.');
+        if ($minutes !== null && $minutes >= STUCK_AFTER_MIN) {
+            CronGuard::report('poll_getnews', "Опрос GetNews не заканчивается уже {$minutes} мин. — похоже, прежний запуск завис. Новые запуски пропускаются, пока он не завершится.");
+        }
+        exit(0);
+    }
 }
 
 $moscow = new DateTimeZone('Europe/Moscow');
@@ -187,6 +219,8 @@ $skipped = [];
 $unreadable = [];
 /** @var array<int, array{0: string, 1: \BondKeeper\Payments\PaymentMessage}> $messages */
 $messages = [];
+/** @var array<int, array{0: string, 1: OfferNotice}> $offerNotices объявленные коллы и отмены оферт */
+$offerNotices = [];
 
 try {
     foreach ($pager->pages($filter) as $items) {
@@ -197,6 +231,10 @@ try {
             if ($pubDate !== '') {
                 $newestPubDate = $newestPubDate === null || $pubDate > $newestPubDate ? $pubDate : $newestPubDate;
                 $oldestOnPage = $oldestOnPage === null || $pubDate < $oldestOnPage ? $pubDate : $oldestOnPage;
+            }
+            $offerNotice = OfferNotice::fromRaw($rawMessage);
+            if ($offerNotice !== null) {
+                $offerNotices[] = [$pubDate . ' ' . str_pad((string) ($rawMessage['content_id_out'] ?? ''), 20, '0', STR_PAD_LEFT), $offerNotice];
             }
             $classified = GetNewsMessageMapper::classify($rawMessage);
             if ($classified['message'] === null) {
@@ -214,14 +252,13 @@ try {
         }
     }
 } catch (\Throwable $e) {
-    Logger::error('GetNews: ошибка запроса — ' . $e->getMessage());
-    if (!$dryRun) {
-        AdminNotifier::send('⚠️ Опрос GetNews: ошибка запроса — ' . $e->getMessage());
-    }
+    // Технический сбой — разработчику; одно и то же сообщение не чаще раза в час (опрос идёт часто).
+    CronGuard::report('poll_getnews', 'Опрос GetNews: ошибка запроса — ' . $e->getMessage(), '', !$dryRun);
     exit(1);
 }
 
-Logger::info("Получено сообщений: {$received} (запросов: {$pager->requestsMade()}); о выплатах: " . count($messages));
+Logger::info("Получено сообщений: {$received} (запросов: {$pager->requestsMade()}); о выплатах: " . count($messages)
+    . '; об офертах (объявленное досрочное погашение, отмена): ' . count($offerNotices));
 foreach ($skipped as $reason => $count) {
     Logger::info("  пропущено — {$reason}: {$count}");
 }
@@ -231,6 +268,57 @@ if (!$pager->isComplete()) {
 
 // От старых к новым: «не выплачено» → «часть» → «остаток» должны лечь в том же порядке, в каком вышли.
 usort($messages, static fn (array $a, array $b): int => $a[0] <=> $b[0]);
+usort($offerNotices, static fn (array $a, array $b): int => $a[0] <=> $b[0]);
+$today = $now->format('Y-m-d');
+
+/**
+ * Сообщения НРД об офертах → таблица offers. $apply = false — только показать.
+ *
+ * @param array<int, array{0: string, 1: OfferNotice}> $offerNotices
+ * @return array<int, string> строки для администратора: что изменилось
+ */
+$processOfferNotices = static function (PDO $db, array $offerNotices, string $today, bool $apply): array {
+    if ($offerNotices === []) {
+        return [];
+    }
+    $problem = OffersImporter::schemaProblem($db);
+    if ($problem !== null) {
+        // Таблица не готова — это вопрос к установке, а не к данным: разработчику, и не чаще раза в час.
+        CronGuard::report('poll_getnews', 'Сообщения НРД об офертах пропущены. ' . $problem, '', $apply);
+
+        return [];
+    }
+    $processor = new OfferNoticeProcessor($db);
+    $counts = [];
+    $lines = [];
+    foreach ($offerNotices as [, $notice]) {
+        try {
+            $result = $processor->process($notice, $today, $apply);
+        } catch (\Throwable $e) {
+            Logger::error("{$notice->isin} оферта на {$notice->date}: ошибка обработки — " . $e->getMessage());
+            continue;
+        }
+        $counts[$result['result']] = ($counts[$result['result']] ?? 0) + 1;
+        if ($result['result'] === OfferNoticeProcessor::RESULT_APPLIED) {
+            $what = $notice->action === OfferNotice::ACTION_CANCELLED
+                ? ($notice->type === 'call' ? 'отменено досрочное погашение' : 'отменена оферта')
+                : 'объявлено досрочное погашение' . ($notice->percent !== null ? ' (' . rtrim(rtrim($notice->percent, '0'), '.') . ' % номинала)' : '');
+            $line = "{$result['security_name']} ({$notice->isin}): {$what}, дата " . date('d.m.Y', (int) strtotime($notice->date));
+            $lines[] = '• ' . $line;
+            Logger::info(($apply ? '' : '[просмотр] ') . "оферты: {$line} — {$result['note']}");
+        }
+    }
+    Logger::info(sprintf(
+        'Оферты по сообщениям НРД: %s %d; без изменений: %d; не оферта или дата прошла: %d; чужие бумаги: %d',
+        $apply ? 'применено' : 'было бы применено',
+        $counts[OfferNoticeProcessor::RESULT_APPLIED] ?? 0,
+        $counts[OfferNoticeProcessor::RESULT_NO_CHANGE] ?? 0,
+        $counts[OfferNoticeProcessor::RESULT_IGNORED] ?? 0,
+        $counts[OfferNoticeProcessor::RESULT_FOREIGN] ?? 0,
+    ));
+
+    return $lines;
+};
 
 // --- Просмотр ---------------------------------------------------------------
 if ($dryRun) {
@@ -244,7 +332,7 @@ if ($dryRun) {
         ? new PaymentProcessor($db, new EventPublisher($db), WorkingCalendar::fromFile(__DIR__ . '/../config/working_calendar.php'))
         : null;
 
-    $stats = ['чужая бумага' => 0, 'найдено: точная дата' => 0, 'найдено: по дню исполнения' => 0,
+    $stats = ['чужая бумага' => 0, 'найдено: точная дата' => 0, 'найдено: по дню исполнения' => 0, 'досрочное погашение выпуска' => 0,
         'структурный выпуск: купон по сообщению НРД' => 0, 'структурный выпуск: пропущено' => 0, 'наша бумага, выплаты в графике нет' => 0];
     foreach ($messages as [, $message]) {
         $where = '';
@@ -254,7 +342,10 @@ if ($dryRun) {
                 $stats['чужая бумага']++;
                 continue;
             }
-            if ($located['structured'] === 'build') {
+            if ($located['early']) {
+                $stats['досрочное погашение выпуска']++;
+                $where = ' → ДОСРОЧНОЕ ПОГАШЕНИЕ ВЫПУСКА: строка погашения ' . ($located['payment'] === null ? 'будет создана по сообщению' : 'уже есть');
+            } elseif ($located['structured'] === 'build') {
                 $stats['структурный выпуск: купон по сообщению НРД']++;
                 $where = ' → структурный выпуск, графика нет: купон будет создан по сообщению';
             } elseif ($located['structured'] === 'skip') {
@@ -292,12 +383,22 @@ if ($dryRun) {
     foreach ($unreadable as $line) {
         Logger::warn("  НЕ ПРОЧИТАНО: {$line}");
     }
+    if ($db !== null) {
+        $processOfferNotices($db, $offerNotices, $today, false);
+    }
     Logger::info('В базу ничего не записано (--dry-run).');
     exit(0);
 }
 
 // --- Запись -----------------------------------------------------------------
 $db = Database::connection();
+// Без этих типов событий база не даст записать ни одной выплаты — говорим прямо и до начала обработки.
+PaymentSchemaCheck::requireEventTypes($db, ['A2', 'A3', 'A4', 'A5', 'A6', 'A7', 'B1', 'B1a', 'B2', 'B4', 'B5', 'C2']);
+// То же про статусы выплат: без миграции 031 база не примет «дефолт» и «отменена».
+$statusProblem = ScheduleStatuses::schemaProblem($db);
+if ($statusProblem !== null) {
+    throw new RuntimeException($statusProblem);
+}
 $processor = new PaymentProcessor($db, new EventPublisher($db), WorkingCalendar::fromFile(__DIR__ . '/../config/working_calendar.php'), $quiet);
 
 $counts = [
@@ -312,6 +413,8 @@ $counts = [
 $eventCounts = [];
 /** @var array<int, string> $gapLines */
 $gapLines = [];
+/** @var array<string, string> $earlyLines досрочные погашения выпусков: ISIN → строка для администратора */
+$earlyLines = [];
 
 foreach ($messages as [, $message]) {
     try {
@@ -328,7 +431,12 @@ foreach ($messages as [, $message]) {
         $eventCounts[$code] = ($eventCounts[$code] ?? 0) + 1;
     }
     if ($result['events'] !== []) {
-        Logger::info("{$message->isin} {$message->kind} на {$message->paymentDate}: " . implode(', ', $result['events']));
+        Logger::info("{$message->isin} {$message->kind} на {$message->paymentDate}: " . implode(', ', $result['events'])
+            . (($result['early_redemption'] ?? false) ? ' — досрочное погашение выпуска' : ''));
+    }
+    if (($result['early_redemption'] ?? false) && array_intersect(['A6', 'B5'], $result['events']) !== []) {
+        $earlyLines[$message->isin] = "• {$result['security_name']} ({$message->isin}): погашен досрочно " . date('d.m.Y', (int) strtotime($message->paymentDate))
+            . ($message->amountPerBond !== null ? ', ' . rtrim(rtrim($message->amountPerBond, '0'), '.') . ' ' . ($message->currency ?? '') . ' на бумагу' : '');
     }
 }
 
@@ -344,6 +452,19 @@ Logger::info(sprintf(
 ));
 Logger::info('События: ' . ($eventCounts === [] ? 'нет' : implode(', ', array_map(static fn (string $c, int $n): string => "{$c} — {$n}", array_keys($eventCounts), $eventCounts))));
 
+if ($earlyLines !== [] && !$quiet) {
+    AdminNotifier::sendLines(array_merge(
+        ['📋 НРД: выпуски погашены досрочно (' . count($earlyLines) . '). Бумага получила статус «погашена», остаток графика отменён:'],
+        array_slice(array_values($earlyLines), 0, 40),
+    ));
+}
+
+$offerLines = $processOfferNotices($db, $offerNotices, $today, true);
+if ($offerLines !== [] && !$quiet) {
+    AdminNotifier::sendLines(array_merge(['📋 НРД об офертах (' . count($offerLines) . '):'], array_slice($offerLines, 0, 40),
+        count($offerLines) > 40 ? ['… и ещё ' . (count($offerLines) - 40)] : []));
+}
+
 if ($gapLines !== []) {
     AdminNotifier::sendLines(array_merge(
         ['⚠️ GetNews: сообщения по нашим бумагам, которым не нашлось выплаты в графике (' . count($gapLines) . '). Стоит проверить график с Мосбиржи:'],
@@ -352,7 +473,8 @@ if ($gapLines !== []) {
     ));
 }
 if ($unreadable !== []) {
-    AdminNotifier::sendLines(array_merge(
+    // Смена формата сообщений НРД — вопрос к коду, а не к данным: разработчику.
+    AdminNotifier::sendTechLines(array_merge(
         ['⚠️ GetNews: не удалось прочитать сообщения о деньгах (' . count($unreadable) . ') — возможно, НРД изменил формат:'],
         array_slice($unreadable, 0, 20),
     ));

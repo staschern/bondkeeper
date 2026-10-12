@@ -75,6 +75,30 @@ check('Роял Капитал: 04.05.2026 + 10 рабочих дней = 19.05.
 check('между 16.04 и 30.04.2026 — 10 рабочих дней', 10, $calendar->workingDaysBetween('2026-04-16', '2026-04-30'));
 check('дата не позже начала — 0', 0, $calendar->workingDaysBetween('2026-04-30', '2026-04-16'));
 
+echo "\n--- о каких датах напоминают в этот день (последний рабочий день перед выплатой) ---\n";
+check('четверг 08.10.2026 — только о пятнице', ['2026-10-09'], $calendar->scheduleDatesRemindedOn('2026-10-08'));
+check('пятница 09.10.2026 — о субботе, воскресенье и понедельнике', ['2026-10-10', '2026-10-11', '2026-10-12'], $calendar->scheduleDatesRemindedOn('2026-10-09'));
+check('суббота и воскресенье — ни о чём: напоминания уходят только в рабочие дни', [[], []], [$calendar->scheduleDatesRemindedOn('2026-10-10'), $calendar->scheduleDatesRemindedOn('2026-10-11')]);
+check('вторник 03.11.2026 перед праздником — о среде 04.11 и четверге 05.11', ['2026-11-04', '2026-11-05'], $calendar->scheduleDatesRemindedOn('2026-11-03'));
+$newYear = $calendar->scheduleDatesRemindedOn('2026-12-30');
+check('среда 30.12.2026 — обо всех датах до первого рабочего дня января включительно (12 дат, последняя 11.01.2027)', [12, '2026-12-31', '2027-01-11'], [count($newYear), $newYear[0], end($newYear)]);
+check('рабочая суббота 20.02.2027 — о днях до среды 24.02 (понедельник и вторник — выходные)', ['2027-02-21', '2027-02-22', '2027-02-23', '2027-02-24'], $calendar->scheduleDatesRemindedOn('2027-02-20'));
+check('каждая дата по графику попадает ровно в одно напоминание', true, (static function () use ($calendar): bool {
+    $seen = [];
+    for ($day = new DateTimeImmutable('2026-10-01'); $day->format('Y-m-d') <= '2027-03-31'; $day = $day->modify('+1 day')) {
+        foreach ($calendar->scheduleDatesRemindedOn($day->format('Y-m-d')) as $date) {
+            $seen[$date] = ($seen[$date] ?? 0) + 1;
+        }
+    }
+    for ($day = new DateTimeImmutable('2026-10-02'); $day->format('Y-m-d') <= '2027-03-31'; $day = $day->modify('+1 day')) {
+        if (($seen[$day->format('Y-m-d')] ?? 0) !== 1) {
+            return false;
+        }
+    }
+
+    return true;
+})());
+
 echo "\n";
 if ($failures === 0) {
     echo "ВСЕ {$checks} ПРОВЕРОК ПРОШЛИ.\n";
