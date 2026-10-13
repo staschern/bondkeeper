@@ -96,7 +96,7 @@ $db->exec("CREATE TABLE raw_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sour
 $db->exec("CREATE TABLE event_stories (id INTEGER PRIMARY KEY AUTOINCREMENT, security_id INTEGER, coupon_id INTEGER, amortization_id INTEGER, redemption_id INTEGER,
     title TEXT, status TEXT DEFAULT 'open', resolution_type TEXT, resolved_at TEXT)");
 $db->exec("CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, security_id INTEGER, issuer_id INTEGER, event_type_code TEXT, story_id INTEGER, raw_message_id INTEGER,
-    event_date TEXT, published_at TEXT, detected_at TEXT DEFAULT (datetime('now')), amount_planned TEXT, amount_actual TEXT, status_text TEXT, priority TEXT, payload_json TEXT)");
+    event_date TEXT, reminder_days INTEGER, published_at TEXT, detected_at TEXT DEFAULT (datetime('now')), amount_planned TEXT, amount_actual TEXT, status_text TEXT, priority TEXT, payload_json TEXT)");
 $db->exec('CREATE TABLE users (id INTEGER PRIMARY KEY, telegram_id INTEGER, telegram_bot_blocked INTEGER DEFAULT 0)');
 $db->exec("CREATE TABLE watchlist (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, issuer_id INTEGER, security_id INTEGER, added_at TEXT DEFAULT (datetime('now')))");
 $db->exec('CREATE TABLE notifications (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, event_id INTEGER, channel TEXT, status TEXT, failure_reason TEXT, sent_at TEXT, UNIQUE(user_id, event_id, channel))');

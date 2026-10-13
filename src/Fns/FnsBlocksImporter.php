@@ -5,8 +5,11 @@ declare(strict_types=1);
 namespace BondKeeper\Fns;
 
 use BondKeeper\Events\EventPublisher;
+use BondKeeper\Payments\WorkingCalendar;
 use BondKeeper\Support\Logger;
 use PDO;
+use PDOException;
+use RuntimeException;
 
 /**
  * Наполняет fns_blocks (одна строка на эмитента: блокировка + состояние
@@ -81,6 +84,36 @@ use PDO;
  * не только на конкретный эмитент, поэтому имеет смысл переждать дольше).
  * Суточный крон остаётся финальной страховкой, если все повторы исчерпаны
  * — не заменяется этим механизмом, а дополняется.
+ *
+ * === Подтверждение снятия и числа счетов (13 октября 2026) ===
+ *
+ * Сервис ФНС временами отдаёт по эмитенту не все строки или ни одной, а
+ * через несколько часов или на следующий рабочий день — снова прежние.
+ * На бою за 09–13.10.2026 это дало у трёх эмитентов четыре ложных
+ * «блокировка снята», три ложные «новые блокировки» и четыре скачка
+ * числа счетов (14 → 8 → 0 → 14; 10 → 6 → 0 → 10 → 15 → 10). Решение
+ * пользователя от 13.10.2026: снятие и изменение числа счетов объявляем
+ * только после подтверждения.
+ *
+ * В fns_blocks лежит ПОДТВЕРЖДЁННОЕ состояние (is_fns_blocked,
+ * active_bank_count) — то, о чём клиенты уже знают. Если ответ сервиса
+ * расходится с ним по числу счетов (в том числе «строк нет вовсе»),
+ * расхождение записывается как ожидающее: pending_bank_count — сколько
+ * счетов показал сервис (0 — блокировок нет), pending_since — день, когда
+ * мы это впервые увидели (по Москве). Дальше:
+ *   - ответ вернулся к подтверждённому — ожидание снимается молча;
+ *   - ответ показал третье число — ожидание начинается заново с него;
+ *   - ответ тот же, а день уже другой и рабочий — подтверждено:
+ *     состояние меняется, уходит событие (снятие — с датой, когда
+ *     блокировка пропала впервые, в unblock_date).
+ * Сразу, как и раньше, объявляются новая блокировка и изменение суммы.
+ * Пока число счетов не подтверждено, в сообщении о сумме стоит прежнее,
+ * подтверждённое число.
+ *
+ * Каждый раз, когда ответ сервиса отличается от предыдущего, он
+ * сохраняется целиком в raw_messages (source = 'fns') — и когда событие
+ * есть, и когда его нет: по этим строкам потом видно, что именно отдавал
+ * сервис. Колонки ожидания — миграция 033.
  */
 final class FnsBlocksImporter
 {
@@ -89,12 +122,20 @@ final class FnsBlocksImporter
     private int $skippedCaptcha = 0;
     private int $failed = 0;
     private int $recoveredOnRetry = 0;
+    private int $awaitingConfirmation = 0;
 
+    /**
+     * @param ?WorkingCalendar $calendar рабочие дни — для подтверждения снятия и числа счетов;
+     *        без календаря рабочими считаются понедельник — пятница
+     * @param ?\Closure $today «сегодня» по Москве (ГГГГ-ММ-ДД) — подменяется в тестах
+     */
     public function __construct(
         private readonly NalogBiClientInterface $client,
         private readonly PDO $db,
         private readonly EventPublisher $events,
         private readonly int $delaySeconds = 5,
+        private readonly ?WorkingCalendar $calendar = null,
+        private readonly ?\Closure $today = null,
     ) {
     }
 
@@ -106,6 +147,14 @@ final class FnsBlocksImporter
      */
     public function checkIssuers(array $issuers, int $maxRetries = 2, int $retryDelaySeconds = 90): void
     {
+        // Без колонок ожидания подтверждения нечего и начинать: иначе первая же запись упадёт посреди прогона.
+        try {
+            $this->db->query('SELECT pending_bank_count, pending_since FROM fns_blocks LIMIT 1');
+        } catch (PDOException $e) {
+            throw new RuntimeException('В таблице fns_blocks нет колонок pending_bank_count / pending_since — не применена миграция '
+                . 'database/033_fns_blocks_pending_confirmation.sql. Проверка блокировок ФНС не выполнена.');
+        }
+
         $this->checked = count($issuers);
         $pending = $issuers;
 
@@ -150,14 +199,18 @@ final class FnsBlocksImporter
             return false;
         }
 
-        /*if ($result->captchaRequired) {
+        // Сервис попросил капчу и не дал ни одной строки: мы НЕ узнали, есть ли блокировка. Без этой проверки
+        // (в коде с сервера от 05.10 и 11.10.2026 она была закомментирована) такой ответ читался как «блокировок нет»: блокировка
+        // помечалась снятой, клиентам уходило «блокировка снята», а при следующей удачной проверке — «новая
+        // блокировка». Если строки в ответе есть, берём их, что бы ни стояло в признаке капчи.
+        if ($result->captchaRequired && $result->rows === []) {
             $this->skippedCaptcha++;
             Logger::warn("ФНС: капча для ИНН {$inn} — статус блокировки не тронут, отмечена только попытка");
             $this->markVerificationError($issuerId);
             return false;
-        }*/
+        }
 
-        $this->applyResult($issuerId, $inn, $result->rows);
+        $this->applyResult($issuerId, $inn, $result);
         return true;
     }
 
@@ -181,42 +234,90 @@ final class FnsBlocksImporter
         )->execute(['issuer_id' => $issuerId]);
     }
 
-    /** @param array<int, array<string, mixed>> $rows */
-    private function applyResult(int $issuerId, string $inn, array $rows): void
+    /**
+     * Успешный ответ сервиса → запись в fns_blocks и, если нужно, событие.
+     * Правило подтверждения — в докблоке класса.
+     */
+    private function applyResult(int $issuerId, string $inn, NalogBiResult $result): void
     {
         $old = $this->fetchCurrentState($issuerId);
+        $summary = $this->consolidateRows($result->rows);
+        $observed = $summary['active_bank_count'] ?? 0;
+        $today = $this->today();
+
+        // Подтверждённое состояние — то, о чём клиенты уже знают.
+        $confirmedBlocked = $old['is_fns_blocked'];
+        $confirmedCount = $confirmedBlocked ? $old['active_bank_count'] : 0;
+        // Что сервис показывал при прошлой проверке: ожидающее число, если оно есть, иначе подтверждённое.
+        $previousObserved = $old['pending_bank_count'] ?? $confirmedCount;
+
+        // Что будет подтверждённым состоянием после этой проверки и что остаётся ждать.
+        $newBlocked = $confirmedBlocked;
+        $newCount = $confirmedCount;
+        $pendingCount = null;
+        $pendingSince = null;
+        $unblockDate = null;
+        $step = 'unchanged';
+
+        if (!$confirmedBlocked) {
+            if ($observed > 0) {
+                // Новая блокировка — сразу.
+                $newBlocked = true;
+                $newCount = $observed;
+                $step = 'started';
+            }
+        } elseif ($observed === $confirmedCount) {
+            $step = $old['pending_bank_count'] !== null ? 'pending_cancelled' : 'unchanged';
+        } elseif ($old['pending_bank_count'] === $observed && $this->canConfirm($old['pending_since'], $today)) {
+            if ($observed === 0) {
+                $newBlocked = false;
+                $newCount = 0;
+                $unblockDate = $old['pending_since'];
+                $step = 'lift_confirmed';
+            } else {
+                $newCount = $observed;
+                $step = 'count_confirmed';
+            }
+        } else {
+            $sameAsBefore = $old['pending_bank_count'] === $observed && $old['pending_since'] !== null;
+            $pendingCount = $observed;
+            $pendingSince = $sameAsBefore ? $old['pending_since'] : $today;
+            $step = $sameAsBefore ? 'pending_waiting' : ($observed === 0 ? 'pending_lift' : 'pending_count');
+        }
 
         $this->db->beginTransaction();
         try {
-            $summary = $this->consolidateRows($rows);
-            $isBlocked = $summary !== null;
+            // Строка эмитента должна быть: дальше — обычные UPDATE.
+            $this->db->prepare(
+                "INSERT INTO fns_blocks (issuer_id, verification, date_verification)
+                 VALUES (:issuer_id, 'success', NOW())
+                 ON DUPLICATE KEY UPDATE
+                    verification = 'success',
+                    date_verification = NOW()"
+            )->execute(['issuer_id' => $issuerId]);
 
             if ($summary !== null) {
-                $stmt = $this->db->prepare(
-                    "INSERT INTO fns_blocks
-                        (issuer_id, is_fns_blocked, verification, date_verification, last_success_verification,
-                         active_bank_count, decision_number, block_date, blocked_amount, reason, reason_category, source_reference)
-                     VALUES
-                        (:issuer_id, 1, 'success', NOW(), NOW(),
-                         :active_bank_count, :decision_number, :block_date, :blocked_amount, :reason, :reason_category, :source_reference)
-                     ON DUPLICATE KEY UPDATE
+                $this->db->prepare(
+                    'UPDATE fns_blocks SET
                         is_fns_blocked = 1,
-                        verification = 'success',
-                        date_verification = NOW(),
                         last_success_verification = NOW(),
-                        active_bank_count = VALUES(active_bank_count),
-                        decision_number = VALUES(decision_number),
-                        block_date = VALUES(block_date),
+                        active_bank_count = :active_bank_count,
+                        pending_bank_count = :pending_bank_count,
+                        pending_since = :pending_since,
+                        decision_number = :decision_number,
+                        block_date = :block_date,
                         unblock_date = NULL,
-                        blocked_amount = VALUES(blocked_amount),
-                        reason = VALUES(reason),
-                        reason_category = VALUES(reason_category),
-                        source_reference = VALUES(source_reference),
-                        updated_at = CURRENT_TIMESTAMP"
-                );
-                $stmt->execute([
+                        blocked_amount = :blocked_amount,
+                        reason = :reason,
+                        reason_category = :reason_category,
+                        source_reference = :source_reference,
+                        updated_at = CURRENT_TIMESTAMP
+                     WHERE issuer_id = :issuer_id'
+                )->execute([
                     'issuer_id' => $issuerId,
-                    'active_bank_count' => $summary['active_bank_count'],
+                    'active_bank_count' => $newCount,
+                    'pending_bank_count' => $pendingCount,
+                    'pending_since' => $pendingSince,
                     'decision_number' => $summary['decision_number'],
                     'block_date' => $summary['block_date'],
                     'blocked_amount' => $summary['blocked_amount'],
@@ -224,35 +325,30 @@ final class FnsBlocksImporter
                     'reason_category' => $summary['reason_category'],
                     'source_reference' => $summary['source_reference'],
                 ]);
-            } else {
-                // Ни одной валидной строки в ответе — проверка прошла
-                // успешно, блокировок нет. unblock_date выставляется
-                // только если строка ДО этого была активно заблокирована
-                // (is_fns_blocked = 1 читается ДО этого же UPDATE — ссылка
-                // на колонку без VALUES() в ON DUPLICATE KEY UPDATE берёт
-                // текущее значение строки, не новое) — если эмитент и
-                // раньше был свободен, его старый unblock_date (если был)
-                // не трогаем, а не пробел/не блокировка вообще ещё не
-                // проверялась — тогда это просто первая вставка.
+            } elseif ($newBlocked) {
+                // В ответе блокировок нет, но снятие ещё не подтверждено: саму блокировку не трогаем.
                 $this->db->prepare(
-                    "INSERT INTO fns_blocks
-                        (issuer_id, is_fns_blocked, verification, date_verification, last_success_verification, active_bank_count)
-                     VALUES
-                        (:issuer_id, 0, 'success', NOW(), NOW(), 0)
-                     ON DUPLICATE KEY UPDATE
-                        unblock_date = IF(is_fns_blocked = 1, CURDATE(), unblock_date),
+                    'UPDATE fns_blocks SET
+                        last_success_verification = NOW(),
+                        pending_bank_count = 0,
+                        pending_since = :pending_since,
+                        updated_at = CURRENT_TIMESTAMP
+                     WHERE issuer_id = :issuer_id'
+                )->execute(['issuer_id' => $issuerId, 'pending_since' => $pendingSince]);
+            } else {
+                // Блокировок нет: эмитент и раньше был свободен либо снятие подтверждено.
+                // unblock_date ставится только при подтверждённом снятии — днём, когда блокировка пропала впервые.
+                $this->db->prepare(
+                    'UPDATE fns_blocks SET
                         is_fns_blocked = 0,
-                        verification = 'success',
-                        date_verification = NOW(),
                         last_success_verification = NOW(),
                         active_bank_count = 0,
-                        updated_at = CURRENT_TIMESTAMP"
-                )->execute(['issuer_id' => $issuerId]);
-            }
-
-            if ($isBlocked) {
-                $this->blockedFound++;
-                Logger::info("ФНС: ИНН {$inn} — активная блокировка счёта подтверждена ({$summary['active_bank_count']} банк(ов))");
+                        pending_bank_count = NULL,
+                        pending_since = NULL,
+                        unblock_date = COALESCE(:unblock_date, unblock_date),
+                        updated_at = CURRENT_TIMESTAMP
+                     WHERE issuer_id = :issuer_id'
+                )->execute(['issuer_id' => $issuerId, 'unblock_date' => $unblockDate]);
             }
 
             $this->db->commit();
@@ -261,26 +357,52 @@ final class FnsBlocksImporter
             throw $e;
         }
 
+        if ($summary !== null) {
+            $this->blockedFound++;
+        }
+        if ($pendingCount !== null) {
+            $this->awaitingConfirmation++;
+        }
+        $this->logStep($step, $inn, $observed, $confirmedCount, $pendingSince ?? $old['pending_since']);
+
+        // Ответ сервиса целиком — в журнал сырых сообщений: вместе с событием, а если события нет, но ответ
+        // отличается от предыдущего, — отдельной строкой.
+        $answer = [
+            'inn' => $inn,
+            'step' => $step,
+            'captcha_required' => $result->captchaRequired,
+            'rows_in_answer' => count($result->rows),
+            'observed_bank_count' => $observed,
+            'confirmed_bank_count' => $newCount,
+            'pending_bank_count' => $pendingCount,
+            'pending_since' => $pendingSince,
+            'rows' => $result->rows,
+        ];
+        $sourceReference = $summary['source_reference'] ?? "service.nalog.ru bi.do, ИНН {$inn}: блокировок в ответе нет";
+
         // Событие — уже ПОСЛЕ commit(): публикуем только то, что реально
         // сохранилось, а не то, что могло откатиться при ошибке записи.
+        // На вход идёт подтверждённое состояние «до» и «после»: пока снятие
+        // или число счетов ждут подтверждения, они здесь равны прежним, и
+        // события о них не будет.
         $eventId = $this->events->publishFnsBlockChange(
             $issuerId,
-            $old['is_fns_blocked'],
+            $confirmedBlocked,
             $old['blocked_amount'],
             $old['active_bank_count'],
-            $isBlocked,
-            $summary['blocked_amount'] ?? null,
-            $summary['active_bank_count'] ?? 0,
+            $newBlocked,
+            $summary !== null ? $summary['blocked_amount'] : ($newBlocked ? $old['blocked_amount'] : null),
+            $newCount,
             $summary['block_date'] ?? date('Y-m-d'),
             $summary['reason'] ?? null,
-            $summary['source_reference'] ?? null,
+            $sourceReference,
+            $answer,
         );
 
-        // fns_blocks.event_id — только если событие реально создалось
-        // (один из 4 триггеров сработал). publishFnsBlockChange() уже
-        // содержит проверку фильтра существенности — здесь просто не
-        // трогаем строку, если он вернул null, а не затираем прежний
-        // event_id NULL'ом.
+        // fns_blocks.event_id — только если событие реально создалось.
+        // publishFnsBlockChange() уже содержит проверку фильтра
+        // существенности — здесь просто не трогаем строку, если он вернул
+        // null, а не затираем прежний event_id NULL'ом.
         if ($eventId !== null) {
             $this->db->prepare(
                 'UPDATE fns_blocks SET event_id = :event_id WHERE issuer_id = :issuer_id'
@@ -288,31 +410,78 @@ final class FnsBlocksImporter
                 'event_id' => $eventId,
                 'issuer_id' => $issuerId,
             ]);
+        } elseif ($observed !== $previousObserved) {
+            $this->events->recordFnsObservation($sourceReference, $answer);
         }
     }
 
     /**
-     * "Было" для EventPublisher::publishFnsBlockChange() — читается ДО
-     * апсерта этой же строки fns_blocks (см. вызов в applyResult()).
-     * Строки ещё нет вообще (эмитент проверяется впервые) — трактуем как
-     * "не заблокирован", это и есть нейтральное начальное состояние.
+     * Можно ли подтвердить ожидающее изменение: оно замечено в один из
+     * прошлых дней, а сегодня рабочий день. Проверка идёт каждые полчаса,
+     * так что подтверждает первая удачная проверка следующего рабочего дня.
+     */
+    private function canConfirm(?string $pendingSince, string $today): bool
+    {
+        if ($pendingSince === null || $today <= $pendingSince) {
+            return false;
+        }
+
+        return $this->calendar !== null
+            ? $this->calendar->isWorkingDay($today)
+            : (int) date('N', (int) strtotime($today)) <= 5;
+    }
+
+    /** «Сегодня» по московскому времени: серверное время может быть другим, а день подтверждения считаем по Москве. */
+    private function today(): string
+    {
+        return $this->today !== null
+            ? (string) ($this->today)()
+            : (new \DateTimeImmutable('now', new \DateTimeZone('Europe/Moscow')))->format('Y-m-d');
+    }
+
+    private function logStep(string $step, string $inn, int $observed, int $confirmed, ?string $pendingSince): void
+    {
+        $since = $pendingSince !== null ? date('d.m.Y', (int) strtotime($pendingSince)) : '?';
+        match ($step) {
+            'started' => Logger::info("ФНС: ИНН {$inn} — новая блокировка, счетов: {$observed}"),
+            'unchanged' => $observed > 0 ? Logger::info("ФНС: ИНН {$inn} — активная блокировка счёта подтверждена ({$observed} банк(ов))") : null,
+            'pending_cancelled' => Logger::info("ФНС: ИНН {$inn} — ответ вернулся к прежнему (счетов: {$confirmed}), ожидание подтверждения снято"),
+            'pending_lift' => Logger::info("ФНС: ИНН {$inn} — в ответе блокировок нет, в базе счетов: {$confirmed}. Снятие не объявляем: ждём подтверждения на следующий рабочий день"),
+            'pending_count' => Logger::info("ФНС: ИНН {$inn} — в ответе счетов: {$observed}, в базе: {$confirmed}. Изменение не объявляем: ждём подтверждения на следующий рабочий день"),
+            'pending_waiting' => Logger::info("ФНС: ИНН {$inn} — в ответе по-прежнему счетов: {$observed}, в базе: {$confirmed}; ждём подтверждения (замечено {$since})"),
+            'lift_confirmed' => Logger::info("ФНС: ИНН {$inn} — снятие блокировки подтверждено (блокировок нет с {$since})"),
+            'count_confirmed' => Logger::info("ФНС: ИНН {$inn} — число счетов подтверждено: было {$confirmed}, стало {$observed} (замечено {$since})"),
+            default => null,
+        };
+    }
+
+    /**
+     * Состояние строки fns_blocks ДО этой проверки: подтверждённое (оно же
+     * «было» для EventPublisher::publishFnsBlockChange()) и ожидающее
+     * подтверждения. Строки ещё нет вообще (эмитент проверяется впервые) —
+     * трактуем как «не заблокирован», это и есть нейтральное начальное
+     * состояние.
      *
-     * @return array{is_fns_blocked: bool, blocked_amount: ?string, active_bank_count: int}
+     * @return array{is_fns_blocked: bool, blocked_amount: ?string, active_bank_count: int, pending_bank_count: ?int, pending_since: ?string}
      */
     private function fetchCurrentState(int $issuerId): array
     {
-        $stmt = $this->db->prepare('SELECT is_fns_blocked, blocked_amount, active_bank_count FROM fns_blocks WHERE issuer_id = :issuer_id');
+        $stmt = $this->db->prepare(
+            'SELECT is_fns_blocked, blocked_amount, active_bank_count, pending_bank_count, pending_since FROM fns_blocks WHERE issuer_id = :issuer_id'
+        );
         $stmt->execute(['issuer_id' => $issuerId]);
-        $row = $stmt->fetch();
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
 
         if ($row === false) {
-            return ['is_fns_blocked' => false, 'blocked_amount' => null, 'active_bank_count' => 0];
+            return ['is_fns_blocked' => false, 'blocked_amount' => null, 'active_bank_count' => 0, 'pending_bank_count' => null, 'pending_since' => null];
         }
 
         return [
             'is_fns_blocked' => (bool) $row['is_fns_blocked'],
             'blocked_amount' => $row['blocked_amount'],
             'active_bank_count' => (int) $row['active_bank_count'],
+            'pending_bank_count' => $row['pending_bank_count'] !== null ? (int) $row['pending_bank_count'] : null,
+            'pending_since' => $row['pending_since'] !== null ? substr((string) $row['pending_since'], 0, 10) : null,
         ];
     }
 
@@ -440,6 +609,7 @@ final class FnsBlocksImporter
         Logger::info('=== Отчёт по проверке блокировок счетов (ФНС, service.nalog.ru) ===');
         Logger::info("Эмитентов проверено: {$this->checked}");
         Logger::info("С активной блокировкой: {$this->blockedFound}");
+        Logger::info("Ждут подтверждения (снятие или число счетов): {$this->awaitingConfirmation}");
         Logger::info("Пропущено (капча, суммарно по всем попыткам): {$this->skippedCaptcha}");
         Logger::info("Восстановлено повтором (не прошли с первого раза, но прошли на повторной попытке): {$this->recoveredOnRetry}");
         Logger::info("Окончательно не прошли проверку в этом прогоне (после всех повторов): {$this->failed}");

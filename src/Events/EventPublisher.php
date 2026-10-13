@@ -115,6 +115,12 @@ final class EventPublisher
      * буквенный порядок match ниже) — 'count_changed' срабатывает, только
      * когда сумма НЕ изменилась, иначе на одном и том же реальном событии
      * ушли бы два разных уведомления подряд.
+     *
+     * С 13.10.2026 снятие и изменение числа счетов объявляются только после
+     * подтверждения: FnsBlocksImporter передаёт сюда ПОДТВЕРЖДЁННОЕ состояние
+     * «до» и «после», а не то, что сервис показал в эту минуту.
+     *
+     * @param array<string, mixed> $sourceAnswer ответ сервиса ФНС целиком — только в raw_messages, в событие не попадает
      */
     public function publishFnsBlockChange(
         int $issuerId,
@@ -127,6 +133,7 @@ final class EventPublisher
         string $blockDate,
         ?string $reason,
         ?string $sourceReference,
+        array $sourceAnswer = [],
     ): ?int {
         $kind = match (true) {
             !$oldBlocked && $newBlocked => 'started',
@@ -156,6 +163,8 @@ final class EventPublisher
             'active_bank_count' => $newActiveBankCount,
             'block_date' => $blockDate,
             'reason' => $reason,
+            // Ответ сервиса ФНС целиком (13.10.2026) — чтобы по журналу было видно, что именно он отдавал.
+            'fns_answer' => $sourceAnswer,
         ]);
 
         $statusText = match ($kind) {
@@ -176,12 +185,28 @@ final class EventPublisher
                 'kind' => $kind,
                 'old_blocked_amount' => $oldBlockedAmount,
                 'new_blocked_amount' => $newBlockedAmount,
+                // Прежнее число счетов нужно тексту уведомления «было X, стало Y». До 13.10.2026 его здесь не было
+                // (лежало только в raw_messages), и клиент получал «было 0» при любом изменении.
+                'old_active_bank_count' => $oldActiveBankCount,
                 'active_bank_count' => $newActiveBankCount,
                 'block_date' => $blockDate,
                 'reason' => $reason,
             ],
             rawMessageId: $rawMessageId,
         );
+    }
+
+    /**
+     * Ответ сервиса ФНС, по которому события НЕТ, но который отличается от
+     * предыдущего (число счетов изменилось и ждёт подтверждения, ожидание
+     * снято и т. п. — см. докблок FnsBlocksImporter). Только строка в
+     * raw_messages: клиентам ничего не уходит.
+     *
+     * @param array<string, mixed> $answer
+     */
+    public function recordFnsObservation(?string $sourceReference, array $answer): int
+    {
+        return $this->insertRawMessage('fns', $sourceReference, ['kind' => 'observation', 'fns_answer' => $answer]);
     }
 
     /**
@@ -208,16 +233,20 @@ final class EventPublisher
         ?int $rawMessageId = null,
         ?string $amountPlanned = null,
         ?string $amountActual = null,
+        /** Только у напоминаний (R1, R2): за сколько дней до даты оно создано (миграция 032). */
+        ?int $reminderDays = null,
     ): int {
+        // Колонка reminder_days называется в запросе только у напоминаний: события о деньгах от НРД
+        // должны записываться и там, где миграция 032 ещё не применена.
         $stmt = $this->db->prepare(
             'INSERT INTO events
                 (security_id, issuer_id, event_type_code, story_id, raw_message_id, event_date,
-                 amount_planned, amount_actual, status_text, priority, payload_json)
+                 amount_planned, amount_actual, status_text, priority, payload_json' . ($reminderDays !== null ? ', reminder_days' : '') . ')
              VALUES
                 (:security_id, :issuer_id, :event_type_code, :story_id, :raw_message_id, :event_date,
-                 :amount_planned, :amount_actual, :status_text, :priority, :payload_json)'
+                 :amount_planned, :amount_actual, :status_text, :priority, :payload_json' . ($reminderDays !== null ? ', :reminder_days' : '') . ')'
         );
-        $stmt->execute([
+        $stmt->execute(($reminderDays !== null ? ['reminder_days' => $reminderDays] : []) + [
             'security_id' => $securityId,
             'issuer_id' => $issuerId,
             'event_type_code' => $eventTypeCode,

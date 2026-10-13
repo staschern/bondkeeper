@@ -14,6 +14,16 @@ use RuntimeException;
  *   reminders      — напоминания в последний рабочий день перед
  *                    выплатой (R1). От НРД не
  *                    зависят, работают по графику с Мосбиржи.
+ *   offer_reminders — напоминания о предстоящей оферте (R2), по
+ *                    умолчанию за 30 календарных дней. Создаёт тот же
+ *                    скрипт, что и напоминания о выплатах.
+ *   offer_put_reminders_from — разовая настройка первого запуска
+ *                    напоминаний об офертах (решение пользователя,
+ *                    12.10.2026): о путах с датой оферты раньше этой
+ *                    даты не напоминаем. Ставится «день включения
+ *                    плюс 10 дней»: о путах, до которых в момент
+ *                    включения осталось меньше 10 дней, напоминать
+ *                    уже поздно. Через 10 дней ни на что не влияет.
  *   checks         — проверки «сообщения о получении нет»:
  *                    off     — выключены (так и должно быть, пока
  *                              сообщения НРД не поступают: иначе
@@ -41,6 +51,8 @@ final class PaymentsConfig
         public readonly bool $reminders,
         public readonly string $checks,
         public readonly bool $getNewsPolling,
+        public readonly bool $offerReminders = false,
+        public readonly ?string $offerPutRemindersFrom = null,
     ) {
     }
 
@@ -59,10 +71,17 @@ final class PaymentsConfig
             throw new RuntimeException("Конфиг выплат {$path}: checks должен быть off, admin или clients, получено «{$checks}».");
         }
 
+        $putFrom = $config['offer_put_reminders_from'] ?? null;
+        if ($putFrom !== null && (!is_string($putFrom) || preg_match('/^\d{4}-\d{2}-\d{2}$/', $putFrom) !== 1 || date('Y-m-d', (int) strtotime($putFrom)) !== $putFrom)) {
+            throw new RuntimeException("Конфиг выплат {$path}: offer_put_reminders_from должен быть датой вида '2026-10-23' (в кавычках).");
+        }
+
         return new self(
             (bool) ($config['reminders'] ?? false),
             $checks,
             (bool) ($config['getnews_polling'] ?? false),
+            (bool) ($config['offer_reminders'] ?? false),
+            $putFrom,
         );
     }
 }

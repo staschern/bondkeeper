@@ -5,7 +5,8 @@ declare(strict_types=1);
 namespace BondKeeper\Payments;
 
 /**
- * Образцы всех уведомлений о выплатах (Этап 5, docs/STAGE5_PAYMENTS.md) —
+ * Образцы всех уведомлений о выплатах (Этап 5, docs/STAGE5_PAYMENTS.md) и
+ * напоминаний об офертах (docs/OFFERS.md) —
  * по одному на каждый вид и на каждый заметный вариант текста. Нужны,
  * чтобы посмотреть и поправить формулировки в Telegram, не дожидаясь
  * настоящих событий: bin/send_payment_samples.php отправляет их
@@ -13,7 +14,7 @@ namespace BondKeeper\Payments;
  *
  * Тексты клиентских уведомлений здесь НЕ записаны: образец — это только
  * вид события и данные (payload) в том виде, в каком их создают
- * PaymentWatch и PaymentProcessor, а текст строит тот же
+ * PaymentWatch, OfferWatch и PaymentProcessor, а текст строит тот же
  * NotificationDispatcher, что и для клиентов. Поэтому образец всегда
  * совпадает с настоящим уведомлением, и после правки шаблона образцы
  * меняются сами.
@@ -43,6 +44,10 @@ final class PaymentNotificationSamples
             'currency' => 'RUB', 'amount_planned' => null, 'amount_actual' => null, 'tranche_amount' => null,
             'received_date' => null, 'late' => false, 'before_due' => false, 'extra' => false,
             'full_default_date' => null, 'working_days_to_default' => null, 'source_note' => null,
+        ];
+        // Напоминание об оферте (R2) — в том виде, в каком его создаёт OfferWatch.
+        $offer = static fn (string $date, string $reminder, array $offers): array => self::BOND + [
+            'offer_date' => $date, 'reminder_date' => $reminder, 'days_before' => 30, 'offers' => $offers,
         ];
 
         return [
@@ -115,6 +120,27 @@ final class PaymentNotificationSamples
             ['code' => 'B2a', 'title' => 'жёлтое: к 12:02 следующего рабочего дня НРД не сообщил о деньгах', 'payload' => $schedule('2026-10-15', '2026-10-15', [
                 ['kind' => 'coupon', 'amount_planned' => '12.3300'], ['kind' => 'amortization', 'amount_planned' => '250.0000'],
             ]) + ['check' => 'noon', 'due_date' => '2026-10-15']],
+
+            // Настройки пользователя и напоминания об офертах (ТЗ от 12.10.2026). Новые образцы — в конце,
+            // чтобы номера прежних не сдвигались.
+            ['code' => 'R1', 'title' => 'напоминание со своим интервалом (за 3 дня до выплаты): купон', 'payload' => $schedule('2026-10-15', '2026-10-15', [
+                ['kind' => 'coupon', 'amount_planned' => '12.3300'],
+            ], 'RUB', '2026-10-12') + ['days_before' => 3]],
+            ['code' => 'R2', 'title' => 'напоминание об оферте за 30 дней: пут, известны период предъявления и цена', 'payload' => $offer('2026-11-13', '2026-10-14', [
+                ['type' => 'put', 'period_start' => '2026-10-27', 'period_end' => '2026-11-02', 'price_percent' => '100.000', 'announced' => false],
+            ])],
+            ['code' => 'R2', 'title' => 'напоминание об оферте: пут, биржа дала только дату и цену', 'payload' => $offer('2026-11-13', '2026-10-14', [
+                ['type' => 'put', 'period_start' => null, 'period_end' => null, 'price_percent' => '100.000', 'announced' => false],
+            ])],
+            ['code' => 'R2', 'title' => 'напоминание об оферте: колл-опцион по данным биржи (право эмитента)', 'payload' => $offer('2026-11-13', '2026-10-14', [
+                ['type' => 'call', 'period_start' => null, 'period_end' => null, 'price_percent' => '100.000', 'announced' => false],
+            ])],
+            ['code' => 'R2', 'title' => 'напоминание об оферте: досрочное погашение, объявленное НРД (до даты меньше 30 дней)', 'payload' => $offer('2026-10-30', '2026-10-19', [
+                ['type' => 'call', 'period_start' => null, 'period_end' => null, 'price_percent' => '100.000', 'announced' => true],
+            ])],
+            ['code' => 'R2', 'title' => 'напоминание об оферте по бумаге в техническом дефолте', 'payload' => $offer('2026-11-13', '2026-10-14', [
+                ['type' => 'put', 'period_start' => null, 'period_end' => null, 'price_percent' => '100.000', 'announced' => false],
+            ]) + ['security_status' => 'tech_default']],
         ];
     }
 

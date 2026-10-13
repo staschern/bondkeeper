@@ -8,6 +8,7 @@ use BondKeeper\Events\EventPublisher;
 use BondKeeper\Fns\FnsBlocksImporter;
 use BondKeeper\Fns\NalogBiClient;
 use BondKeeper\Fns\NalogBiClientInterface;
+use BondKeeper\Payments\WorkingCalendar;
 use BondKeeper\Ratings\IssuerMatcher;
 use BondKeeper\Ratings\NameMatchReviews;
 use BondKeeper\Support\Logger;
@@ -47,6 +48,19 @@ use PDOException;
  * без Reply вообще — молча игнорируется, это осознанное решение из ТЗ,
  * не пробел).
  *
+ * === Меню с 12.10.2026 (ТЗ пользователя, docs/BOT_UX_SPEC.md, раздел 10) ===
+ * Главная клавиатура: «Выбор компаний 📝 / Настройки ⚙️ / Подписка 🎁 /
+ * О сервисе 🌐 / Помощь 🛠». Кнопка «Статус 📍» из главного меню убрана:
+ * проверка статуса теперь в подменю «Выбор компаний» («Проверить статус
+ * 📌», callback `stat:menu`). У тех, кто не нажимал /start после
+ * обновления, старая кнопка ещё на экране — её нажатие по-прежнему
+ * открывает статус и заодно присылает новую клавиатуру.
+ * «Настройки ⚙️» — настройка уведомлений (callback-префикс `set:`):
+ * отключение напоминаний целиком или по эмитентам, свой интервал для
+ * купонов / амортизаций / оферт / погашений (число дней пользователь
+ * присылает сообщением — состояние `awaiting_reminder_days`), выбор
+ * выпусков эмитента. Сами настройки хранит NotificationPreferences.
+ *
  * Регистрация пользователя (ensureUser()) выполняется на КАЖДОЕ входящее
  * сообщение, а не только на /start — так что если пользователь почему-то
  * напишет боту сразу /watch (например, по диплинку) без предварительного
@@ -66,7 +80,12 @@ use PDOException;
 final class BotCommandHandler
 {
     private const BTN_ISSUERS = 'Выбор компаний 📝';
-    private const BTN_STATUS = 'Статус 📍';
+    private const BTN_SETTINGS = 'Настройки ⚙️';
+    /** Кнопка главного меню до 12.10.2026: у части пользователей она ещё на экране. */
+    private const BTN_STATUS_LEGACY = 'Статус 📍';
+    /** Инлайн-кнопка в подменю «Выбор компаний» — туда переехал прежний «Статус». */
+    private const BTN_STATUS = 'Проверить статус 📌';
+    private const BONDS_PAGE_SIZE = 8;
     private const BTN_SUBSCRIPTION = 'Подписка 🎁';
     private const BTN_ABOUT = 'О сервисе 🌐';
     private const BTN_HELP = 'Помощь 🛠';
@@ -83,7 +102,10 @@ final class BotCommandHandler
         /** Подмена в офлайн-тестах (checkFnsOnAdd()) — без сети, по умолчанию настоящий сервис ФНС. */
         private readonly NalogBiClientInterface $nalogBiClient = new NalogBiClient(),
     ) {
+        $this->preferences = new NotificationPreferences($db);
     }
+
+    private readonly NotificationPreferences $preferences;
 
     /** @param array<string, mixed> $update сырой объект Update от Bot API */
     public function handleUpdate(array $update): void
@@ -131,6 +153,9 @@ final class BotCommandHandler
 
         $known = $this->matchKnownCommand($userId, $text);
         if ($known !== null) {
+            if (isset($known['before'])) {
+                $this->telegram->sendMessage($chatId, $known['before']['text'], $known['before']['keyboard'] ?? null);
+            }
             $this->telegram->sendMessage($chatId, $known['text'], $known['keyboard'] ?? null, $known['parseMode'] ?? null);
             return;
         }
@@ -184,20 +209,38 @@ final class BotCommandHandler
         if ($toast === null) {
             $toast = $this->dispatchStatusCallback($userId, $chatId, $messageId, $data);
         }
+        if ($toast === null) {
+            $toast = $this->dispatchSettingsCallback($userId, $chatId, $messageId, $data);
+        }
         $this->telegram->answerCallbackQuery($id, $toast);
     }
 
-    /** @return array{text: string, keyboard?: array<string, mixed>, parseMode?: string}|null null — не команда и не кнопка меню, дальше — handleFreeText() */
+    /**
+     * Ответы, у которых нет своих инлайн-кнопок («Подписка», «Помощь»,
+     * /help), несут главную клавиатуру: так она обновляется у тех, кто не
+     * нажимал /start после смены меню 12.10.2026.
+     *
+     * @return array{text: string, keyboard?: array<string, mixed>, parseMode?: string, before?: array{text: string, keyboard?: array<string, mixed>}}|null
+     *         null — не команда и не кнопка меню, дальше — handleFreeText(); before — сообщение, которое уходит перед основным
+     */
     private function matchKnownCommand(int $userId, string $text): ?array
     {
         return match ($text) {
             '/start' => ['text' => $this->handleStart(), 'keyboard' => $this->mainMenuKeyboard(), 'parseMode' => 'HTML'],
-            '/help' => ['text' => $this->helpText()],
+            '/help' => ['text' => $this->helpText(), 'keyboard' => $this->mainMenuKeyboard()],
+            // Вернуть значок меню, если он пропал (так бывает в Telegram Desktop — см. докблок mainMenuKeyboard()).
+            '/menu' => ['text' => 'Меню 👇', 'keyboard' => $this->mainMenuKeyboard()],
             self::BTN_ISSUERS => $this->handleIssuerMenuEntry(),
-            self::BTN_STATUS => $this->handleStatusMenuEntry($userId),
-            self::BTN_SUBSCRIPTION => ['text' => $this->handleSubscription($userId), 'parseMode' => 'HTML'],
+            self::BTN_SETTINGS => $this->handleSettingsMenuEntry($userId),
+            // Старая кнопка: статус показываем, как и раньше, а перед этим — новая клавиатура.
+            self::BTN_STATUS_LEGACY => $this->handleStatusMenuEntry($userId) + ['before' => [
+                'text' => 'Меню обновилось: вместо кнопки «Статус» теперь «' . self::BTN_SETTINGS . '», а проверка статуса — в разделе «'
+                    . self::BTN_ISSUERS . '» → «' . self::BTN_STATUS . '».',
+                'keyboard' => $this->mainMenuKeyboard(),
+            ]],
+            self::BTN_SUBSCRIPTION => ['text' => $this->handleSubscription($userId), 'keyboard' => $this->mainMenuKeyboard(), 'parseMode' => 'HTML'],
             self::BTN_ABOUT => ['text' => $this->aboutServiceText(), 'keyboard' => $this->aboutServiceKeyboard(), 'parseMode' => 'HTML'],
-            self::BTN_HELP => ['text' => $this->startSupportFlow($userId)],
+            self::BTN_HELP => ['text' => $this->startSupportFlow($userId), 'keyboard' => $this->mainMenuKeyboard()],
             default => $this->matchSlashCommandWithArgument($userId, $text),
         };
     }
@@ -225,13 +268,23 @@ final class BotCommandHandler
      * белый текст сами по себе (часть стиля Bot API 9.4, не наша
      * настройка); "серая, чёрный текст" — это и есть цвет ПО УМОЛЧАНИЮ
      * (поле `style` просто не передаём), отдельного "grey" в Bot API нет.
+     *
+     * Публичный и статический с 13.10.2026: клавиатуру время от времени
+     * прикладывает к уведомлениям и NotificationDispatcher. Причина —
+     * Telegram Desktop: он не хранит клавиатуру бота, а при открытии чата
+     * ищет её среди загруженных сообщений (первая порция — 30 штук; так в
+     * исходном коде tdesktop: history.cpp, addItemsToLists(); history_widget.cpp,
+     * kMessagesPerPageFirst). Если последние три десятка сообщений в чате —
+     * уведомления без клавиатуры, значок меню у поля ввода пропадает до
+     * следующего сообщения с клавиатурой. Мобильные приложения клавиатуру
+     * помнят, там такого нет.
      */
-    private function mainMenuKeyboard(): array
+    public static function mainMenuKeyboard(): array
     {
         return [
             'keyboard' => [
                 [['text' => self::BTN_ISSUERS, 'style' => 'primary'], ['text' => self::BTN_SUBSCRIPTION, 'style' => 'success']],
-                [['text' => self::BTN_STATUS], ['text' => self::BTN_ABOUT, 'style' => 'danger']],
+                [['text' => self::BTN_SETTINGS], ['text' => self::BTN_ABOUT, 'style' => 'danger']],
                 [['text' => self::BTN_HELP]],
             ],
             'resize_keyboard' => true,
@@ -352,7 +405,7 @@ final class BotCommandHandler
         return date('Y-m-d H:i:s', strtotime($dateTime) + $days * 86400);
     }
 
-    /** Текст дословно из ТЗ (docs/BOT_UX_SPEC.md, раздел 1.2) — не перефразировать без запроса пользователя. */
+    /** Текст дословно из ТЗ (docs/BOT_UX_SPEC.md, раздел 10.1 — редакция пользователя от 12.10.2026) — не перефразировать без запроса пользователя. */
     /**
      * HTML (не Markdown) — Bot API парсит только <b>/<i>/... в тексте с
      * parse_mode=HTML, экранировать тут нечего (в статичном тексте и в
@@ -369,8 +422,8 @@ final class BotCommandHandler
             . "Перед тем, как начать, расскажу немного о своём меню.\n\n"
             . "Чтобы открыть его, просто нажми на кнопку справа от окна сообщения 😉 (квадрат с четырьмя кружочками внутри).\n\n"
             . "Пробежимся по разделам:\n"
-            . '<b>' . self::BTN_ISSUERS . '</b>' . " — жми сюда, чтобы составить или отредактировать список эмитентов, за которыми нужно следить.\n"
-            . '<b>' . self::BTN_STATUS . '</b>' . " — жми сюда, чтобы получить актуальную информацию по конкретному эмитенту или всему списку.\n"
+            . '<b>' . self::BTN_ISSUERS . '</b>' . " — жми сюда, чтобы составить или отредактировать список эмитентов, за которыми нужно следить. Тут же можно получить актуальную информацию по конкретному эмитенту или всему списку.\n"
+            . '<b>' . self::BTN_SETTINGS . '</b>' . " — жми сюда, чтобы настроить отправку уведомлений и напоминаний.\n"
             . '<b>' . self::BTN_SUBSCRIPTION . '</b>' . " — жми сюда, чтобы получить информацию о текущей подписке и тарифах.\n"
             . '<b>' . self::BTN_ABOUT . '</b>' . " — жми сюда, чтобы получить больше информации о самом проекте и сервисе. Я подробно расскажу о том, какие данные нам доступны и как их можно использовать.\n"
             . '<b>' . self::BTN_HELP . '</b>' . " — жми сюда, если у тебя возникли какие-то вопросы или сложности, связанные с проектом. Наша поддержка оперативно тебе поможет и ответит на все вопросы.";
@@ -378,16 +431,30 @@ final class BotCommandHandler
 
     // === Раздел "Выбор компаний" — docs/BOT_UX_SPEC.md раздел 3 ===
 
-    /** Вход в раздел — сообщение с двумя инлайн-кнопками, дословно из ТЗ. */
+    /**
+     * Вход в раздел — тексты дословно из ТЗ от 12.10.2026: к двум прежним
+     * кнопкам добавились «Проверить статус 📌» (прежняя кнопка «Статус»
+     * главного меню) и «Карточка эмитента 📋» (пока заглушка).
+     */
     private function handleIssuerMenuEntry(): array
     {
         return [
-            'text' => 'Что делаем со списком эмитентов?',
+            'text' => 'Настройка списка и проверка текущего статуса по эмитентам ⚙️',
             'keyboard' => ['inline_keyboard' => [
-                [['text' => 'Добавить новых эмитентов', 'callback_data' => 'iss:add_menu']],
-                [['text' => 'Редактировать список', 'callback_data' => 'iss:edit_list']],
+                [['text' => 'Добавить новых эмитентов ➕', 'callback_data' => 'iss:add_menu']],
+                [['text' => 'Редактировать список ✏️', 'callback_data' => 'iss:edit_list']],
+                [['text' => self::BTN_STATUS, 'callback_data' => 'stat:menu']],
+                [['text' => 'Карточка эмитента 📋', 'callback_data' => 'iss:card']],
             ]],
         ];
+    }
+
+    /** «Карточка эмитента 📋» — раздела ещё нет; отдельным сообщением, чтобы меню осталось на экране. */
+    private function showIssuerCardStub(int $chatId): ?string
+    {
+        $this->telegram->sendMessage($chatId, "Данный функционал находится в разработке и будет доступен позже.\nОжидайте анонса на канале @Bond_Keeper 😉");
+
+        return null;
     }
 
     /**
@@ -411,6 +478,7 @@ final class BotCommandHandler
             'pick' => $this->pickIssuer($userId, $chatId, $messageId, (int) ($parts[2] ?? 0)),
             'toggle' => $this->toggleIssuer($userId, $chatId, $messageId, (int) ($parts[2] ?? 0), (int) ($parts[3] ?? 0)),
             'remove' => $this->removeIssuerFromEditList($userId, $chatId, $messageId, (int) ($parts[2] ?? 0)),
+            'card' => $this->showIssuerCardStub($chatId),
             default => null,
         };
     }
@@ -501,6 +569,7 @@ final class BotCommandHandler
         if ($alreadyWatched) {
             $this->db->prepare('DELETE FROM watchlist WHERE user_id = :user_id AND issuer_id = :issuer_id AND security_id IS NULL')
                 ->execute(['user_id' => $userId, 'issuer_id' => $issuerId]);
+            $this->forgetIssuerSettings($userId, $issuerId);
             $toast = 'Убрано';
         } else {
             $limit = $this->currentTariffLimit($userId);
@@ -575,7 +644,8 @@ final class BotCommandHandler
         $this->telegram->editMessageText(
             $chatId,
             $messageId,
-            "Список успешно обновлён! 🥳\nЧтобы получить актуальную информацию по конкретному эмитенту или всему списку нажми на команду " . self::BTN_STATUS
+            "Список успешно обновлён! 🥳\nЧтобы получить актуальную информацию по конкретному эмитенту или всему списку нажми «" . self::BTN_STATUS . '»',
+            ['inline_keyboard' => [[['text' => self::BTN_STATUS, 'callback_data' => 'stat:menu']]]]
         );
 
         // Проверка ФНС — уже ПОСЛЕ подтверждения добавления (быстрый
@@ -590,6 +660,9 @@ final class BotCommandHandler
         $stmt = $this->db->prepare('DELETE FROM watchlist WHERE user_id = :user_id AND issuer_id = :issuer_id');
         $stmt->execute(['user_id' => $userId, 'issuer_id' => $issuerId]);
         $removed = $stmt->rowCount() > 0;
+        if ($removed) {
+            $this->forgetIssuerSettings($userId, $issuerId);
+        }
 
         $this->showEditListScreen($userId, $chatId, $messageId);
 
@@ -636,8 +709,13 @@ final class BotCommandHandler
         $fns = $this->fetchFnsBlockRow($issuerId);
         if (!$this->isFnsCheckFresh($fns)) {
             try {
-                (new FnsBlocksImporter($this->nalogBiClient, $this->db, new EventPublisher($this->db)))
-                    ->checkIssuers([['id' => $issuerId, 'inn' => (string) $issuer['inn']]], maxRetries: 0);
+                // Календарь — чтобы и эта разовая проверка подтверждала снятие и число счетов только в рабочий день.
+                (new FnsBlocksImporter(
+                    $this->nalogBiClient,
+                    $this->db,
+                    new EventPublisher($this->db),
+                    calendar: WorkingCalendar::fromFile(dirname(__DIR__, 2) . '/config/working_calendar.php'),
+                ))->checkIssuers([['id' => $issuerId, 'inn' => (string) $issuer['inn']]], maxRetries: 0);
             } catch (\Throwable $e) {
                 Logger::warn("ФНС: разовая проверка при добавлении эмитента id={$issuerId} не удалась: {$e->getMessage()}");
                 return;
@@ -832,13 +910,23 @@ final class BotCommandHandler
             ];
         }
 
+        // Текст и смайлики на кнопках — из ТЗ от 12.10.2026 (раньше: «Что показать?»).
         return [
-            'text' => 'Что показать?',
+            'text' => 'Ты можешь уточнить текущий статус по конкретной компании или по всему списку 📍',
             'keyboard' => ['inline_keyboard' => [
-                [['text' => 'Указать компанию', 'callback_data' => 'stat:pick_menu']],
-                [['text' => 'Весь список', 'callback_data' => 'stat:all']],
+                [['text' => 'Указать компанию ❤️', 'callback_data' => 'stat:pick_menu']],
+                [['text' => 'Весь список 📋', 'callback_data' => 'stat:all']],
             ]],
         ];
+    }
+
+    /** «Проверить статус 📌» из подменю «Выбор компаний»: тот же экран, но в том же сообщении. */
+    private function showStatusMenu(int $userId, int $chatId, int $messageId): ?string
+    {
+        $entry = $this->handleStatusMenuEntry($userId);
+        $this->telegram->editMessageText($chatId, $messageId, $entry['text'], $entry['keyboard'] ?? null);
+
+        return null;
     }
 
     /** Текст "весь список" — тот же формат, что был единственным до правки от 17 сентября 2026. */
@@ -866,6 +954,7 @@ final class BotCommandHandler
         }
 
         return match ($parts[1] ?? '') {
+            'menu' => $this->showStatusMenu($userId, $chatId, $messageId),
             'pick_menu' => $this->showStatusPickList($userId, $chatId, $messageId),
             'all' => $this->showStatusAll($userId, $chatId, $messageId),
             'one' => $this->showStatusOne($userId, $chatId, $messageId, (int) ($parts[2] ?? 0)),
@@ -1136,16 +1225,21 @@ final class BotCommandHandler
      * parse_mode=HTML, см. matchKnownCommand(). Последний абзац и кнопка
      * "Читать статью 📚" (ссылка — ABOUT_ARTICLE_URL) — по запросу
      * пользователя (16 сентября 2026), URL статьи прислан.
+     * Редакция пользователя от 12.10.2026: убран абзац «Мы постоянно
+     * дорабатываем… функционал включает: блокировки ФНС и рейтинговые
+     * действия» — сервис уже шлёт и выплаты. Заодно исправлены две
+     * грамматические ошибки исходного текста («о приостановки» →
+     * «о приостановлении», «на их основе» → «на её основе»; пользователь
+     * разрешил править его опечатки и сообщать об этом).
      */
     private function aboutServiceText(): string
     {
         return "Благодарим за интерес к нашему проекту! 🙏\n\n"
-            . "<b>BondKeeper</b> — российский digital-сервис мониторинга корпоративных облигаций. Сервис объединяет в одном канале уведомлений структурированные данные по облигациям, корпоративные раскрытия (включая информацию о поступлении денежных средств для купонных выплат, амортизаций, оферт и погашений), сигналы о наличии решений ФНС о приостановки операций по счетам, сигналы о пересмотре кредитного рейтинга эмитентов от РА. Основная цель сервиса — своевременно предоставить пользователю критически важную информацию, чтобы на их основе он мог принять собственное инвестиционное решение.\n\n"
+            . "<b>BondKeeper</b> — российский digital-сервис мониторинга корпоративных облигаций. Сервис объединяет в одном канале уведомлений структурированные данные по облигациям, корпоративные раскрытия (включая информацию о поступлении денежных средств для купонных выплат, амортизаций, оферт и погашений), сигналы о наличии решений ФНС о приостановлении операций по счетам, сигналы о пересмотре кредитного рейтинга эмитентов от РА. Основная цель сервиса — своевременно предоставить пользователю критически важную информацию, чтобы на её основе он мог принять собственное инвестиционное решение.\n\n"
             . "Главные преимущества проекта:\n"
             . "- скорость получения информации;\n"
             . "- пользователь сам настраивает список интересующих его эмитентов и облигаций (исключён рыночный шум и бесконечный спам);\n"
             . "- все сигналы (выплаты, блокировки и рейтинги) объединены в один удобный канал уведомлений.\n\n"
-            . "Мы постоянно дорабатываем и улучшаем наш сервис и на сегодняшний день его функционал включает: информацию о блокировках ФНС и уведомления о рейтинговых действиях.\n\n"
             . "Получить больше информации о самом проекте можно в статье по ссылке ниже 👇";
     }
 
@@ -1153,6 +1247,456 @@ final class BotCommandHandler
     private function aboutServiceKeyboard(): array
     {
         return ['inline_keyboard' => [[['text' => 'Читать статью 📚', 'url' => self::ABOUT_ARTICLE_URL]]]];
+    }
+
+    // === Раздел "Настройки ⚙️" — настройка уведомлений, docs/BOT_UX_SPEC.md раздел 10 ===
+
+    /** Виды напоминаний, для которых можно задать свой интервал: вид → [подпись кнопки, «о чём» в ответе, «до чего»]. */
+    private const REMINDER_KINDS = [
+        NotificationPreferences::KIND_COUPON => ['Свой интервал для купонов ⌛️', 'о купонах', 'до выплаты'],
+        NotificationPreferences::KIND_AMORTIZATION => ['Свой интервал для амортизации ⌛️', 'об амортизациях', 'до выплаты'],
+        NotificationPreferences::KIND_OFFER => ['Свой интервал для оферт ⌛️', 'об офертах', 'до даты оферты'],
+        NotificationPreferences::KIND_REDEMPTION => ['Свой интервал для погашений ⌛️', 'о погашениях', 'до выплаты'],
+    ];
+
+    /**
+     * Вход в раздел. Первый абзац — дословно из ТЗ от 12.10.2026. Если
+     * пользователь уже что-то поменял, ниже добавляется короткая сводка
+     * его настроек: текст из ТЗ описывает значения по умолчанию, и без
+     * сводки было бы не видно, что они уже другие.
+     *
+     * @return array{text: string, keyboard: array<string, mixed>}
+     */
+    private function handleSettingsMenuEntry(int $userId): array
+    {
+        $text = "Ты можешь самостоятельно настраивать уведомления так, как тебе удобно 😉\n"
+            . 'Сейчас ты по умолчанию получаешь уведомления по всем выпускам облигаций эмитентов в твоём списке. '
+            . 'Также ты получаешь напоминания по всем выплатам эмитентов в списке за 1 рабочий день до даты самой выплаты, а по офертам за 30 дней.';
+        try {
+            $summary = $this->settingsSummary($userId);
+        } catch (PDOException $e) {
+            $summary = ''; // миграция 032 ещё не применена — показываем раздел без сводки
+        }
+
+        return [
+            'text' => $text . ($summary !== '' ? "\n\nТвои настройки сейчас:\n" . $summary : ''),
+            'keyboard' => ['inline_keyboard' => [
+                [['text' => 'Напоминания по выплатам 🗓', 'callback_data' => 'set:reminders']],
+                [['text' => 'Уведомления по эмитентам ⏰', 'callback_data' => 'set:bonds']],
+            ]],
+        ];
+    }
+
+    /** Что у пользователя отличается от значений по умолчанию — строками; пусто — ничего не менял. */
+    private function settingsSummary(int $userId): string
+    {
+        $settings = $this->preferences->get($userId);
+        $lines = [];
+        if (!$settings['reminders_enabled']) {
+            $lines[] = '• напоминания отключены для всего списка';
+        } else {
+            $muted = count($this->preferences->mutedIssuerIds($userId));
+            if ($muted > 0) {
+                $lines[] = "• напоминания отключены по эмитентам: {$muted}";
+            }
+        }
+        foreach (self::REMINDER_KINDS as $kind => [, $about, $until]) {
+            if ($settings['custom'][$kind] !== null && $settings['custom'][$kind] !== NotificationPreferences::DEFAULT_DAYS[$kind]) {
+                $lines[] = "• напоминания {$about} — за {$settings['custom'][$kind]} дн. {$until}";
+            }
+        }
+        $excluded = count($this->preferences->excludedSecurityIds($userId));
+        if ($excluded > 0) {
+            $lines[] = "• выпусков без уведомлений: {$excluded}";
+        }
+
+        return implode("\n", $lines);
+    }
+
+    /**
+     * Разбор callback_data вида "set:<действие>[:...]" — раздел «Настройки».
+     * Тот же приём возврата тоста/null, что и dispatchIssuerCallback().
+     */
+    private function dispatchSettingsCallback(int $userId, int $chatId, int $messageId, string $data): ?string
+    {
+        $parts = explode(':', $data);
+        if (($parts[0] ?? '') !== 'set') {
+            return null;
+        }
+        $id = (int) ($parts[2] ?? 0);
+
+        try {
+            return match ($parts[1] ?? '') {
+                'reminders' => $this->showRemindersMenu($chatId, $messageId),
+                'off' => $this->showRemindersOffMenu($chatId, $messageId),
+                'off_all' => $this->disableAllReminders($userId, $chatId, $messageId),
+                'off_pick' => $this->showMutePickList($userId, $chatId, $messageId),
+                'mute' => $this->toggleIssuerMute($userId, $chatId, $messageId, $id),
+                'on' => $this->showRemindersOnMenu($userId, $chatId, $messageId),
+                'on_all' => $this->enableAllReminders($userId, $chatId, $messageId),
+                'on_pick' => $this->showUnmutePickList($userId, $chatId, $messageId),
+                'unmute' => $this->unmuteIssuer($userId, $chatId, $messageId, $id),
+                'int' => $this->askReminderDays($userId, $chatId, $messageId, (string) ($parts[2] ?? '')),
+                'bonds' => $this->showBondsMenu($chatId, $messageId),
+                'bonds_pick' => $this->showBondsIssuerList($userId, $chatId, $messageId),
+                'bonds_iss' => $this->showIssuerBonds($userId, $chatId, $messageId, $id, (int) ($parts[3] ?? 0)),
+                'bond' => $this->toggleBond($userId, $chatId, $messageId, $id, (int) ($parts[3] ?? 0)),
+                'bonds_all' => $this->setAllBonds($userId, $chatId, $messageId, $id, (int) ($parts[3] ?? 0), ($parts[4] ?? '1') === '1'),
+                default => null,
+            };
+        } catch (PDOException $e) {
+            // Таблиц настроек нет (не применена миграция 032) или база недоступна: кнопка не должна ронять бота.
+            Logger::warn("Настройки уведомлений: {$data} — {$e->getMessage()}");
+
+            return 'Настройки сейчас недоступны — попробуй чуть позже.';
+        }
+    }
+
+    private function showRemindersMenu(int $chatId, int $messageId): ?string
+    {
+        $buttons = [
+            [['text' => 'Отключить напоминания ❌', 'callback_data' => 'set:off']],
+            [['text' => 'Включить напоминания ✅', 'callback_data' => 'set:on']],
+        ];
+        foreach (self::REMINDER_KINDS as $kind => [$label]) {
+            $buttons[] = [['text' => $label, 'callback_data' => 'set:int:' . $kind]];
+        }
+        $this->telegram->editMessageText($chatId, $messageId, 'Ты можешь отключить напоминания или задать свой интервал ⌛️', ['inline_keyboard' => $buttons]);
+
+        return null;
+    }
+
+    private function showRemindersOffMenu(int $chatId, int $messageId): ?string
+    {
+        $this->telegram->editMessageText(
+            $chatId,
+            $messageId,
+            'Ты можешь отключить напоминания для всего списка или выбрать конкретных эмитентов ❌',
+            ['inline_keyboard' => [
+                [['text' => 'Отключить для всего списка 📋', 'callback_data' => 'set:off_all']],
+                [['text' => 'Выбрать эмитентов ➕', 'callback_data' => 'set:off_pick']],
+            ]],
+        );
+
+        return null;
+    }
+
+    private function disableAllReminders(int $userId, int $chatId, int $messageId): ?string
+    {
+        $this->preferences->setRemindersEnabled($userId, false);
+        $this->telegram->editMessageText($chatId, $messageId, 'Напоминания отключены для всего списка ❌');
+
+        return 'Отключено';
+    }
+
+    /**
+     * «Отключить → Выбрать эмитентов»: весь список пользователя, 🔔 —
+     * напоминания по эмитенту приходят, 🔕 — отключены. Нажатие
+     * переключает, поэтому ошибочное нажатие исправляется тут же.
+     */
+    private function showMutePickList(int $userId, int $chatId, int $messageId): ?string
+    {
+        $issuers = $this->watchlistIssuers($userId);
+        if ($issuers === []) {
+            $this->telegram->editMessageText($chatId, $messageId, 'Ваш список эмитентов для отслеживания пуст 😢');
+
+            return null;
+        }
+        $muted = $this->preferences->mutedIssuerIds($userId);
+        $buttons = array_map(
+            static fn (array $issuer): array => [[
+                'text' => (in_array((int) $issuer['id'], $muted, true) ? '🔕 ' : '🔔 ') . $issuer['short_name'],
+                'callback_data' => 'set:mute:' . $issuer['id'],
+            ]],
+            $issuers,
+        );
+        $note = $this->preferences->get($userId)['reminders_enabled'] ? '' : "\n\nСейчас напоминания отключены для всего списка — включить их можно кнопкой «Включить напоминания ✅».";
+        $this->telegram->editMessageText($chatId, $messageId, "Нажми на эмитента, чтобы отключить напоминания по нему ❌\n🔔 — приходят, 🔕 — отключены." . $note,
+            ['inline_keyboard' => $buttons]);
+
+        return null;
+    }
+
+    private function toggleIssuerMute(int $userId, int $chatId, int $messageId, int $issuerId): ?string
+    {
+        if (!$this->isWatched($userId, $issuerId)) {
+            return 'Этой компании уже нет в твоём списке.';
+        }
+        $mute = !in_array($issuerId, $this->preferences->mutedIssuerIds($userId), true);
+        $this->preferences->setIssuerMuted($userId, $issuerId, $mute);
+        if (!$mute) {
+            $this->preferences->reviveSuppressedReminders($userId, date('Y-m-d'));
+        }
+        $this->showMutePickList($userId, $chatId, $messageId);
+
+        return $mute ? 'Напоминания отключены' : 'Напоминания включены';
+    }
+
+    private function showRemindersOnMenu(int $userId, int $chatId, int $messageId): ?string
+    {
+        if (!$this->preferences->hasAnythingDisabled($userId)) {
+            $this->telegram->editMessageText($chatId, $messageId, 'Напоминания включены ✅');
+
+            return null;
+        }
+        $this->telegram->editMessageText(
+            $chatId,
+            $messageId,
+            'Ты можешь включить напоминания для всего списка или выбрать конкретных эмитентов ✅',
+            ['inline_keyboard' => [
+                [['text' => 'Включить для всего списка 📋', 'callback_data' => 'set:on_all']],
+                [['text' => 'Выбрать эмитентов ➕', 'callback_data' => 'set:on_pick']],
+            ]],
+        );
+
+        return null;
+    }
+
+    private function enableAllReminders(int $userId, int $chatId, int $messageId): ?string
+    {
+        $this->preferences->enableAllReminders($userId);
+        $this->preferences->reviveSuppressedReminders($userId, date('Y-m-d'));
+        $this->telegram->editMessageText($chatId, $messageId, 'Напоминания включены ✅');
+
+        return 'Включено';
+    }
+
+    /**
+     * «Включить → Выбрать эмитентов»: только те эмитенты, по которым
+     * напоминания сейчас отключены. Если отключён весь список, это все
+     * эмитенты пользователя.
+     */
+    private function showUnmutePickList(int $userId, int $chatId, int $messageId): ?string
+    {
+        $allOff = !$this->preferences->get($userId)['reminders_enabled'];
+        $muted = $this->preferences->mutedIssuerIds($userId);
+        $issuers = array_values(array_filter(
+            $this->watchlistIssuers($userId),
+            static fn (array $issuer): bool => $allOff || in_array((int) $issuer['id'], $muted, true),
+        ));
+        if ($issuers === []) {
+            // Отключённых не осталось (или отключения были по эмитентам, которых уже нет в списке).
+            if ($allOff || $muted !== []) {
+                $this->preferences->enableAllReminders($userId);
+            }
+            $this->telegram->editMessageText($chatId, $messageId, 'Напоминания включены ✅');
+
+            return null;
+        }
+        $buttons = array_map(
+            static fn (array $issuer): array => [['text' => '🔕 ' . $issuer['short_name'], 'callback_data' => 'set:unmute:' . $issuer['id']]],
+            $issuers,
+        );
+        $this->telegram->editMessageText($chatId, $messageId, 'Нажми на эмитента, чтобы включить напоминания по нему ✅', ['inline_keyboard' => $buttons]);
+
+        return null;
+    }
+
+    private function unmuteIssuer(int $userId, int $chatId, int $messageId, int $issuerId): ?string
+    {
+        if (!$this->isWatched($userId, $issuerId)) {
+            return 'Этой компании уже нет в твоём списке.';
+        }
+        $watched = array_map(static fn (array $issuer): int => (int) $issuer['id'], $this->watchlistIssuers($userId));
+        $this->preferences->enableIssuer($userId, $issuerId, $watched);
+        $this->preferences->reviveSuppressedReminders($userId, date('Y-m-d'));
+        $this->showUnmutePickList($userId, $chatId, $messageId);
+
+        return 'Напоминания включены';
+    }
+
+    /** «Свой интервал для …»: дальше пользователь присылает число обычным сообщением — receiveReminderDays(). */
+    private function askReminderDays(int $userId, int $chatId, int $messageId, string $kind): ?string
+    {
+        if (!isset(self::REMINDER_KINDS[$kind])) {
+            return null;
+        }
+        $this->setDialogState($userId, 'awaiting_reminder_days', ['kind' => $kind]);
+        $this->telegram->editMessageText($chatId, $messageId, 'За какое количество календарных дней до выплаты ты бы хотел получать напоминания? ⏰');
+
+        return null;
+    }
+
+    /** Ответ на число дней. Не число или вне диапазона — просим ещё раз, состояние остаётся. */
+    private function receiveReminderDays(int $userId, string $kind, string $text): string
+    {
+        if (!isset(self::REMINDER_KINDS[$kind])) {
+            $this->clearDialogState($userId);
+
+            return "Не понимаю эту команду.\n\n" . $this->helpText();
+        }
+        $min = NotificationPreferences::MIN_DAYS;
+        $max = NotificationPreferences::MAX_DAYS;
+        if (preg_match('/^\d{1,3}$/', trim($text)) !== 1 || (int) $text < $min || (int) $text > $max) {
+            return "Нужно целое число от {$min} до {$max} — пришли его одним сообщением, например: 3";
+        }
+
+        $days = (int) $text;
+        try {
+            $this->preferences->setDays($userId, $kind, $days);
+            $this->preferences->reviveSuppressedReminders($userId, date('Y-m-d'));
+        } catch (PDOException $e) {
+            Logger::warn("Настройки уведомлений: интервал {$kind} — {$e->getMessage()}");
+
+            return 'Настройки сейчас недоступны — попробуй чуть позже.';
+        }
+        $this->clearDialogState($userId);
+        [, $about, $until] = self::REMINDER_KINDS[$kind];
+
+        return "Готово ✅ Напоминания {$about} теперь будут приходить за {$days} дн. {$until}.\n"
+            . 'Если этот день выпадет на выходной, напоминание придёт в последний рабочий день перед ним.';
+    }
+
+    private function showBondsMenu(int $chatId, int $messageId): ?string
+    {
+        $this->telegram->editMessageText(
+            $chatId,
+            $messageId,
+            'Ты можешь выбрать конкретные выпуски облигаций для получения уведомлений и напоминаний по выплатам ✅',
+            ['inline_keyboard' => [[['text' => 'Выбрать эмитента ➕', 'callback_data' => 'set:bonds_pick']]]],
+        );
+
+        return null;
+    }
+
+    private function showBondsIssuerList(int $userId, int $chatId, int $messageId): ?string
+    {
+        $issuers = $this->watchlistIssuers($userId);
+        if ($issuers === []) {
+            $this->telegram->editMessageText($chatId, $messageId, 'Ваш список эмитентов для отслеживания пуст 😢');
+
+            return null;
+        }
+        $buttons = array_map(
+            static fn (array $issuer): array => [['text' => $issuer['short_name'], 'callback_data' => 'set:bonds_iss:' . $issuer['id'] . ':0']],
+            $issuers,
+        );
+        $this->telegram->editMessageText($chatId, $messageId, 'Выбери эмитента:', ['inline_keyboard' => $buttons]);
+
+        return null;
+    }
+
+    /**
+     * Выпуски эмитента, которые сейчас в обращении.
+     *
+     * @return array<int, array{id: int, short_name: string, isin: string}>
+     */
+    private function issuerBonds(int $issuerId): array
+    {
+        $stmt = $this->db->prepare(
+            "SELECT id, short_name, isin FROM securities WHERE issuer_id = :issuer_id AND status IN ('active', 'tech_default', 'default') ORDER BY short_name, id"
+        );
+        $stmt->execute(['issuer_id' => $issuerId]);
+
+        return array_map(
+            static fn (array $row): array => ['id' => (int) $row['id'], 'short_name' => (string) $row['short_name'], 'isin' => (string) $row['isin']],
+            $stmt->fetchAll(),
+        );
+    }
+
+    /**
+     * Список выпусков эмитента с отметками — тот же приём ➕/✅, что и в
+     * листалке «Выбор компаний». ✅ — по выпуску приходят уведомления и
+     * напоминания, ➕ — отметка снята. По умолчанию отмечены все.
+     */
+    private function showIssuerBonds(int $userId, int $chatId, int $messageId, int $issuerId, int $page): ?string
+    {
+        if (!$this->isWatched($userId, $issuerId)) {
+            $this->telegram->editMessageText($chatId, $messageId, 'Эта компания больше не в вашем списке отслеживания.');
+
+            return null;
+        }
+        $bonds = $this->issuerBonds($issuerId);
+        $name = $this->issuerDisplayName($issuerId) ?? "эмитент #{$issuerId}";
+        if ($bonds === []) {
+            $this->telegram->editMessageText($chatId, $messageId, "{$name}: выпусков в обращении нет.");
+
+            return null;
+        }
+
+        $pages = (int) ceil(count($bonds) / self::BONDS_PAGE_SIZE);
+        $page = max(0, min($page, $pages - 1));
+        $excluded = $this->preferences->excludedSecurityIds($userId, $issuerId);
+
+        $buttons = [];
+        foreach (array_slice($bonds, $page * self::BONDS_PAGE_SIZE, self::BONDS_PAGE_SIZE) as $bond) {
+            $mark = in_array($bond['id'], $excluded, true) ? '➕ ' : '✅ ';
+            $buttons[] = [['text' => $mark . $bond['short_name'] . ' · ' . $bond['isin'], 'callback_data' => "set:bond:{$bond['id']}:{$page}"]];
+        }
+        $nav = [];
+        if ($page > 0) {
+            $nav[] = ['text' => '◀️ Назад', 'callback_data' => "set:bonds_iss:{$issuerId}:" . ($page - 1)];
+        }
+        if ($page < $pages - 1) {
+            $nav[] = ['text' => 'Вперёд ▶️', 'callback_data' => "set:bonds_iss:{$issuerId}:" . ($page + 1)];
+        }
+        if ($nav !== []) {
+            $buttons[] = $nav;
+        }
+        $buttons[] = [
+            ['text' => 'Отметить все ✅', 'callback_data' => "set:bonds_all:{$issuerId}:{$page}:1"],
+            ['text' => 'Снять все ➕', 'callback_data' => "set:bonds_all:{$issuerId}:{$page}:0"],
+        ];
+
+        $selected = count($bonds) - count($excluded);
+        $text = "{$name}: выпуски облигаций" . ($pages > 1 ? ' (стр. ' . ($page + 1) . " из {$pages})" : '') . ".\n"
+            . '✅ — по выпуску приходят уведомления и напоминания, ➕ — не приходят. Нажми на выпуск, чтобы изменить.' . "\n"
+            . "Отмечено: {$selected} из " . count($bonds) . '.';
+        $this->telegram->editMessageText($chatId, $messageId, $text, ['inline_keyboard' => $buttons]);
+
+        return null;
+    }
+
+    private function toggleBond(int $userId, int $chatId, int $messageId, int $securityId, int $page): ?string
+    {
+        $stmt = $this->db->prepare('SELECT issuer_id FROM securities WHERE id = :id');
+        $stmt->execute(['id' => $securityId]);
+        $issuerId = $stmt->fetchColumn();
+        if ($issuerId === false || !$this->isWatched($userId, (int) $issuerId)) {
+            return 'Этой компании уже нет в твоём списке.';
+        }
+        $exclude = !in_array($securityId, $this->preferences->excludedSecurityIds($userId, (int) $issuerId), true);
+        $this->preferences->setSecurityExcluded($userId, $securityId, $exclude);
+        if (!$exclude) {
+            $this->preferences->reviveSuppressedReminders($userId, date('Y-m-d'));
+        }
+        $this->showIssuerBonds($userId, $chatId, $messageId, (int) $issuerId, $page);
+
+        return $exclude ? 'Уведомления по выпуску отключены' : 'Уведомления по выпуску включены';
+    }
+
+    private function setAllBonds(int $userId, int $chatId, int $messageId, int $issuerId, int $page, bool $selected): ?string
+    {
+        if (!$this->isWatched($userId, $issuerId)) {
+            return 'Этой компании уже нет в твоём списке.';
+        }
+        $this->preferences->setAllSecuritiesExcluded($userId, array_column($this->issuerBonds($issuerId), 'id'), !$selected);
+        if ($selected) {
+            $this->preferences->reviveSuppressedReminders($userId, date('Y-m-d'));
+        }
+        $this->showIssuerBonds($userId, $chatId, $messageId, $issuerId, $page);
+
+        return $selected ? 'Отмечены все выпуски' : 'Отметки сняты со всех выпусков';
+    }
+
+    private function isWatched(int $userId, int $issuerId): bool
+    {
+        $stmt = $this->db->prepare('SELECT 1 FROM watchlist WHERE user_id = :user_id AND issuer_id = :issuer_id LIMIT 1');
+        $stmt->execute(['user_id' => $userId, 'issuer_id' => $issuerId]);
+
+        return $stmt->fetchColumn() !== false;
+    }
+
+    /** Эмитент убран из списка — его настройки (отключённые напоминания, снятые отметки с выпусков) тоже. */
+    private function forgetIssuerSettings(int $userId, int $issuerId): void
+    {
+        try {
+            if (!$this->isWatched($userId, $issuerId)) {
+                $this->preferences->forgetIssuer($userId, $issuerId);
+            }
+        } catch (PDOException $e) {
+            // Таблиц настроек может ещё не быть (миграция 032) — удаление из списка от этого не зависит.
+        }
     }
 
     // === Раздел "Помощь" — чат-релей, docs/BOT_UX_SPEC.md раздел 7 ===
@@ -1180,6 +1724,7 @@ final class BotCommandHandler
 
         return match ($dialog['state']) {
             'awaiting_issuer_search' => $this->handleIssuerSearchText($text),
+            'awaiting_reminder_days' => ['text' => $this->receiveReminderDays($userId, (string) ($dialog['context']['kind'] ?? ''), $text)],
             'awaiting_support_name' => ['text' => $this->receiveSupportName($userId, $text)],
             'awaiting_support_message' => ['text' => $this->receiveSupportMessage($userId, $telegramId, $username, $dialog['context'], $text)],
             'in_support_chat' => ['text' => $this->relayUserMessageToAdmin($userId, $telegramId, $username, $dialog['context'], $text)],
@@ -1283,20 +1828,26 @@ final class BotCommandHandler
         return ['state' => (string) $row['state'], 'context' => is_array($context) ? $context : []];
     }
 
-    /** @param array<string, mixed> $context */
+    /**
+     * Удалить и вставить, а не ON DUPLICATE KEY UPDATE: так запрос работает
+     * и в офлайн-тестах на SQLite (с 12.10.2026 — тест раздела «Настройки»
+     * проходит через состояние диалога).
+     *
+     * @param array<string, mixed> $context
+     */
     private function setDialogState(int $userId, string $state, array $context = []): void
     {
-        $this->db->prepare(
-            'INSERT INTO bot_dialog_state (user_id, state, context_json)
-             VALUES (:user_id, :state, :context_json)
-             ON DUPLICATE KEY UPDATE
-                state = VALUES(state),
-                context_json = VALUES(context_json)'
-        )->execute([
+        $this->clearDialogState($userId);
+        $this->db->prepare('INSERT INTO bot_dialog_state (user_id, state, context_json) VALUES (:user_id, :state, :context_json)')->execute([
             'user_id' => $userId,
             'state' => $state,
             'context_json' => json_encode($context, JSON_UNESCAPED_UNICODE),
         ]);
+    }
+
+    private function clearDialogState(int $userId): void
+    {
+        $this->db->prepare('DELETE FROM bot_dialog_state WHERE user_id = :user_id')->execute(['user_id' => $userId]);
     }
 
     private function handleWatch(int $userId, string $argument): string
@@ -1358,6 +1909,9 @@ final class BotCommandHandler
             'DELETE FROM watchlist WHERE user_id = :user_id AND issuer_id = :issuer_id AND security_id IS NULL'
         );
         $stmt->execute(['user_id' => $userId, 'issuer_id' => $issuerId]);
+        if ($stmt->rowCount() > 0) {
+            $this->forgetIssuerSettings($userId, $issuerId);
+        }
 
         return $stmt->rowCount() > 0
             ? "Убрано из списка отслеживания: «{$name}»."
@@ -1391,6 +1945,7 @@ final class BotCommandHandler
             . "/watch <название или ИНН> — добавить эмитента в список отслеживания\n"
             . "/unwatch <название или ИНН> — убрать эмитента из списка\n"
             . "/list — показать список отслеживания\n"
+            . "/menu — вернуть меню, если оно пропало\n"
             . "/help — это сообщение";
     }
 

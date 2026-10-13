@@ -76,24 +76,36 @@ final class PaymentWatch
      * ничего не делает. $createEvents = false — только показать список,
      * ничего не создавая.
      *
+     * $daysBefore — свой интервал пользователей (12.10.2026): за сколько
+     * календарных дней до даты напоминать; правило «не в выходной» то же.
+     * Для каждого интервала создаётся своё событие, получают его только
+     * те, у кого этот интервал задан (NotificationPreferences). Для своих
+     * интервалов $issuerIds ограничивает бумаги эмитентами, за которыми
+     * следят такие пользователи, — чтобы не создавать события впустую.
+     *
+     * @param ?array<int, int> $issuerIds null — все эмитенты
      * @return array{created: int, existing: int, items: array<int, array<string, mixed>>}
      */
-    public function remind(string $today, bool $createEvents = true): array
+    public function remind(string $today, bool $createEvents = true, int $daysBefore = 1, ?array $issuerIds = null): array
     {
         $result = ['created' => 0, 'existing' => 0, 'items' => []];
-        $dates = $this->calendar->scheduleDatesRemindedOn($today);
-        if ($dates === []) {
+        $dates = $this->calendar->scheduleDatesRemindedOn($today, $daysBefore);
+        if ($dates === [] || $issuerIds === []) {
             return $result;
         }
         $tomorrow = date('Y-m-d', (int) strtotime($today . ' +1 day'));
 
-        foreach ($this->plannedPayments($dates) as $group) {
+        foreach ($this->plannedPayments($dates, $issuerIds) as $group) {
             $paymentDate = (string) $group['payment_date'];
-            $result['items'][] = $group;
+            $exists = $this->eventExists('R1', (int) $group['security_id'], $paymentDate, $daysBefore);
+            // Для своего интервала дат в диапазоне много, и о большинстве уже напомнили: в список идут только новые.
+            if (!$exists || $daysBefore === 1) {
+                $result['items'][] = $group;
+            }
             if (!$createEvents) {
                 continue;
             }
-            if ($this->eventExists('R1', (int) $group['security_id'], $paymentDate)) {
+            if ($exists) {
                 $result['existing']++;
                 continue;
             }
@@ -106,9 +118,10 @@ final class PaymentWatch
                     . self::kindsText($group['payments']),
                 // reminder_date — день напоминания: по нему текст решает, уместно ли слово «завтра».
                 // security_status — только у бумаги с нарушением: текст добавит, что выплата под вопросом.
-                payload: $this->payload($group) + ['reminder_date' => $today]
+                payload: $this->payload($group) + ['reminder_date' => $today, 'days_before' => $daysBefore]
                     + (self::isTroubled($group) ? ['security_status' => $group['security_status']] : []),
                 amountPlanned: self::totalPlanned($group['payments']),
+                reminderDays: $daysBefore,
             );
             $result['created']++;
         }
@@ -242,15 +255,17 @@ final class PaymentWatch
      * @param array<int, string> $dates
      * @return array<int, array{security_id: int|string, issuer_id: int|string, isin: string, security_name: string, issuer_name: string, currency: ?string, security_status: string, payment_date: string, payments: array<int, array{kind: string, amount_planned: ?string}>}>
      */
-    private function plannedPayments(array $dates): array
+    private function plannedPayments(array $dates, ?array $issuerIds = null): array
     {
-        if ($dates === []) {
+        if ($dates === [] || $issuerIds === []) {
             return [];
         }
         $in = implode(',', array_fill(0, count($dates), '?'));
         $select = 'p.security_id, p.issuer_id, p.value_per_bond, s.isin, s.short_name AS security_name, s.currency, s.status AS security_status, i.short_name AS issuer_name';
         $joins = 'JOIN securities s ON s.id = p.security_id JOIN issuers i ON i.id = p.issuer_id';
-        $where = "p.status = 'planned' AND s.status IN ('active', 'tech_default')";
+        $where = "p.status = 'planned' AND s.status IN ('active', 'tech_default')"
+            // Числа приведены к целым — подставлять их в текст запроса безопасно.
+            . ($issuerIds !== null ? ' AND p.issuer_id IN (' . implode(',', array_map('intval', $issuerIds)) . ')' : '');
 
         $queries = [
             // Купоны.
@@ -309,10 +324,23 @@ final class PaymentWatch
         return in_array($group['security_status'] ?? null, [SecurityStatus::TECH_DEFAULT, SecurityStatus::DEFAULTED], true);
     }
 
-    private function eventExists(string $eventTypeCode, int $securityId, string $eventDate): bool
+    /**
+     * $reminderDays — только для напоминаний: у одной выплаты их может быть
+     * несколько, по одному на интервал. Напоминания, созданные до
+     * миграции 032, интервала не имеют — они создавались за день.
+     */
+    private function eventExists(string $eventTypeCode, int $securityId, string $eventDate, ?int $reminderDays = null): bool
     {
-        $stmt = $this->db->prepare('SELECT 1 FROM events WHERE event_type_code = :code AND security_id = :security_id AND event_date = :event_date LIMIT 1');
-        $stmt->execute(['code' => $eventTypeCode, 'security_id' => $securityId, 'event_date' => $eventDate]);
+        $sql = 'SELECT 1 FROM events WHERE event_type_code = :code AND security_id = :security_id AND event_date = :event_date';
+        $params = ['code' => $eventTypeCode, 'security_id' => $securityId, 'event_date' => $eventDate];
+        if ($reminderDays !== null) {
+            $sql .= $reminderDays === 1 ? ' AND (reminder_days = 1 OR reminder_days IS NULL)' : ' AND reminder_days = :days';
+            if ($reminderDays !== 1) {
+                $params['days'] = $reminderDays;
+            }
+        }
+        $stmt = $this->db->prepare($sql . ' LIMIT 1');
+        $stmt->execute($params);
 
         return $stmt->fetchColumn() !== false;
     }

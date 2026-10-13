@@ -22,7 +22,7 @@ use BondKeeper\Telegram\TelegramClientInterface;
 
 final class FakeTelegramClient implements TelegramClientInterface
 {
-    /** @var array<int, array{chat_id: int, text: string, parse_mode: ?string, disable_web_page_preview: bool}> */
+    /** @var array<int, array{chat_id: int, text: string, parse_mode: ?string, disable_web_page_preview: bool, markup: ?array}> */
     public array $sent = [];
     public bool $nextSendShouldFail = false;
     public bool $nextFailureIsBlock = false;
@@ -38,7 +38,7 @@ final class FakeTelegramClient implements TelegramClientInterface
 
             return false;
         }
-        $this->sent[] = ['chat_id' => $chatId, 'text' => $text, 'parse_mode' => $parseMode, 'disable_web_page_preview' => $disableWebPagePreview];
+        $this->sent[] = ['chat_id' => $chatId, 'text' => $text, 'parse_mode' => $parseMode, 'disable_web_page_preview' => $disableWebPagePreview, 'markup' => $replyMarkup];
 
         return true;
     }
@@ -390,6 +390,47 @@ $db->exec("INSERT INTO events (id, security_id, issuer_id, event_type_code, payl
 $telegram->sent = [];
 $dispatcher->dispatchPending();
 check('Выплаты: "&" в названии бумаги экранирован', str_contains($telegram->sent[0]['text'], 'Х &amp; Y Финанс-01'));
+
+// --- Клавиатура меню — к каждому десятому уведомлению (13 октября 2026) ---
+// Telegram Desktop находит клавиатуру бота, только если она есть в одном из последних 30 сообщений чата;
+// уведомления шли без неё, и значок меню на компьютере пропадал.
+echo "\n--- клавиатура меню в уведомлениях ---\n";
+$db->exec("INSERT INTO issuers (id, short_name, inn) VALUES (50, 'ООО «Меню»', '7700000050')");
+$db->exec('INSERT INTO users (id, telegram_id, telegram_bot_blocked) VALUES (50, 5050, 0), (51, 5151, 0)');
+$db->exec('INSERT INTO watchlist (user_id, issuer_id) VALUES (50, 50)');
+$addRatingEvents = static function (int $count) use ($db): void {
+    for ($i = 0; $i < $count; $i++) {
+        $db->exec("INSERT INTO events (issuer_id, event_type_code, status_text, payload_json) VALUES (50, 'C5', 'НКР подтвердило рейтинг', '{}')");
+    }
+};
+$withMenu = static fn (array $sent): array => array_keys(array_filter($sent, static fn (array $m): bool => $m['markup'] !== null));
+$addRatingEvents(23);
+$telegram->sent = [];
+$dispatcher->dispatchPending();
+check('из 23 уведомлений подряд клавиатура — у первого, одиннадцатого и двадцать первого', count($telegram->sent) === 23 && $withMenu($telegram->sent) === [0, 10, 20],
+    json_encode($withMenu($telegram->sent)));
+check('это клавиатура главного меню: пять кнопок, среди них «Настройки ⚙️»', ($telegram->sent[0]['markup']['resize_keyboard'] ?? false) === true
+    && array_merge(...array_map(static fn (array $row): array => array_column($row, 'text'), $telegram->sent[0]['markup']['keyboard']))
+        === ['Выбор компаний 📝', 'Подписка 🎁', 'Настройки ⚙️', 'О сервисе 🌐', 'Помощь 🛠']);
+
+// Счёт идёт по отправленным: у пользователя их 23, клавиатуру получит 31-е (после 30 отправленных).
+$addRatingEvents(1);
+$telegram->nextSendShouldFail = true;
+$telegram->sent = [];
+$dispatcher->dispatchPending();
+$addRatingEvents(8);
+$dispatcher->dispatchPending();
+check('неотправленное уведомление в счёт не идёт: следующие семь — без клавиатуры, восьмое (после 30 отправленных) — с ней',
+    count($telegram->sent) === 8 && $withMenu($telegram->sent) === [7], json_encode($withMenu($telegram->sent)));
+
+// Второй пользователь подписывается позже прежних событий (иначе получил бы и их: в тесте всё происходит в одну секунду).
+$db->exec("INSERT INTO watchlist (user_id, issuer_id, added_at) VALUES (51, 50, '2099-01-01 00:00:00')");
+$db->exec("INSERT INTO events (issuer_id, event_type_code, status_text, payload_json, detected_at) VALUES (50, 'C5', 'НКР подтвердило рейтинг', '{}', '2099-01-01 00:00:01')");
+$telegram->sent = [];
+$dispatcher->dispatchPending();
+$byChat = array_column($telegram->sent, 'markup', 'chat_id');
+check('счёт у каждого пользователя свой: новичок получает клавиатуру с первым уведомлением, у первого пользователя очередное — без неё',
+    count($telegram->sent) === 2 && $byChat[5151] !== null && $byChat[5050] === null);
 
 echo "\n";
 if ($failures === 0) {

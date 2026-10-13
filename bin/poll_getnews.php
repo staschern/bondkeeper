@@ -17,6 +17,10 @@ declare(strict_types=1);
  *   - --dry-run работает ВСЕГДА, даже если опрос выключен: ничего не
  *     пишет, показывает, как сообщения ложатся на наш график;
  *   - обычная запись в базу требует config/payments.php: 'getnews_polling' => true;
+ *   - Объявления НРД об офертах: строка в offers и — если включены
+ *     напоминания об офертах ('offer_reminders') — сразу напоминание R2
+ *     по этой бумаге (docs/OFFERS.md, раздел 5а). В тихом прогоне
+ *     напоминание не создаётся.
  *   - --quiet («тихий» прогон) пишет статусы и события, но клиентам не
  *     отправляет ничего; работает и при выключенном опросе. Нужен дважды:
  *     один раз заранее — проверить запись в боевую базу, и один раз в день
@@ -87,6 +91,7 @@ use BondKeeper\Iss\OffersImporter;
 use BondKeeper\Payments\GetNewsPager;
 use BondKeeper\Payments\OfferNotice;
 use BondKeeper\Payments\OfferNoticeProcessor;
+use BondKeeper\Payments\OfferWatch;
 use BondKeeper\Payments\PaymentProcessor;
 use BondKeeper\Payments\PaymentSchemaCheck;
 use BondKeeper\Payments\PaymentsConfig;
@@ -96,6 +101,7 @@ use BondKeeper\Payments\WorkingCalendar;
 use BondKeeper\Support\CronGuard;
 use BondKeeper\Support\Logger;
 use BondKeeper\Telegram\AdminNotifier;
+use BondKeeper\Telegram\NotificationPreferences;
 
 const OVERLAP_HOURS = 6;
 const STATE_FILE = __DIR__ . '/../var/getnews_poll_state.json';
@@ -275,9 +281,10 @@ $today = $now->format('Y-m-d');
  * Сообщения НРД об офертах → таблица offers. $apply = false — только показать.
  *
  * @param array<int, array{0: string, 1: OfferNotice}> $offerNotices
+ * @param array<string, true> $announcedIsins сюда попадают бумаги, по которым НРД объявил оферту (для напоминания сразу)
  * @return array<int, string> строки для администратора: что изменилось
  */
-$processOfferNotices = static function (PDO $db, array $offerNotices, string $today, bool $apply): array {
+$processOfferNotices = static function (PDO $db, array $offerNotices, string $today, bool $apply, array &$announcedIsins = []): array {
     if ($offerNotices === []) {
         return [];
     }
@@ -306,6 +313,9 @@ $processOfferNotices = static function (PDO $db, array $offerNotices, string $to
             $line = "{$result['security_name']} ({$notice->isin}): {$what}, дата " . date('d.m.Y', (int) strtotime($notice->date));
             $lines[] = '• ' . $line;
             Logger::info(($apply ? '' : '[просмотр] ') . "оферты: {$line} — {$result['note']}");
+            if ($notice->action !== OfferNotice::ACTION_CANCELLED) {
+                $announcedIsins[$notice->isin] = true;
+            }
         }
     }
     Logger::info(sprintf(
@@ -459,10 +469,36 @@ if ($earlyLines !== [] && !$quiet) {
     ));
 }
 
-$offerLines = $processOfferNotices($db, $offerNotices, $today, true);
+/** @var array<string, true> $announcedIsins */
+$announcedIsins = [];
+$offerLines = $processOfferNotices($db, $offerNotices, $today, true, $announcedIsins);
 if ($offerLines !== [] && !$quiet) {
     AdminNotifier::sendLines(array_merge(['📋 НРД об офертах (' . count($offerLines) . '):'], array_slice($offerLines, 0, 40),
         count($offerLines) > 40 ? ['… и ещё ' . (count($offerLines) - 40)] : []));
+}
+
+// Решение пользователя (12.10.2026): если дата оферты стала известна, когда до неё меньше 30 дней, напоминаем сразу,
+// как получили информацию, — не дожидаясь утреннего запуска payment_reminders.php. Только по бумагам из объявлений
+// этого прохода; в нерабочий день OfferWatch ничего не создаёт (как и утренний скрипт), в тихой загрузке — тоже.
+// Сбой здесь опрос не останавливает: напоминание создаст утренний запуск.
+if ($announcedIsins !== [] && !$quiet && $paymentsConfig->offerReminders) {
+    try {
+        $problem = PaymentSchemaCheck::missingEventTypes($db, ['R2']) !== [] ? PaymentSchemaCheck::describe(['R2']) : NotificationPreferences::schemaProblem($db);
+        if ($problem !== null) {
+            Logger::warn('Напоминание об оферте сразу после объявления НРД не создано. ' . $problem);
+        } else {
+            $offerWatch = new OfferWatch($db, new EventPublisher($db), WorkingCalendar::fromFile(__DIR__ . '/../config/working_calendar.php'),
+                $paymentsConfig->offerPutRemindersFrom);
+            $isins = array_map('strval', array_keys($announcedIsins));
+            $created = $offerWatch->remind($today, true, NotificationPreferences::DEFAULT_DAYS[NotificationPreferences::KIND_OFFER], null, $isins)['created'];
+            foreach ((new NotificationPreferences($db))->customIntervals()[NotificationPreferences::KIND_OFFER] ?? [] as $days => $issuerIds) {
+                $created += $offerWatch->remind($today, true, (int) $days, $issuerIds, $isins)['created'];
+            }
+            Logger::info('Напоминания об офертах сразу после объявления НРД (бумаг: ' . count($isins) . "): создано {$created}");
+        }
+    } catch (\Throwable $e) {
+        CronGuard::report('poll_getnews', 'Напоминание об оферте сразу после объявления НРД не создано — его создаст утренний запуск payment_reminders.php. ' . $e->getMessage());
+    }
 }
 
 if ($gapLines !== []) {

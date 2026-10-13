@@ -53,14 +53,38 @@ use PDOException;
  * security_id (отслеживается эмитент целиком — так бот добавляет сейчас)
  * получает все события эмитента, как и раньше; строка с security_id —
  * только события этой бумаги и события уровня эмитента (рейтинг, ФНС).
- * Это основа будущей настройки «уведомлять только по выбранным выпускам».
+ *
+ * === Настройки пользователя (12.10.2026, миграция 032) ===
+ *
+ * Перед отправкой спрашиваем NotificationPreferences: выпуск исключён,
+ * напоминания отключены (целиком или по эмитенту), у пользователя другой
+ * интервал напоминаний — уведомление не уходит и помечается failed с
+ * причиной. Отметка обязательна: без строки в notifications событие
+ * осталось бы «ещё не отправленным» и ушло бы задним числом, как только
+ * пользователь вернёт настройку. Напоминание (R1, R2) показывается
+ * каждому в своём виде: из выплат остаются только те виды, для которых
+ * его интервал совпал с интервалом события.
+ *
+ * Пока миграция 032 не применена, настроек нет — рассылка идёт как раньше.
  */
 final class NotificationDispatcher
 {
+    /**
+     * Как часто прикладывать к уведомлению клавиатуру меню: к каждому десятому. Telegram Desktop видит клавиатуру,
+     * только если она есть в одном из последних 30 сообщений чата, — десять оставляют запас на сообщения самого
+     * пользователя и ответы бота с кнопками под сообщением. См. menuKeyboardIfDue().
+     */
+    private const MENU_REFRESH_EVERY = 10;
+
+    private readonly NotificationPreferences $preferences;
+    /** Есть ли в базе таблицы настроек: проверяется, пока не станет «да». */
+    private bool $preferencesReady = false;
+
     public function __construct(
         private readonly PDO $db,
         private readonly TelegramClientInterface $telegram,
     ) {
+        $this->preferences = new NotificationPreferences($db);
     }
 
     /** @return int сколько уведомлений реально отправлено в этом проходе */
@@ -128,9 +152,29 @@ final class NotificationDispatcher
             return false;
         }
 
+        $payload = $this->decodePayload($event['payload_json']);
+        if ($this->preferencesReady()) {
+            $forPreferences = [
+                'event_type_code' => (string) $event['event_type_code'],
+                'issuer_id' => (int) $event['issuer_id'],
+                'security_id' => $event['security_id'] !== null ? (int) $event['security_id'] : null,
+                'reminder_days' => $event['reminder_days'] !== null ? (int) $event['reminder_days'] : null,
+                'payload' => $payload,
+            ];
+            $skip = $this->preferences->skipReason($userId, $forPreferences);
+            if ($skip !== null) {
+                $this->markFailed($notificationId, $skip);
+
+                return false;
+            }
+            if (in_array($event['event_type_code'], ['R1', 'R2'], true)) {
+                $payload = $this->preferences->reminderPayload($userId, $forPreferences) ?? $payload;
+            }
+        }
+
         $text = $this->buildMessageText(
             (string) $event['event_type_code'],
-            $this->decodePayload($event['payload_json']),
+            $payload,
             (string) $event['issuer_name'],
             (string) $event['issuer_inn'],
             (string) $event['status_text'],
@@ -140,7 +184,7 @@ final class NotificationDispatcher
         // ФНC:" жирным; disable_web_page_preview — ссылка на пресс-релиз в
         // тексте C5 иначе разворачивается превью-карточкой на пол-экрана
         // (по просьбе пользователя, 4 октября 2026).
-        if ($this->telegram->sendMessage($user['telegram_id'], $text, null, 'HTML', true)) {
+        if ($this->telegram->sendMessage($user['telegram_id'], $text, $this->menuKeyboardIfDue($userId), 'HTML', true)) {
             $this->markSent($notificationId);
 
             return true;
@@ -152,6 +196,23 @@ final class NotificationDispatcher
         $this->markFailed($notificationId, 'sendMessage failed');
 
         return false;
+    }
+
+    /**
+     * Клавиатура меню — к каждому MENU_REFRESH_EVERY-му уведомлению пользователя (к первому, одиннадцатому, …),
+     * к остальным — ничего. Telegram Desktop ищет клавиатуру бота среди последних 30 сообщений чата (см. докблок
+     * BotCommandHandler::mainMenuKeyboard()); уведомлений бывает по нескольку десятков в день, и без этого значок
+     * меню на компьютере пропадал. К каждому уведомлению клавиатуру не прикладываем: новое сообщение с
+     * клавиатурой снова раскрывает её у тех, кто её свернул.
+     *
+     * @return array<string, mixed>|null
+     */
+    private function menuKeyboardIfDue(int $userId): ?array
+    {
+        $stmt = $this->db->prepare("SELECT COUNT(*) FROM notifications WHERE user_id = :user_id AND channel = 'telegram' AND status = 'sent'");
+        $stmt->execute(['user_id' => $userId]);
+
+        return (int) $stmt->fetchColumn() % self::MENU_REFRESH_EVERY === 0 ? BotCommandHandler::mainMenuKeyboard() : null;
     }
 
     /** @return array{telegram_id: int, telegram_bot_blocked: bool}|null */
@@ -166,11 +227,36 @@ final class NotificationDispatcher
             : null;
     }
 
-    /** @return array{event_type_code: string, payload_json: ?string, issuer_name: string, issuer_inn: string, status_text: string}|null */
+    /**
+     * Применена ли миграция 032 (таблицы настроек и events.reminder_days).
+     * Бот — долгоживущий процесс: новые файлы могут оказаться на сервере
+     * раньше миграции, и тогда рассылка должна идти по-старому, а не
+     * падать. Отрицательный ответ не запоминается.
+     */
+    private function preferencesReady(): bool
+    {
+        if (!$this->preferencesReady) {
+            try {
+                $this->db->query('SELECT reminder_days FROM events LIMIT 1');
+                $this->db->query('SELECT 1 FROM user_notification_settings LIMIT 1');
+                $this->db->query('SELECT 1 FROM user_reminder_mutes LIMIT 1');
+                $this->db->query('SELECT 1 FROM user_excluded_securities LIMIT 1');
+                $this->preferencesReady = true;
+            } catch (PDOException $e) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /** @return array{event_type_code: string, payload_json: ?string, issuer_name: string, issuer_inn: string, status_text: string, issuer_id: int|string, security_id: int|string|null, reminder_days: int|string|null}|null */
     private function fetchEvent(int $eventId): ?array
     {
+        $ready = $this->preferencesReady();
         $stmt = $this->db->prepare(
-            'SELECT e.event_type_code, e.payload_json, e.status_text, i.short_name AS issuer_name, i.inn AS issuer_inn
+            'SELECT e.event_type_code, e.payload_json, e.status_text, e.issuer_id, e.security_id, '
+            . ($ready ? 'e.reminder_days' : 'NULL AS reminder_days') . ', i.short_name AS issuer_name, i.inn AS issuer_inn
              FROM events e
              JOIN issuers i ON i.id = e.issuer_id
              WHERE e.id = :id'
@@ -185,6 +271,9 @@ final class NotificationDispatcher
                 'issuer_name' => (string) $row['issuer_name'],
                 'issuer_inn' => (string) ($row['issuer_inn'] ?? ''),
                 'status_text' => (string) ($row['status_text'] ?? ''),
+                'issuer_id' => $row['issuer_id'],
+                'security_id' => $row['security_id'],
+                'reminder_days' => $row['reminder_days'],
             ]
             : null;
     }
@@ -237,6 +326,7 @@ final class NotificationDispatcher
             'C5' => $this->buildRatingActionText($payload, $statusText),
             'E1' => $this->buildFnsBlockText($payload, $issuerName, $issuerInn),
             'R1' => $this->buildPaymentReminderText($payload, $issuerName, $issuerInn),
+            'R2' => $this->buildOfferReminderText($payload, $issuerName, $issuerInn),
             'A2', 'A4', 'A6', 'B1', 'B1a', 'B2', 'B4', 'B5', 'C2' => $this->buildPaymentText($eventTypeCode, $payload, $issuerName, $issuerInn),
             'B2a' => $this->buildNoReceiptText($payload, $issuerName, $issuerInn),
             default => '<b>🔔 Новое событие:</b>' . "\n" . BotFormatting::escapeHtml("Эмитент «{$issuerName}»."),
@@ -281,6 +371,65 @@ final class NotificationDispatcher
         };
 
         return '<b>⏰ Выплаты:</b>' . "\n" . self::bondHeader($payload, $issuerName, $issuerInn) . "\n" . $body . $warning;
+    }
+
+    /**
+     * R2 — напоминание о предстоящей оферте (ТЗ пользователя от
+     * 12.10.2026): по умолчанию за 30 календарных дней, с указанием вида.
+     * Виды названы так, чтобы было понятно, чьё это право:
+     *   пут — владелец может предъявить облигации к выкупу;
+     *   колл по данным биржи — эмитент ВПРАВЕ погасить выпуск досрочно;
+     *   колл, объявленный НРД, — эмитент уже ОБЪЯВИЛ о погашении.
+     * Если известны период предъявления и цена — они в тексте: для
+     * владельца срок подачи заявки важнее самой даты оферты.
+     *
+     * @param array<string, mixed> $payload
+     */
+    private function buildOfferReminderText(array $payload, string $issuerName, string $issuerInn): string
+    {
+        $offerDate = (string) ($payload['offer_date'] ?? '');
+        $reminderDate = (string) ($payload['reminder_date'] ?? '');
+        $left = $offerDate !== '' && $reminderDate !== ''
+            ? ', осталось ' . max(0, (int) round((strtotime($offerDate) - strtotime($reminderDate)) / 86400)) . ' дн'
+            : '';
+        $date = BotFormatting::formatDate($offerDate);
+
+        $lines = [];
+        foreach ((array) ($payload['offers'] ?? []) as $offer) {
+            $percent = ($offer['price_percent'] ?? null) !== null ? self::percent((string) $offer['price_percent']) . ' % номинала' : null;
+            $start = $offer['period_start'] ?? null;
+            $end = $offer['period_end'] ?? null;
+            $period = match (true) {
+                $start !== null && $end !== null => ' Период предъявления: ' . BotFormatting::formatDate((string) $start) . ' – ' . BotFormatting::formatDate((string) $end) . '.',
+                $end !== null => ' Предъявить можно до ' . BotFormatting::formatDate((string) $end) . '.',
+                default => '',
+            };
+            $lines[] = match (true) {
+                ($offer['type'] ?? '') === 'put' => "{$date} — оферта (пут){$left}. Владельцы могут предъявить облигации к выкупу эмитентом." . $period
+                    . ($percent !== null ? " Цена выкупа: {$percent}." : ''),
+                ($offer['type'] ?? '') === 'call' && ($offer['announced'] ?? false) === true => "{$date} — досрочное погашение по решению эмитента (колл){$left}."
+                    . ' Эмитент объявил о погашении выпуска' . ($percent !== null ? ": {$percent}" : '') . '.',
+                ($offer['type'] ?? '') === 'call' => "{$date} — колл-опцион{$left}. Эмитент вправе досрочно погасить выпуск в эту дату"
+                    . ($percent !== null ? " по цене {$percent}" : '') . '.',
+                default => "{$date} — оферта{$left}." . $period,
+            };
+        }
+        if ($lines === []) {
+            $lines[] = "{$date} — оферта{$left}.";
+        }
+        $warning = match ((string) ($payload['security_status'] ?? '')) {
+            'tech_default' => "\n" . '⚠️ Бумага в техническом дефолте — исполнение оферты под вопросом.',
+            'default' => "\n" . '⚠️ Бумага в дефолте — исполнение оферты под вопросом.',
+            default => '',
+        };
+
+        return '<b>⏰ Оферты:</b>' . "\n" . self::bondHeader($payload, $issuerName, $issuerInn) . "\n" . implode("\n", $lines) . $warning;
+    }
+
+    /** Проценты без лишних нулей: 100.000 → 100, 99.500 → 99.5, 9.877 → 9.877. */
+    private static function percent(string $value): string
+    {
+        return rtrim(rtrim(number_format((float) $value, 3, '.', ''), '0'), '.');
     }
 
     /**
@@ -492,13 +641,22 @@ final class NotificationDispatcher
                 BotFormatting::formatMoney($payload['new_blocked_amount'] ?? null),
                 (int) ($payload['active_bank_count'] ?? 0)
             ),
-            'count_changed' => sprintf(
-                '%s | ИНН %s: количество заблокированных счетов ФНС изменилось — было %d, стало %d.',
-                $name,
-                $inn,
-                (int) ($payload['old_active_bank_count'] ?? 0),
-                (int) ($payload['active_bank_count'] ?? 0)
-            ),
+            // У событий, созданных до 13.10.2026, прежнего числа счетов в данных нет: тогда пишем только «стало»,
+            // а не «было 0».
+            'count_changed' => isset($payload['old_active_bank_count'])
+                ? sprintf(
+                    '%s | ИНН %s: количество заблокированных счетов ФНС изменилось — было %d, стало %d.',
+                    $name,
+                    $inn,
+                    (int) $payload['old_active_bank_count'],
+                    (int) ($payload['active_bank_count'] ?? 0)
+                )
+                : sprintf(
+                    '%s | ИНН %s: количество заблокированных счетов ФНС изменилось — стало %d.',
+                    $name,
+                    $inn,
+                    (int) ($payload['active_bank_count'] ?? 0)
+                ),
             'lifted' => sprintf(
                 '%s | ИНН %s: блокировка счетов ФНС снята (по состоянию на %s).',
                 $name,

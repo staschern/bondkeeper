@@ -22,9 +22,12 @@ declare(strict_types=1);
  *   php bin/sync_payment_statuses.php --dry-run          # показать, сколько строк изменится, ничего не меняя
  *   php bin/sync_payment_statuses.php --date=2026-10-12  # считать «сегодня» этой датой
  *
- * По расписанию — раз в сутки, после сверки статусов бумаг (ей нужен
- * свежий статус «погашена досрочно»):
- *   55 2 * * * /usr/bin/php /path/to/bondkeeper/bin/sync_payment_statuses.php >> /path/to/bondkeeper/var/log/sync_payment_statuses.log 2>&1
+ * По расписанию — раз в сутки, после сверки статусов бумаг (нужен свежий
+ * статус «погашена досрочно») и после ночной загрузки графика
+ * (seed_bondization.php, 03:30): иначе прошедшие выплаты бумаги, чей
+ * график загрузился этой ночью впервые, остаются planned ещё на сутки
+ * (до 13.10.2026 здесь стояло 02:55, и на бою так и вышло):
+ *   30 4 * * * /usr/bin/php /path/to/bondkeeper/bin/sync_payment_statuses.php >> /path/to/bondkeeper/var/log/sync_payment_statuses.log 2>&1
  *
  * Первый запуск меняет много строк: все прошедшие выплаты за все годы,
  * кроме уже подтверждённых НРД, получают unconfirmed. Дальше — десятки

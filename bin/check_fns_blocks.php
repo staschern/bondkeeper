@@ -67,7 +67,12 @@ use BondKeeper\Database;
 use BondKeeper\Events\EventPublisher;
 use BondKeeper\Fns\FnsBlocksImporter;
 use BondKeeper\Fns\NalogBiClient;
+use BondKeeper\Payments\WorkingCalendar;
+use BondKeeper\Support\CronGuard;
 use BondKeeper\Support\Logger;
+
+// Если скрипт упал (нет миграции, недоступна база) — сообщение разработчику в Telegram, как у скриптов выплат.
+CronGuard::install('check_fns_blocks');
 
 $inns = null;
 $fromWatchlist = false;
@@ -155,7 +160,15 @@ $issuers = $stmt->fetchAll();
 Logger::info('Старт: проверка блокировок счетов ФНС для ' . count($issuers) . ' эмитентов'
     . " (пауза между проверками: {$delaySeconds} с)");
 
-$importer = new FnsBlocksImporter(new NalogBiClient(), $db, new EventPublisher($db), $delaySeconds);
+// Календарь рабочих дней нужен для подтверждения снятия блокировки и изменения числа счетов:
+// они объявляются, только если картина держится до следующего рабочего дня (см. докблок FnsBlocksImporter).
+$importer = new FnsBlocksImporter(
+    new NalogBiClient(),
+    $db,
+    new EventPublisher($db),
+    $delaySeconds,
+    WorkingCalendar::fromFile(__DIR__ . '/../config/working_calendar.php'),
+);
 $importer->checkIssuers($issuers, $maxRetries, $retryDelaySeconds);
 
 Logger::info('Готово.');

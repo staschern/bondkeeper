@@ -24,6 +24,7 @@ final class PaymentSchemaCheck
         'R1' => 'database/027_payment_events.sql',
         'B2b' => 'database/027_payment_events.sql',
         'B1a' => 'database/028_payment_events_partial_before_due.sql',
+        'R2' => 'database/032_notification_settings.sql',
     ];
 
     /**

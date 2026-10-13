@@ -165,19 +165,33 @@ final class WorkingCalendar
      * 11.10.2026: в выходной клиент бумагу уже не продаст). Для нерабочего
      * дня — пусто.
      *
+     * $daysBefore — за сколько календарных дней до даты напоминать (свой
+     * интервал пользователя, 12.10.2026). Правило то же: если день
+     * «дата минус N» нерабочий, напоминание уходит в последний рабочий
+     * день перед ним. Поэтому в $workingDay напоминают о датах от «завтра»
+     * до «последний день перед следующим рабочим плюс N»: начало диапазона
+     * — «завтра», а не «сегодня плюс N», чтобы выплата, до которой уже
+     * осталось меньше N дней (пользователь только что задал интервал,
+     * оферта появилась поздно), не осталась без напоминания. При N = 1
+     * получается прежнее правило.
+     *
      * @return array<int, string>
      */
-    public function scheduleDatesRemindedOn(string $workingDay): array
+    public function scheduleDatesRemindedOn(string $workingDay, int $daysBefore = 1): array
     {
-        if (!$this->isWorkingDay($workingDay)) {
+        if (!$this->isWorkingDay($workingDay) || $daysBefore < 1) {
             return [];
         }
+        // Последний день, «за который отвечает» этот рабочий день: канун следующего рабочего.
+        $lastOwned = self::parse($this->nextWorkingDay($workingDay))->modify('-1 day');
+        $last = $lastOwned->modify("+{$daysBefore} days")->format('Y-m-d');
+
         $dates = [];
         $day = self::parse($workingDay);
         do {
             $day = $day->modify('+1 day');
             $dates[] = $day->format('Y-m-d');
-        } while (!$this->isWorkingDay($day->format('Y-m-d')));
+        } while ($day->format('Y-m-d') < $last);
 
         return $dates;
     }
