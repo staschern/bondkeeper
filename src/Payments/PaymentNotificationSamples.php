@@ -89,6 +89,9 @@ final class PaymentNotificationSamples
             ['code' => 'A2', 'title' => 'вторая выплата НРД по тому же купону (структурные выпуски)', 'payload' => $payment('coupon', [
                 'amount_planned' => '65.2100', 'amount_actual' => '65.3100', 'tranche_amount' => '65.2100', 'received_date' => '2026-10-14', 'extra' => true,
             ])],
+            ['code' => 'A2', 'title' => 'купон поступил в НРД заранее — напоминания накануне по нему не будет', 'payload' => $payment('coupon', [
+                'amount_planned' => '12.3300', 'amount_actual' => '12.3300', 'tranche_amount' => '12.3300', 'received_date' => '2026-10-09', 'message_date' => '2026-10-12',
+            ])],
 
             ['code' => 'B1a', 'title' => 'часть суммы пришла раньше срока', 'payload' => $payment('coupon', [
                 'amount_planned' => '4.6800', 'amount_actual' => '2.8400', 'tranche_amount' => '2.8400', 'received_date' => '2026-10-14',

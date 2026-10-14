@@ -102,11 +102,11 @@ final class PaymentWatch
             if (!$exists || $daysBefore === 1) {
                 $result['items'][] = $group;
             }
-            if (!$createEvents) {
-                continue;
-            }
+            // Считаем и в просмотре: до 13.10.2026 просмотр всегда печатал «уже были созданы раньше: 0».
             if ($exists) {
                 $result['existing']++;
+            }
+            if (!$createEvents || $exists) {
                 continue;
             }
             $this->publisher->publishPaymentEvent(

@@ -10,8 +10,16 @@ namespace BondKeeper\Fns;
  *   1. Есть активные блокировки: ключ 'rows' — массив решений.
  *   2. Блокировок нет: ключа 'rows' в ответе вообще НЕТ (не пустой массив).
  *   3. Нужна капча: ключа 'rows' тоже нет, но 'captchaRequired' = true.
- * Формы 2 и 3 неразличимы по одному только отсутствию 'rows' — поэтому
- * $captchaRequired проверяется отдельно и в первую очередь.
+ *
+ * Уточнение по бою (14.10.2026): признак 'captchaRequired' сервис ставит и в
+ * обычный ответ «блокировок нет». После того как 13.10 ответ «капча и ни
+ * одной строки» стали считать неудачной попыткой, все 58 отслеживаемых
+ * эмитентов без блокировок перестали проходить проверку, а все 6 с
+ * блокировками проходили, — значит, формы 2 и 3 по признаку капчи не
+ * различить. Настоящий отказ — HTTP 400 «Требуется ввести цифры с
+ * картинки»: NalogBiClient помечает его ключом 'refused' => true, это
+ * $refused. Признак капчи без отказа ($captchaRequired) теперь только
+ * пишется в журнал и в отчёт прогона.
  */
 final class NalogBiResult
 {
@@ -19,6 +27,7 @@ final class NalogBiResult
     private function __construct(
         public readonly bool $captchaRequired,
         public readonly array $rows,
+        public readonly bool $refused = false,
     ) {
     }
 
@@ -27,7 +36,8 @@ final class NalogBiResult
     {
         $captchaRequired = ($json['captchaRequired'] ?? false) === true;
         $rows = isset($json['rows']) && is_array($json['rows']) ? $json['rows'] : [];
+        $refused = ($json['refused'] ?? false) === true;
 
-        return new self($captchaRequired, $rows);
+        return new self($captchaRequired, $rows, $refused);
     }
 }

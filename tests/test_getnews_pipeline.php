@@ -83,7 +83,8 @@ $db->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
 $db->sqliteCreateFunction('NOW', static fn (): string => date('Y-m-d H:i:s'), 0);
 
 $db->exec('CREATE TABLE issuers (id INTEGER PRIMARY KEY, short_name TEXT, inn TEXT)');
-$db->exec("CREATE TABLE securities (id INTEGER PRIMARY KEY AUTOINCREMENT, isin TEXT, issuer_id INTEGER, short_name TEXT, currency TEXT DEFAULT 'RUB', is_structured INTEGER DEFAULT 0, status TEXT DEFAULT 'active', maturity_date TEXT, status_reason TEXT, status_changed_at TEXT, ended_at TEXT, missing_since TEXT, has_offer INTEGER DEFAULT 0)");
+$db->exec("CREATE TABLE securities (id INTEGER PRIMARY KEY AUTOINCREMENT, isin TEXT, issuer_id INTEGER, short_name TEXT, currency TEXT DEFAULT 'RUB', is_structured INTEGER DEFAULT 0, status TEXT DEFAULT 'active', maturity_date TEXT, status_reason TEXT, status_changed_at TEXT, ended_at TEXT, missing_since TEXT, has_offer INTEGER DEFAULT 0,
+    nominal_value TEXT, initial_nominal_value TEXT)");
 $db->exec('CREATE TABLE offers (id INTEGER PRIMARY KEY AUTOINCREMENT, security_id INTEGER, execution_date_planned TEXT, offer_type TEXT)');
 $schedule = "id INTEGER PRIMARY KEY AUTOINCREMENT, security_id INTEGER, issuer_id INTEGER, %s TEXT, value_per_bond TEXT, actual_value_per_bond TEXT, full_default_date_planned TEXT, status TEXT DEFAULT 'planned'";
 $db->exec('CREATE TABLE coupons (' . sprintf($schedule, 'period_end_date') . ')');
@@ -359,7 +360,8 @@ $find = static function (string ...$needles) use ($telegram): string {
 
     return '';
 };
-check('обычный купон', true, str_contains($find('РЖД 1Р-13R', 'получен НРД'), "<b>✅ Выплаты:</b>\nЭмитент | ИНН 7700000001 · РЖД 1Р-13R (RU000A100W45)\nКупон за 30.09.26 получен НРД: 105.20 ₽ на бумагу."));
+check('обычный купон; сообщение НРД вышло раньше даты выплаты — текст прямо называет выплату', true, str_contains($find('РЖД 1Р-13R', 'поступил в НРД'),
+    "<b>✅ Выплаты:</b>\nЭмитент | ИНН 7700000001 · РЖД 1Р-13R (RU000A100W45)\nКупон с датой выплаты 30.09.26 поступил в НРД заранее: 105.20 ₽ на бумагу."));
 check('поздняя полная выплата: срок и день поступления', true, str_contains($find('ЭМ ЗАПАД'), 'Купон за 29.09.26 выплачен полностью после просрочки: 12.74 ₽ на бумагу. Срок был 29.09.26, деньги поступили 30.09.26.'));
 check('часть погашения: сумма, отметка НРД дословно, срок полного дефолта', true, str_contains($find('СамолетP20', 'частично'),
     "<b>🔴 Выплаты:</b>\nЭмитент | ИНН 7700000001 · СамолетP20 (RU000A10CZA1)\nПогашение 28.09.26 выплачено частично: получено 269.10 ₽ из 1 000.00 ₽ на бумагу. Отметка НРД: «исполнена ненадлежащим образом». Полный дефолт наступит, если долг не будет закрыт до 12.10.26 (осталось рабочих дней: 9)."));
@@ -373,7 +375,7 @@ check('вторая выплата по тому же купону', true, str_c
 check('валютный выпуск: получено в рублях', true, str_contains($find('Акрон Б1P9', 'получен НРД'), 'Купон за 29.09.26 получен НРД: 537.25 ₽ на бумагу.'));
 check('напоминание по валютному выпуску: сумма в валюте номинала, не со знаком рубля', true, str_contains($find('Акрон Б1P9', 'Завтра'), 'Завтра, 23.10.26, выплата: купон — 6.37 USD на бумагу.'));
 check('напоминание в день погашения', true, str_contains($find('ВЭБ2Р-К749', 'Завтра'), 'Завтра, 23.10.26, выплата: купон — 5.27 ₽ на бумагу; погашение — 1 000.00 ₽ на бумагу.'));
-check('структурный выпуск: купон из сообщения НРД', true, str_contains($find('СбКИБ1P999', 'получен НРД'), 'Купон за 02.10.26 получен НРД: 65.21 ₽ на бумагу.'));
+check('структурный выпуск: купон из сообщения НРД', true, str_contains($find('СбКИБ1P999', 'поступил в НРД'), 'Купон с датой выплаты 02.10.26 поступил в НРД заранее: 65.21 ₽ на бумагу.'));
 check('«передано депонентам» клиенту не уходит', '', $find('передано'));
 check('тихая загрузка: по «Тихому эмитенту» клиенту ничего не ушло', '', $find('Тихий БО-01'));
 

@@ -59,6 +59,9 @@ use PDO;
  *   объявление «дефолт»                     → C2, один раз на выплату;
  *   структурный выпуск без графика купонов на бирже → купон создаётся по
  *       сообщению НРД о деньгах (см. canBuildFromMessage());
+ *   выпуск с индексируемым номиналом (золото, серебро, инфляция), амортизации
+ *       нет в графике → строка амортизации создаётся по сообщению НРД о
+ *       деньгах (решение пользователя 14.10.2026, см. hasIndexedNominal());
  *   «передано депонентам» по уже учтённым деньгам → A3 / A5 / A7 (клиенту
  *       не рассылается); если получение мы не видели — засчитывается как
  *       получение;
@@ -174,6 +177,7 @@ final class PaymentProcessor
         $kind = $early ? PaymentMessage::KIND_REDEMPTION : $message->kind;
         $payment = $early ? $this->findEarlyRedemption((int) $security['id']) : $this->findPayment($message, (int) $security['id']);
         $buildFromMessage = false;
+        $buildAmortization = false;
         if ($payment === null && !$early) {
             // Выплаты в графике нет, но само погашение — факт: статус бумаги меняется, даже если сообщение не к чему привязать.
             $this->markRedeemed($message, $kind, $security, $message->execution === PaymentMessage::EXECUTION_FULL);
@@ -185,6 +189,8 @@ final class PaymentProcessor
                     return ['result' => self::RESULT_SKIPPED, 'events' => [], 'note' => $reason];
                 }
                 $buildFromMessage = true;
+            } elseif (self::hasIndexedNominal($security) && self::canBuildAmortizationFromMessage($message)) {
+                $buildAmortization = true;
             } else {
                 $reason = 'выплата (' . PaymentMessage::kindLabel($message->kind) . " на {$message->paymentDate}) не найдена в графике бумаги {$message->isin}";
                 $this->markRaw($rawId, 'failed', $reason);
@@ -197,6 +203,8 @@ final class PaymentProcessor
         try {
             if ($buildFromMessage) {
                 $payment = $this->createCouponFromMessage($message, $security);
+            } elseif ($buildAmortization) {
+                $payment = $this->createAmortizationFromMessage($message, $security);
             } elseif ($payment === null) {
                 $payment = $this->createEarlyRedemption($message, $security);
             }
@@ -318,25 +326,28 @@ final class PaymentProcessor
     /**
      * Куда ляжет сообщение, без записи в базу — для просмотра (--dry-run).
      *
-     * @return array{security: ?array<string, mixed>, payment: ?array<string, mixed>, structured: ?string, early: bool}
+     * @return array{security: ?array<string, mixed>, payment: ?array<string, mixed>, structured: ?string, early: bool, indexed: bool}
      *         payment: строка графика с ключами table (в какой таблице) и match (exact | shifted);
      *         structured (только когда выплаты в графике нет, а выпуск структурный):
      *         build — купон будет создан по сообщению, skip — сообщение будет пропущено;
-     *         early — это досрочное погашение выпуска: строка погашения будет создана по сообщению
+     *         early — это досрочное погашение выпуска: строка погашения будет создана по сообщению;
+     *         indexed — номинал индексируется, амортизации в графике нет: строка будет создана по сообщению
      */
     public function locate(PaymentMessage $message): array
     {
         $security = $this->findSecurity($message->isin);
         if ($security !== null && self::isEarlyRedemption($message, $security)) {
-            return ['security' => $security, 'payment' => $this->findEarlyRedemption((int) $security['id']), 'structured' => null, 'early' => true];
+            return ['security' => $security, 'payment' => $this->findEarlyRedemption((int) $security['id']), 'structured' => null, 'early' => true, 'indexed' => false];
         }
         $payment = $security !== null ? $this->findPayment($message, (int) $security['id']) : null;
         $structured = null;
         if ($security !== null && $payment === null && (int) ($security['is_structured'] ?? 0) === 1) {
             $structured = self::canBuildFromMessage($message) ? 'build' : 'skip';
         }
+        $indexed = $security !== null && $payment === null && $structured === null
+            && self::hasIndexedNominal($security) && self::canBuildAmortizationFromMessage($message);
 
-        return ['security' => $security, 'payment' => $payment, 'structured' => $structured, 'early' => false];
+        return ['security' => $security, 'payment' => $payment, 'structured' => $structured, 'early' => false, 'indexed' => $indexed];
     }
 
     /**
@@ -376,6 +387,62 @@ final class PaymentProcessor
         $payment = $this->findRow(PaymentMessage::KIND_COUPON, (int) $security['id'], $message->paymentDate);
         if ($payment === null) {
             throw new \RuntimeException("Не удалось создать купон по сообщению НРД для {$message->isin} на {$message->paymentDate}");
+        }
+
+        return $payment;
+    }
+
+    /**
+     * Номинал выпуска привязан к цене золота, серебра или к инфляции: текущий
+     * номинал выше первоначального (на 14.10.2026 таких в обращении 18 —
+     * SELGOLD001–003, SELSILV01, PolyusZL1, МГКЛ-G01, ОФЗ-ИН, НКК, ВСМИ и др.).
+     * Сумма амортизации у них заранее неизвестна, и биржа даёт в графике
+     * только итоговую выплату в конце срока: 08.10.2026 НРД прислал по
+     * SELGOLD002 амортизацию 1114,33 руб., которой в графике не было. Решение
+     * пользователя (14.10.2026): такую амортизацию создавать по сообщению НРД,
+     * как купон структурного выпуска, — клиент получит «амортизация получена»
+     * (без напоминания накануне: дату и сумму заранее мы не знаем).
+     *
+     * Если после амортизаций номинал опустится ниже первоначального, признак
+     * перестанет срабатывать — сообщение снова уйдёт администратору как
+     * «выплаты нет в графике», как до этого решения.
+     *
+     * @param array<string, mixed> $security
+     */
+    private static function hasIndexedNominal(array $security): bool
+    {
+        $current = $security['nominal_value'] ?? null;
+        $initial = $security['initial_nominal_value'] ?? null;
+
+        return $current !== null && $initial !== null && (float) $current > (float) $initial + self::EPSILON;
+    }
+
+    private static function canBuildAmortizationFromMessage(PaymentMessage $message): bool
+    {
+        return $message->kind === PaymentMessage::KIND_AMORTIZATION
+            && in_array($message->execution, [PaymentMessage::EXECUTION_FULL, PaymentMessage::EXECUTION_PARTIAL], true)
+            && $message->amountPerBond !== null;
+    }
+
+    /**
+     * Строка амортизации по сообщению НРД: дата — из сообщения, сумма —
+     * плановая по данным НРД (если её нет — сумма перевода).
+     *
+     * @param array{id: int|string, issuer_id: int|string} $security
+     * @return array<string, mixed> строка графика в том же виде, что из findPayment()
+     */
+    private function createAmortizationFromMessage(PaymentMessage $message, array $security): array
+    {
+        $this->db->prepare('INSERT INTO amortizations (security_id, issuer_id, payment_date_planned, value_per_bond) VALUES (:security_id, :issuer_id, :payment_date, :value)')
+            ->execute([
+                'security_id' => (int) $security['id'],
+                'issuer_id' => (int) $security['issuer_id'],
+                'payment_date' => $message->paymentDate,
+                'value' => self::money((float) ($message->plannedPerBond ?? $message->amountPerBond)),
+            ]);
+        $payment = $this->findRow(PaymentMessage::KIND_AMORTIZATION, (int) $security['id'], $message->paymentDate);
+        if ($payment === null) {
+            throw new \RuntimeException("Не удалось создать амортизацию по сообщению НРД для {$message->isin} на {$message->paymentDate}");
         }
 
         return $payment;
@@ -641,7 +708,9 @@ final class PaymentProcessor
     /** @return array{id: int|string, issuer_id: int|string, short_name: string, isin: string, is_structured: int|string|null}|null */
     private function findSecurity(string $isin): ?array
     {
-        $stmt = $this->db->prepare('SELECT id, issuer_id, short_name, isin, is_structured, maturity_date FROM securities WHERE isin = :isin');
+        $stmt = $this->db->prepare(
+            'SELECT id, issuer_id, short_name, isin, is_structured, maturity_date, nominal_value, initial_nominal_value FROM securities WHERE isin = :isin'
+        );
         $stmt->execute(['isin' => $isin]);
         $row = $stmt->fetch();
 

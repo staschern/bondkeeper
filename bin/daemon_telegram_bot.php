@@ -77,7 +77,7 @@ foreach ($argv as $arg) {
 $config = TelegramBotConfig::fromFile($configFile);
 $telegram = new TelegramClient($config->botToken);
 $db = Database::connection();
-$handler = new BotCommandHandler($db, $telegram, new IssuerMatcher($db), $config->adminTelegramId);
+$handler = new BotCommandHandler($db, $telegram, new IssuerMatcher($db), $config->adminTelegramId, botUsername: $config->botUsername);
 $dispatcher = new NotificationDispatcher($db, $telegram);
 
 /**
@@ -95,7 +95,7 @@ function reconnectDependents(TelegramClient $telegram, TelegramBotConfig $config
 
     return [
         $db,
-        new BotCommandHandler($db, $telegram, new IssuerMatcher($db), $config->adminTelegramId),
+        new BotCommandHandler($db, $telegram, new IssuerMatcher($db), $config->adminTelegramId, botUsername: $config->botUsername),
         new NotificationDispatcher($db, $telegram),
     ];
 }
@@ -105,8 +105,23 @@ Logger::info('Telegram-бот запущен, PID=' . getmypid() . ' (long polli
 $offset = 0;
 $lastDispatchAt = 0; // 0 — первый же проход цикла сразу выполнит рассылку (безопаснее, чем ждать минуту после рестарта)
 while (true) {
+    // Отложенные сообщения (предложение ввести промокод через 10 секунд после «Старта»): не ждём новых
+    // сообщений от Telegram дольше, чем осталось до ближайшего из них.
+    $pollTimeout = LONG_POLL_TIMEOUT_SECONDS;
     try {
-        $updates = $telegram->getUpdates($offset, LONG_POLL_TIMEOUT_SECONDS);
+        $untilDelayed = $handler->secondsUntilNextDelayedMessage();
+        if ($untilDelayed !== null) {
+            $pollTimeout = max(1, min($pollTimeout, $untilDelayed));
+        }
+    } catch (\Throwable $e) {
+        Logger::warn('Telegram-бот: очередь отложенных сообщений недоступна: ' . $e->getMessage());
+        if (Database::isConnectionLost($e)) {
+            [$db, $handler, $dispatcher] = reconnectDependents($telegram, $config);
+        }
+    }
+
+    try {
+        $updates = $telegram->getUpdates($offset, $pollTimeout);
     } catch (\Throwable $e) {
         Logger::warn('Telegram-бот: ошибка long-polling запроса: ' . $e->getMessage());
         sleep(NETWORK_ERROR_COOLDOWN_SECONDS); // не долбить API сразу же после сетевой ошибки
@@ -128,6 +143,16 @@ while (true) {
             if (Database::isConnectionLost($e)) {
                 [$db, $handler, $dispatcher] = reconnectDependents($telegram, $config);
             }
+        }
+    }
+
+    try {
+        $handler->sendDueDelayedMessages();
+    } catch (\Throwable $e) {
+        // Сбой отложенных сообщений не должен останавливать ни приём команд, ни рассылку.
+        Logger::warn('Telegram-бот: ошибка отправки отложенных сообщений: ' . $e->getMessage());
+        if (Database::isConnectionLost($e)) {
+            [$db, $handler, $dispatcher] = reconnectDependents($telegram, $config);
         }
     }
 

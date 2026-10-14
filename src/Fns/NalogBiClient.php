@@ -30,8 +30,10 @@ use RuntimeException;
  *
  * Если сервис всё равно вернул captchaRequired=true — это НЕ обрабатывается
  * здесь попыткой решить капчу (умышленно не реализовано и не будет).
- * Вызывающий код (FnsBlocksImporter) обязан пропустить эмитента в этом
- * прогоне и не писать в БД, а не гадать.
+ * Сервис ставит этот признак и в обычный HTTP 200 ответ «блокировок нет»
+ * (бой, 14.10.2026) — настоящий отказ (и повод пропустить эмитента, не
+ * трогая БД) различим только по HTTP 400 с {ERRORS:{captcha:[...]}}, см.
+ * 'refused' ниже и докблок FnsBlocksImporter.
  */
 final class NalogBiClient implements NalogBiClientInterface
 {
@@ -144,12 +146,13 @@ final class NalogBiClient implements NalogBiClientInterface
         // Вторая, отдельная от HTTP 200 {captchaRequired:true} форма
         // капчи — подтверждена вживую (bondkeeper.ru, август 2026):
         // HTTP 400 с телом {"ERRORS":{"captcha":["Требуется ввести цифры
-        // с картинки..."]}}. По смыслу это то же самое "нужна капча", а
-        // не ошибка нашего запроса — приводим к общей форме
-        // {captchaRequired:true}, чтобы NalogBiResult::fromJson и вызывающий
-        // код (FnsBlocksImporter) не различали, откуда пришёл сигнал.
+        // с картинки..."]}}. Это настоящий отказ сервиса (мы не узнали,
+        // есть ли блокировка) — в отличие от captchaRequired=true в
+        // обычном HTTP 200 ответе, который сервис ставит и в ответ
+        // «блокировок нет» (бой, 14.10.2026, см. докблок NalogBiResult).
+        // 'refused' => true — чтобы FnsBlocksImporter различал эти два случая.
         if ($httpCode === 400 && is_array($decoded) && !empty($decoded['ERRORS']['captcha'] ?? null)) {
-            return ['captchaRequired' => true];
+            return ['captchaRequired' => true, 'refused' => true];
         }
 
         if ($httpCode !== 200) {

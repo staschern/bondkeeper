@@ -31,6 +31,13 @@ final class TelegramBotConfig
          * не остался только в логе.
          */
         public readonly int $techTelegramId = 0,
+        /**
+         * Имя бота без «@» (например, BondKeeperBot) — для ссылки с
+         * промокодом, которую бот показывает администратору при назначении
+         * партнёра (docs/PARTNER_PROGRAM.md). Пусто — ссылка показывается
+         * шаблоном с «ИМЯ_БОТА»; на работу самих ссылок не влияет.
+         */
+        public readonly string $botUsername = '',
     ) {
     }
 
@@ -50,6 +57,11 @@ final class TelegramBotConfig
             throw new RuntimeException("config/telegram_bot.php не содержит непустой 'bot_token' — см. {$path} рядом (.example.php) для образца.");
         }
 
-        return new self($token, (int) ($config['admin_telegram_id'] ?? 0), (int) ($config['tech_telegram_id'] ?? 0));
+        return new self(
+            $token,
+            (int) ($config['admin_telegram_id'] ?? 0),
+            (int) ($config['tech_telegram_id'] ?? 0),
+            ltrim(trim((string) ($config['bot_username'] ?? '')), '@'),
+        );
     }
 }

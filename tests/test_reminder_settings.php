@@ -166,6 +166,8 @@ $default = $watch->remind('2026-10-16');
 check('обычные напоминания (за 1 рабочий день) идут своим чередом и по всем эмитентам', [2, ['Образец БО-01 2026-10-17 за 1', 'Другой БО-01 2026-10-17 за 1']],
     [$default['created'], array_values(array_filter($reminders('R1'), static fn (string $r): bool => str_ends_with($r, 'за 1')))]);
 check('повторный запуск ничего не дублирует', [0, 0], [$watch->remind('2026-10-16')['created'], $watch->remind('2026-10-16', true, 3, [1])['created']]);
+$again = $watch->remind('2026-10-16', false);
+check('просмотр после настоящего запуска: в списке те же бумаги, и видно, что напоминания уже созданы', [2, 2, 0], [count($again['items']), $again['existing'], $again['created']]);
 // Напоминание, созданное до миграции 032: интервала у него нет.
 $addPayment('coupons', 2, '2026-10-22');
 $db->exec("INSERT INTO events (security_id, issuer_id, event_type_code, event_date, payload_json) VALUES (2, 1, 'R1', '2026-10-22', '{}')");

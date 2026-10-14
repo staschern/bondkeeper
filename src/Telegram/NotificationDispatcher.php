@@ -486,6 +486,16 @@ final class NotificationDispatcher
         if (($payload['received_date'] ?? null) !== null && $dueDate !== '' && (string) $payload['received_date'] > $dueDate) {
             $lateDates = ' Срок был ' . BotFormatting::formatDate($dueDate) . ', деньги поступили ' . BotFormatting::formatDate((string) $payload['received_date']) . '.';
         }
+        // НРД сообщил о деньгах раньше даты выплаты (решение пользователя 14.10.2026): напоминания накануне по такой
+        // выплате уже не будет (оно только для выплат, о деньгах по которым ещё не известно), поэтому текст прямо
+        // называет, к какой выплате относятся деньги.
+        $paymentDate = (string) ($payload['payment_date'] ?? '');
+        $inAdvance = $dueDate !== '' && (string) ($payload['message_date'] ?? '') !== '' && (string) $payload['message_date'] < $dueDate;
+        $advanceText = ($early ? 'Досрочное погашение' : self::mbUcfirst(self::paymentKindName($kind)))
+            . ' с датой выплаты ' . BotFormatting::formatDate($paymentDate) . " поступил{$ending} в НРД заранее"
+            . ($actual !== null ? ': ' . self::money((string) $actual, $currency) . ' на бумагу' : '') . '.'
+            . ($paymentDate !== '' && $dueDate !== $paymentDate ? ' С учётом выходных выплата — ' . BotFormatting::formatDate($dueDate) . '.' : '')
+            . ($early ? str_replace('Выпуск погашен досрочно', 'Выпуск погашается досрочно', $earlyNote) : '');
 
         [$emoji, $body] = match ($eventTypeCode) {
             'B1' => ['🔴', "{$what} выплачен{$ending} частично: получено "
@@ -501,9 +511,11 @@ final class NotificationDispatcher
                 . ($actual !== null ? ': ' . self::money((string) $actual, $currency) . ' на бумагу' : '') . '.' . $lateDates . $earlyNote],
             'C2' => ['🔴', "{$what}: НРД объявил дефолт — выплата не исполнена в течение 10 рабочих дней после срока"
                 . ($dueDate !== '' ? ' (' . BotFormatting::formatDate($dueDate) . ')' : '') . '.'],
-            default => ['✅', ($payload['extra'] ?? false) === true
-                ? "{$what}: получена ещё одна выплата" . ($tranche !== null ? ' — ' . self::money((string) $tranche, $currency) . ' на бумагу' : '') . '.'
-                : "{$what} получен{$ending} НРД" . ($actual !== null ? ': ' . self::money((string) $actual, $currency) . ' на бумагу' : '') . '.' . $earlyNote],
+            default => ['✅', match (true) {
+                ($payload['extra'] ?? false) === true => "{$what}: получена ещё одна выплата" . ($tranche !== null ? ' — ' . self::money((string) $tranche, $currency) . ' на бумагу' : '') . '.',
+                $inAdvance => $advanceText,
+                default => "{$what} получен{$ending} НРД" . ($actual !== null ? ': ' . self::money((string) $actual, $currency) . ' на бумагу' : '') . '.' . $earlyNote,
+            }],
         };
 
         return "<b>{$emoji} Выплаты:</b>" . "\n" . self::bondHeader($payload, $issuerName, $issuerInn) . "\n" . $body;

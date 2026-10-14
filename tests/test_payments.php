@@ -82,7 +82,8 @@ $db->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
 $db->sqliteCreateFunction('NOW', static fn (): string => date('Y-m-d H:i:s'), 0);
 
 $db->exec('CREATE TABLE issuers (id INTEGER PRIMARY KEY, short_name TEXT, inn TEXT)');
-$db->exec("CREATE TABLE securities (id INTEGER PRIMARY KEY, isin TEXT, issuer_id INTEGER, short_name TEXT, currency TEXT DEFAULT 'RUB', is_structured INTEGER DEFAULT 0, status TEXT DEFAULT 'active', maturity_date TEXT, status_reason TEXT, status_changed_at TEXT, ended_at TEXT, missing_since TEXT, has_offer INTEGER DEFAULT 0)");
+$db->exec("CREATE TABLE securities (id INTEGER PRIMARY KEY, isin TEXT, issuer_id INTEGER, short_name TEXT, currency TEXT DEFAULT 'RUB', is_structured INTEGER DEFAULT 0, status TEXT DEFAULT 'active', maturity_date TEXT, status_reason TEXT, status_changed_at TEXT, ended_at TEXT, missing_since TEXT, has_offer INTEGER DEFAULT 0,
+    nominal_value TEXT, initial_nominal_value TEXT)");
 $db->exec('CREATE TABLE offers (id INTEGER PRIMARY KEY AUTOINCREMENT, security_id INTEGER, execution_date_planned TEXT, offer_type TEXT)');
 $schedule = "id INTEGER PRIMARY KEY AUTOINCREMENT, security_id INTEGER, issuer_id INTEGER, %s TEXT, value_per_bond TEXT, actual_value_per_bond TEXT, full_default_date_planned TEXT, status TEXT DEFAULT 'planned'";
 $db->exec('CREATE TABLE coupons (' . sprintf($schedule, 'period_end_date') . ')');
@@ -249,6 +250,24 @@ $db->exec("INSERT INTO coupons (security_id, issuer_id, period_end_date, value_p
 $r = $processor->process($message('RU000A000006', 'coupon', '2027-03-15', 'received', 'full', '11.5', '2027-03-15', 'msg-gap'));
 check('выплата появилась в графике → то же сообщение обрабатывается со второй попытки', ['processed', 1], [$r['result'], (int) $db->query("SELECT retry_count FROM raw_messages WHERE source_ref = 'msg-gap'")->fetchColumn()]);
 check('в архиве сырых сообщений — исходный вид и отметка источника', ['nsd', '{"example":true}'], array_values($db->query("SELECT source, raw_payload FROM raw_messages WHERE source_ref = 'msg-weekend'")->fetch()));
+
+echo "\n--- номинал привязан к цене золота: амортизации нет в графике (SELGOLD002, 08.10.2026) ---\n";
+$db->exec("INSERT INTO securities (id, isin, issuer_id, short_name, nominal_value, initial_nominal_value) VALUES (90, 'RU000A106XD7', 7, 'SELGOLD002', '9007.19', '5878.39')");
+$db->exec("INSERT INTO amortizations (security_id, issuer_id, payment_date_planned, value_per_bond) VALUES (90, 7, '2030-01-03', '10028.9800')"); // у биржи — только итоговая выплата
+$amortization = static fn (string $date): array|false => $db->query("SELECT value_per_bond, status, actual_value_per_bond FROM amortizations WHERE security_id = 90 AND payment_date_planned = '{$date}'")->fetch(PDO::FETCH_NUM);
+$located = $processor->locate($message('RU000A106XD7', 'amortization', '2026-10-08', 'received', 'full', '1114.33', '2026-10-08'));
+check('просмотр опроса: амортизация будет создана по сообщению', [true, null], [$located['indexed'], $located['payment']]);
+$r = $processor->process($message('RU000A106XD7', 'amortization', '2026-10-08', 'received', 'full', '1114.33', '2026-10-08'));
+check('номинал выше первоначального, амортизации на 08.10 в графике нет → строка создана по сообщению НРД, событие A4', ['processed', ['A4']], [$r['result'], $r['events']]);
+check('…в графике: 1114,33, выплачено; итоговая выплата в конце срока не тронута', [['1114.3300', 'paid', '1114.3300'], ['10028.9800', 'planned', null]],
+    [$amortization('2026-10-08'), $amortization('2030-01-03')]);
+$r = $processor->process($message('RU000A106XD7', 'amortization', '2026-10-08', 'transferred', 'full', '1114.33', '2026-10-09'));
+check('«передано депонентам» ложится на созданную строку, вторая строка не появляется', [['A5'], 1],
+    [$r['events'], (int) $db->query("SELECT COUNT(*) FROM amortizations WHERE security_id = 90 AND payment_date_planned = '2026-10-08'")->fetchColumn()]);
+$r = $processor->process($message('RU000A106XD7', 'coupon', '2026-11-08', 'received', 'full', '137.52', '2026-11-08'));
+check('у такого выпуска нет в графике купона → как раньше, не сопоставлено (создаётся только амортизация)', 'unmatched', $r['result']);
+$r = $processor->process($message('RU000A000006', 'amortization', '2027-04-15', 'received', 'full', '100', '2027-04-15'));
+check('обычный выпуск (номинал не выше первоначального): амортизации нет в графике → как раньше, не сопоставлено', 'unmatched', $r['result']);
 
 echo "\n--- напоминание в последний рабочий день перед выплатой ---\n";
 $addCoupon(70, '2026-10-10', '25.0000');       // суббота

@@ -8,6 +8,7 @@ use BondKeeper\Events\EventPublisher;
 use BondKeeper\Fns\FnsBlocksImporter;
 use BondKeeper\Fns\NalogBiClient;
 use BondKeeper\Fns\NalogBiClientInterface;
+use BondKeeper\Partners\PartnerProgram;
 use BondKeeper\Payments\WorkingCalendar;
 use BondKeeper\Ratings\IssuerMatcher;
 use BondKeeper\Ratings\NameMatchReviews;
@@ -101,11 +102,22 @@ final class BotCommandHandler
         private readonly int $adminTelegramId = 0,
         /** Подмена в офлайн-тестах (checkFnsOnAdd()) — без сети, по умолчанию настоящий сервис ФНС. */
         private readonly NalogBiClientInterface $nalogBiClient = new NalogBiClient(),
+        /** Имя бота без «@» — для ссылки с промокодом в ответе администратору; пусто — ссылка показывается шаблоном. */
+        private readonly string $botUsername = '',
     ) {
         $this->preferences = new NotificationPreferences($db);
+        $this->partners = new PartnerProgram($db);
+        $this->delayed = new DelayedMessages($db);
     }
 
     private readonly NotificationPreferences $preferences;
+    private readonly PartnerProgram $partners;
+    private readonly DelayedMessages $delayed;
+    /** Пользователь создан этим самым сообщением (первый «Старт») — см. ensureUser(). */
+    private bool $userJustRegistered = false;
+    /** Есть ли в базе таблицы партнёрской программы (миграция 034) и когда это проверялось. */
+    private bool $partnersReady = false;
+    private int $partnersCheckedAt = 0;
 
     /** @param array<string, mixed> $update сырой объект Update от Bot API */
     public function handleUpdate(array $update): void
@@ -150,6 +162,18 @@ final class BotCommandHandler
 
         $username = isset($from['username']) && $from['username'] !== '' ? (string) $from['username'] : null;
         $userId = $this->ensureUser($telegramId, $username);
+
+        // Команды администратора по партнёрской программе. Остальным они отвечают «Не понимаю эту команду».
+        if ($this->adminTelegramId !== 0 && $telegramId === $this->adminTelegramId && preg_match('/^\/partner(s|_on|_off)?(\s|$)/u', $text) === 1) {
+            $this->telegram->sendMessage($chatId, $this->handlePartnerAdminCommand($text));
+            return;
+        }
+
+        // «Старт» — в том числе по ссылке с промокодом: t.me/бот?start=КОД приходит как "/start КОД".
+        if ($text === '/start' || str_starts_with($text, '/start ')) {
+            $this->handleStartCommand($userId, $chatId, trim(substr($text, 6)));
+            return;
+        }
 
         $known = $this->matchKnownCommand($userId, $text);
         if ($known !== null) {
@@ -212,6 +236,9 @@ final class BotCommandHandler
         if ($toast === null) {
             $toast = $this->dispatchSettingsCallback($userId, $chatId, $messageId, $data);
         }
+        if ($toast === null) {
+            $toast = $this->dispatchPromoCallback($userId, $chatId, $messageId, $data);
+        }
         $this->telegram->answerCallbackQuery($id, $toast);
     }
 
@@ -238,7 +265,8 @@ final class BotCommandHandler
                     . self::BTN_ISSUERS . '» → «' . self::BTN_STATUS . '».',
                 'keyboard' => $this->mainMenuKeyboard(),
             ]],
-            self::BTN_SUBSCRIPTION => ['text' => $this->handleSubscription($userId), 'keyboard' => $this->mainMenuKeyboard(), 'parseMode' => 'HTML'],
+            // Пока промокод ещё можно ввести, под экраном — кнопка «Ввести промокод 🎟», иначе главная клавиатура.
+            self::BTN_SUBSCRIPTION => ['text' => $this->handleSubscription($userId), 'keyboard' => $this->subscriptionKeyboard($userId), 'parseMode' => 'HTML'],
             self::BTN_ABOUT => ['text' => $this->aboutServiceText(), 'keyboard' => $this->aboutServiceKeyboard(), 'parseMode' => 'HTML'],
             self::BTN_HELP => ['text' => $this->startSupportFlow($userId), 'keyboard' => $this->mainMenuKeyboard()],
             default => $this->matchSlashCommandWithArgument($userId, $text),
@@ -310,6 +338,11 @@ final class BotCommandHandler
      */
     private function ensureUser(int $telegramId, ?string $username): int
     {
+        // Новый ли это пользователь — нужно «Старту»: предложение ввести промокод приходит только новичкам.
+        $known = $this->db->prepare('SELECT 1 FROM users WHERE telegram_id = :telegram_id');
+        $known->execute(['telegram_id' => $telegramId]);
+        $this->userJustRegistered = $known->fetchColumn() === false;
+
         $this->db->prepare(
             'INSERT INTO users (telegram_id, telegram_username, last_active_at)
              VALUES (:telegram_id, :telegram_username, NOW())
@@ -1196,7 +1229,8 @@ final class BotCommandHandler
         return "Ваша текущая подписка: <b>{$tariffName}</b>\n\n"
             . "Количество эмитентов доступных для отслеживания: <b>{$limit}</b>\n"
             . "Количество эмитентов в списке на отслеживание: <b>{$current}</b>\n"
-            . "{$periodLabel}: <b>{$periodValue}</b>\n\n"
+            . "{$periodLabel}: <b>{$periodValue}</b>\n"
+            . $this->promoLine($userId) . "\n"
             . "Благодарим за интерес к нашему проекту! 🙏\n"
             . "Ещё больше возможностей уже скоро откроется на платном тарифе 😉\n"
             . "Следите за новостями: t.me/Bond_Keeper";
@@ -1247,6 +1281,335 @@ final class BotCommandHandler
     private function aboutServiceKeyboard(): array
     {
         return ['inline_keyboard' => [[['text' => 'Читать статью 📚', 'url' => self::ABOUT_ARTICLE_URL]]]];
+    }
+
+    // === Партнёрская программа и промокоды (13.10.2026) — docs/PARTNER_PROGRAM.md ===
+
+    /** Через сколько секунд после «Знакомства» новому пользователю приходит предложение ввести промокод. */
+    private const PROMO_PROMPT_DELAY_SECONDS = 10;
+
+    /** Сколько бот ждёт промокод обычным сообщением после предложения: потом текст снова понимается как обычно. */
+    private const PROMO_WAIT_SECONDS = 3600;
+
+    /** Кнопка под предложением ввести промокод. */
+    private const PROMO_SKIP_KEYBOARD = ['inline_keyboard' => [[['text' => 'Нет промокода', 'callback_data' => 'promo:skip']]]];
+
+    /**
+     * «Старт». Приветствие уходит всегда; дальше — промокод:
+     *   - пришёл по ссылке t.me/бот?start=КОД и код принят — сразу сообщение, что промокод применён;
+     *   - новый пользователь без промокода — через 10 секунд предложение его ввести.
+     * Тем, кто уже пользовался ботом, предложение само не приходит (решение пользователя, 13.10.2026) —
+     * у них есть кнопка в разделе «Подписка 🎁». Без миграции 034 «Старт» работает как раньше.
+     */
+    private function handleStartCommand(int $userId, int $chatId, string $payload): void
+    {
+        $isNewUser = $this->userJustRegistered;
+        $this->telegram->sendMessage($chatId, $this->handleStart(), self::mainMenuKeyboard(), 'HTML');
+
+        try {
+            if ($payload !== '') {
+                $applied = $this->partners->applyCode($userId, $payload, PartnerProgram::SOURCE_LINK);
+                if ($applied['result'] === PartnerProgram::APPLIED) {
+                    $this->delayed->cancel($userId, DelayedMessages::KIND_PROMO_PROMPT);
+                    $this->telegram->sendMessage($chatId, "Промокод {$applied['code']} применён ✅\nСкидка будет применена при первой оплате подписки.");
+
+                    return;
+                }
+            }
+            if ($isNewUser && $this->partners->canEnterCode($userId)) {
+                $this->delayed->schedule($userId, DelayedMessages::KIND_PROMO_PROMPT, self::PROMO_PROMPT_DELAY_SECONDS);
+            }
+        } catch (PDOException $e) {
+            Logger::warn('Промокоды: «Старт» обработан без них — ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * Отправить отложенные сообщения, которым пришло время. Вызывается из цикла бота
+     * (bin/daemon_telegram_bot.php) на каждом обороте.
+     */
+    public function sendDueDelayedMessages(): int
+    {
+        if (!$this->partnersReady()) {
+            return 0;
+        }
+        $sent = 0;
+        foreach ($this->delayed->due() as $message) {
+            // Отметка — до отправки: если отправка упадёт, сообщение не будет уходить снова и снова.
+            $this->delayed->markSent($message['id']);
+            if ($message['kind'] === DelayedMessages::KIND_PROMO_PROMPT && $this->sendPromoPrompt($message['user_id'])) {
+                $sent++;
+            }
+        }
+
+        return $sent;
+    }
+
+    /** Сколько секунд цикл бота может ждать новых сообщений, чтобы не опоздать с отложенным; null — ждать как обычно. */
+    public function secondsUntilNextDelayedMessage(): ?int
+    {
+        return $this->partnersReady() ? $this->delayed->secondsUntilNext() : null;
+    }
+
+    /**
+     * Применена ли миграция 034. Бот — долгоживущий процесс, файлы могут оказаться на сервере раньше миграции:
+     * тогда очередь отложенных сообщений просто не трогаем. «Нет» перепроверяется не чаще раза в пять минут.
+     */
+    private function partnersReady(): bool
+    {
+        if ($this->partnersReady) {
+            return true;
+        }
+        if (time() - $this->partnersCheckedAt < 300) {
+            return false;
+        }
+        $this->partnersCheckedAt = time();
+        $this->partnersReady = PartnerProgram::schemaProblem($this->db) === null;
+
+        return $this->partnersReady;
+    }
+
+    /** Предложение ввести промокод — если его всё ещё можно ввести. */
+    private function sendPromoPrompt(int $userId): bool
+    {
+        $stmt = $this->db->prepare('SELECT telegram_id, telegram_bot_blocked FROM users WHERE id = :id');
+        $stmt->execute(['id' => $userId]);
+        $user = $stmt->fetch();
+        if ($user === false || (bool) $user['telegram_bot_blocked'] || !$this->partners->canEnterCode($userId)) {
+            return false;
+        }
+
+        $sent = $this->telegram->sendMessage(
+            (int) $user['telegram_id'],
+            "У тебя есть промокод? 🎟\nПришли его сообщением — и получишь скидку на первую оплату подписки.",
+            self::PROMO_SKIP_KEYBOARD,
+        );
+        // Следующее сообщение человека читаем как промокод — если он за эти секунды не начал другой диалог
+        // (поиск компании, обращение в поддержку): тогда его не перебиваем, промокод можно ввести из «Подписки».
+        if ($sent && $this->getDialogState($userId) === null) {
+            $this->setDialogState($userId, 'awaiting_promo_code', ['until' => time() + self::PROMO_WAIT_SECONDS]);
+        }
+
+        return $sent;
+    }
+
+    /**
+     * Человек прислал промокод сообщением.
+     *
+     * @return array{text: string, keyboard?: array<string, mixed>}
+     */
+    private function receivePromoCode(int $userId, string $text): array
+    {
+        try {
+            $applied = $this->partners->applyCode($userId, $text, PartnerProgram::SOURCE_MANUAL);
+        } catch (PDOException $e) {
+            Logger::warn('Промокоды: не удалось записать промокод — ' . $e->getMessage());
+            $this->clearDialogState($userId);
+
+            return ['text' => 'Промокоды сейчас недоступны — попробуй чуть позже.'];
+        }
+
+        if ($applied['result'] === PartnerProgram::NOT_FOUND) {
+            // Состояние остаётся: человек мог опечататься и пришлёт код ещё раз.
+            return ['text' => "Такого промокода нет 😕\nПроверь, нет ли опечатки, и пришли его ещё раз.", 'keyboard' => self::PROMO_SKIP_KEYBOARD];
+        }
+        $this->clearDialogState($userId);
+
+        return ['text' => match ($applied['result']) {
+            PartnerProgram::APPLIED => "Промокод {$applied['code']} принят ✅\nСкидка будет применена при первой оплате подписки.",
+            PartnerProgram::OWN_CODE => 'Свой промокод применить нельзя 🙂',
+            PartnerProgram::ALREADY_SET => "У тебя уже применён промокод {$applied['code']} — сменить его нельзя.",
+            default => 'Промокод действует только на первую оплату подписки.',
+        }];
+    }
+
+    /**
+     * Кнопки промокода: "promo:skip" — «Нет промокода», "promo:enter" — «Ввести промокод 🎟» из раздела «Подписка».
+     * null — не наша кнопка.
+     */
+    private function dispatchPromoCallback(int $userId, int $chatId, int $messageId, string $data): ?string
+    {
+        if ($data !== 'promo:skip' && $data !== 'promo:enter') {
+            return null;
+        }
+        try {
+            $dialog = $this->getDialogState($userId);
+            if ($data === 'promo:skip') {
+                if ($dialog !== null && $dialog['state'] === 'awaiting_promo_code') {
+                    $this->clearDialogState($userId);
+                }
+                $this->telegram->editMessageText($chatId, $messageId, "Хорошо 👌\nЕсли промокод появится, его можно ввести в разделе «" . self::BTN_SUBSCRIPTION . '».');
+
+                return '';
+            }
+
+            if (!$this->partners->canEnterCode($userId)) {
+                $code = $this->partners->usedCode($userId);
+
+                return $code !== null ? "У тебя уже применён промокод {$code}." : 'Промокод действует только на первую оплату подписки.';
+            }
+            $this->setDialogState($userId, 'awaiting_promo_code', ['until' => time() + self::PROMO_WAIT_SECONDS]);
+            $this->telegram->sendMessage($chatId, 'Пришли промокод сообщением 🎟', self::PROMO_SKIP_KEYBOARD);
+
+            return '';
+        } catch (PDOException $e) {
+            Logger::warn("Промокоды: {$data} — {$e->getMessage()}");
+
+            return 'Промокоды сейчас недоступны — попробуй чуть позже.';
+        }
+    }
+
+    /**
+     * Что приложить к экрану «Подписка»: кнопку «Ввести промокод 🎟», пока промокод ещё можно ввести,
+     * иначе — главную клавиатуру, как раньше.
+     *
+     * @return array<string, mixed>
+     */
+    private function subscriptionKeyboard(int $userId): array
+    {
+        try {
+            if ($this->partners->canEnterCode($userId)) {
+                return ['inline_keyboard' => [[['text' => 'Ввести промокод 🎟', 'callback_data' => 'promo:enter']]]];
+            }
+        } catch (PDOException $e) {
+            // миграция 034 ещё не применена — экран как раньше
+        }
+
+        return self::mainMenuKeyboard();
+    }
+
+    /** Строка о промокоде для экрана «Подписка»; пусто — промокода нет. */
+    private function promoLine(int $userId): string
+    {
+        try {
+            $code = $this->partners->usedCode($userId);
+        } catch (PDOException $e) {
+            return '';
+        }
+        if ($code === null) {
+            return '';
+        }
+        $note = $this->partners->discountCode($userId) !== null ? ' — скидка на первую оплату' : '';
+
+        return 'Промокод: <b>' . BotFormatting::escapeHtml($code) . "</b>{$note}\n";
+    }
+
+    /**
+     * Команды администратора (только он): назначить промокод, приостановить партнёра, посмотреть итоги.
+     *   /partner @имя КОД [процент]   /partner_off @имя   /partner_on @имя   /partners [ГГГГ-ММ]
+     * Вместо @имени — числовой Telegram ID.
+     */
+    private function handlePartnerAdminCommand(string $text): string
+    {
+        $parts = preg_split('/\s+/', trim($text)) ?: [];
+        $command = mb_strtolower((string) ($parts[0] ?? ''));
+        $usage = "Команды партнёрской программы:\n"
+            . "/partner @имя КОД [процент] — назначить промокод или сменить его\n"
+            . "/partner_off @имя — приостановить партнёра\n"
+            . "/partner_on @имя — вернуть партнёра\n"
+            . "/partners [ГГГГ-ММ] — итоги за месяц (без месяца — за текущий)\n"
+            . 'Вместо @имени можно указать числовой Telegram ID. Человек должен хотя бы раз нажать «Старт» в боте.';
+
+        try {
+            if ($command === '/partners') {
+                return $this->partnersReportText((string) ($parts[1] ?? date('Y-m')));
+            }
+            if (!in_array($command, ['/partner', '/partner_off', '/partner_on'], true) || !isset($parts[1])) {
+                return $usage;
+            }
+            $user = $this->partners->findUser((string) $parts[1]);
+            if ($user === null) {
+                return "Пользователь {$parts[1]} не найден среди пользователей бота. Попросите его нажать «Старт» в боте и повторите команду.";
+            }
+            $who = ($user['telegram_username'] !== null ? '@' . $user['telegram_username'] . ', ' : '') . 'Telegram ID ' . $user['telegram_id'];
+
+            if ($command !== '/partner') {
+                $active = $command === '/partner_on';
+                if (!$this->partners->setActive($user['id'], $active)) {
+                    return "У пользователя ({$who}) нет промокода — он не партнёр.";
+                }
+                $code = (string) $this->partners->partner($user['id'])['promo_code'];
+
+                return $active
+                    ? "Партнёр ({$who}) снова активен: промокод {$code} принимается."
+                    : "Партнёр ({$who}) приостановлен: по промокоду {$code} новые клиенты не записываются. Прежние клиенты остаются за ним.";
+            }
+
+            if (!isset($parts[2])) {
+                return $usage;
+            }
+            $result = $this->partners->assign($user['id'], (string) $parts[2], isset($parts[3]) ? rtrim((string) $parts[3], '%') : null);
+
+            return match ($result['result']) {
+                PartnerProgram::ASSIGN_BAD_CODE => 'Промокод — от 3 до 32 символов: латинские буквы, цифры, «_» и «-». Например: IVAN10',
+                PartnerProgram::ASSIGN_BAD_PERCENT => 'Процент вознаграждения — число от 0 до 100, например 20 или 12.5',
+                PartnerProgram::ASSIGN_CODE_TAKEN => "Промокод {$result['code']} уже занят другим партнёром.",
+                default => $this->partnerAssignedText($user['id'], $who, $result),
+            };
+        } catch (PDOException $e) {
+            Logger::warn('Партнёрская программа: команда администратора — ' . $e->getMessage());
+
+            return 'Партнёрская программа недоступна: похоже, не применена миграция database/034_partner_program.sql.';
+        } catch (\InvalidArgumentException $e) {
+            return $e->getMessage();
+        }
+    }
+
+    /** @param array{result: string, code: ?string, previous_code: ?string} $result */
+    private function partnerAssignedText(int $userId, string $who, array $result): string
+    {
+        $partner = $this->partners->partner($userId);
+        $percent = $partner !== null && $partner['reward_percent'] !== null
+            ? self::percentText($partner['reward_percent']) . ' %'
+            : 'не задан (добавьте третьим словом в команде, например: /partner @имя ' . $result['code'] . ' 20)';
+        $link = $this->botUsername !== ''
+            ? "https://t.me/{$this->botUsername}?start={$result['code']}"
+            : "https://t.me/ИМЯ_БОТА?start={$result['code']} (имя бота подставится само, если указать 'bot_username' в config/telegram_bot.php)";
+
+        return ($result['result'] === PartnerProgram::ASSIGN_CREATED ? 'Партнёр назначен ✅' : 'Партнёр обновлён ✅') . "\n"
+            . "{$who}\n"
+            . "Промокод: {$result['code']}\n"
+            . "Процент вознаграждения: {$percent}\n"
+            . "Ссылка для клиентов: {$link}"
+            . ($result['previous_code'] !== null
+                ? "\n\nПрежний промокод {$result['previous_code']} больше не действует. Клиенты, которые им воспользовались, остаются за партнёром."
+                : '');
+    }
+
+    /** Процент без лишних нулей после запятой: «20.00» → «20», «12.50» → «12.5». */
+    private static function percentText(string $percent): string
+    {
+        return str_contains($percent, '.') ? rtrim(rtrim($percent, '0'), '.') : $percent;
+    }
+
+    /** Итоги по партнёрам за месяц — текстом для администратора. */
+    private function partnersReportText(string $month): string
+    {
+        $rows = $this->partners->report($month);
+        if ($rows === []) {
+            return "Партнёров пока нет. Назначить: /partner @имя КОД [процент]";
+        }
+        $money = static fn (string $amount): string => number_format((float) $amount, 2, '.', ' ') . ' ₽';
+        $lines = ["Партнёры — итоги за {$month}", ''];
+        $totalAmount = 0.0;
+        $totalReward = 0.0;
+        foreach ($rows as $i => $row) {
+            $name = $row['telegram_username'] !== null ? '@' . $row['telegram_username'] : 'ID ' . $row['telegram_id'];
+            $percent = $row['reward_percent'] !== null ? self::percentText($row['reward_percent']) . ' %' : 'процент не задан';
+            $lines[] = ($i + 1) . ". {$name} · {$row['promo_code']} · {$percent}" . ($row['status'] === 'paused' ? ' · приостановлен' : '');
+            $lines[] = "   привёл: {$row['referred_total']} (за месяц {$row['referred_in_month']}; по ссылке {$row['referred_by_link']}, ввели сами {$row['referred_manual']})";
+            $lines[] = "   оплаты за месяц: клиентов {$row['paying_clients_in_month']} (впервые {$row['first_paid_in_month']}), платежей {$row['payments_in_month']}, сумма " . $money($row['amount_in_month']);
+            $lines[] = '   вознаграждение: ' . ($row['reward_in_month'] !== null ? $money($row['reward_in_month']) : 'не посчитано — не задан процент');
+            $totalAmount += (float) $row['amount_in_month'];
+            $totalReward += (float) ($row['reward_in_month'] ?? 0);
+        }
+        $lines[] = '';
+        $lines[] = 'Всего: оплат на ' . $money((string) $totalAmount) . ', вознаграждений на ' . $money((string) $totalReward);
+        $text = implode("\n", $lines);
+
+        return mb_strlen($text) <= 3900
+            ? $text
+            : mb_substr($text, 0, 3800) . "\n…\nСписок длинный — полный отчёт: php bin/partner_report.php --month={$month}";
     }
 
     // === Раздел "Настройки ⚙️" — настройка уведомлений, docs/BOT_UX_SPEC.md раздел 10 ===
@@ -1718,6 +2081,11 @@ final class BotCommandHandler
     private function handleFreeText(int $userId, int $telegramId, ?string $username, string $text): array
     {
         $dialog = $this->getDialogState($userId);
+        // Промокод ждём недолго: через час после предложения текст снова понимается как обычно.
+        if ($dialog !== null && $dialog['state'] === 'awaiting_promo_code' && (int) ($dialog['context']['until'] ?? 0) < time()) {
+            $this->clearDialogState($userId);
+            $dialog = null;
+        }
         if ($dialog === null) {
             return ['text' => "Не понимаю эту команду.\n\n" . $this->helpText()];
         }
@@ -1725,6 +2093,7 @@ final class BotCommandHandler
         return match ($dialog['state']) {
             'awaiting_issuer_search' => $this->handleIssuerSearchText($text),
             'awaiting_reminder_days' => ['text' => $this->receiveReminderDays($userId, (string) ($dialog['context']['kind'] ?? ''), $text)],
+            'awaiting_promo_code' => $this->receivePromoCode($userId, $text),
             'awaiting_support_name' => ['text' => $this->receiveSupportName($userId, $text)],
             'awaiting_support_message' => ['text' => $this->receiveSupportMessage($userId, $telegramId, $username, $dialog['context'], $text)],
             'in_support_chat' => ['text' => $this->relayUserMessageToAdmin($userId, $telegramId, $username, $dialog['context'], $text)],
