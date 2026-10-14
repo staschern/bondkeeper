@@ -191,7 +191,7 @@ $statusMenu = callPrivate($ref, $handler, 'handleStatusMenuEntry', [1]);
 check('handleStatusMenuEntry(): непустой список — две кнопки выбора, не сразу текст (текст из ТЗ от 12.10.2026)', $statusMenu['text'] === 'Ты можешь уточнить текущий статус по конкретной компании или по всему списку 📍');
 check(
     'handleStatusMenuEntry(): кнопка "Указать компанию" -> stat:pick_menu',
-    $statusMenu['keyboard']['inline_keyboard'][0][0]['text'] === 'Указать компанию ❤️'
+    $statusMenu['keyboard']['inline_keyboard'][0][0]['text'] === 'Указать компанию 📍'
     && $statusMenu['keyboard']['inline_keyboard'][0][0]['callback_data'] === 'stat:pick_menu'
 );
 check(

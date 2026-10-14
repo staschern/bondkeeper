@@ -914,7 +914,7 @@ final class BotCommandHandler
         return [
             'text' => 'Ты можешь уточнить текущий статус по конкретной компании или по всему списку 📍',
             'keyboard' => ['inline_keyboard' => [
-                [['text' => 'Указать компанию ❤️', 'callback_data' => 'stat:pick_menu']],
+                [['text' => 'Указать компанию 📍', 'callback_data' => 'stat:pick_menu']],
                 [['text' => 'Весь список 📋', 'callback_data' => 'stat:all']],
             ]],
         ];
@@ -1595,9 +1595,9 @@ final class BotCommandHandler
     }
 
     /**
-     * Список выпусков эмитента с отметками — тот же приём ➕/✅, что и в
-     * листалке «Выбор компаний». ✅ — по выпуску приходят уведомления и
-     * напоминания, ➕ — отметка снята. По умолчанию отмечены все.
+     * Список выпусков эмитента с отметками. ✅ — по выпуску приходят
+     * уведомления и напоминания, 🔴 — отметка снята. По умолчанию
+     * отмечены все.
      */
     private function showIssuerBonds(int $userId, int $chatId, int $messageId, int $issuerId, int $page): ?string
     {
@@ -1620,7 +1620,7 @@ final class BotCommandHandler
 
         $buttons = [];
         foreach (array_slice($bonds, $page * self::BONDS_PAGE_SIZE, self::BONDS_PAGE_SIZE) as $bond) {
-            $mark = in_array($bond['id'], $excluded, true) ? '➕ ' : '✅ ';
+            $mark = in_array($bond['id'], $excluded, true) ? '🔴 ' : '✅ ';
             $buttons[] = [['text' => $mark . $bond['short_name'] . ' · ' . $bond['isin'], 'callback_data' => "set:bond:{$bond['id']}:{$page}"]];
         }
         $nav = [];
@@ -1635,12 +1635,12 @@ final class BotCommandHandler
         }
         $buttons[] = [
             ['text' => 'Отметить все ✅', 'callback_data' => "set:bonds_all:{$issuerId}:{$page}:1"],
-            ['text' => 'Снять все ➕', 'callback_data' => "set:bonds_all:{$issuerId}:{$page}:0"],
+            ['text' => 'Снять все 🔴', 'callback_data' => "set:bonds_all:{$issuerId}:{$page}:0"],
         ];
 
         $selected = count($bonds) - count($excluded);
         $text = "{$name}: выпуски облигаций" . ($pages > 1 ? ' (стр. ' . ($page + 1) . " из {$pages})" : '') . ".\n"
-            . '✅ — по выпуску приходят уведомления и напоминания, ➕ — не приходят. Нажми на выпуск, чтобы изменить.' . "\n"
+            . '✅ — по выпуску приходят уведомления и напоминания, 🔴 — не приходят. Нажми на выпуск, чтобы изменить.' . "\n"
             . "Отмечено: {$selected} из " . count($bonds) . '.';
         $this->telegram->editMessageText($chatId, $messageId, $text, ['inline_keyboard' => $buttons]);
 
