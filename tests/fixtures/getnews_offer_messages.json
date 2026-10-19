@@ -806,7 +806,7 @@
   "id": 1447948,
   "category": "CORP_ACTION"
  },
- "put_announcement_not_processed": {
+ "put_announced": {
   "title_ru": "(BPUT) О корпоративном действии \"Досрочное погашение ценных бумаг или приобретение их эмитентом\" с ценными бумагами эмитента АО \"Группа компаний \"Медси\" ИНН 7710641442 (облигация 4B02-03-62024-H-001P / ISIN RU000A106K27)",
   "body_ru": "\n      <table class=\"table_C8_properties\" version=\"96\" cellspacing=\"1\" cellpadding=\"0\" width=\"100%\">\n         <thead bgcolor=\"#ffdddd\">\n            <tr>\n               <th colspan=\"2\" bgcolor=\"#bbbbbb\" align=\"center\">Реквизиты корпоративного действия</th>\n            </tr>\n         </thead>\n         <tbody>\n            <tr>\n               <td bgcolor=\"#eeeeee\">Референс корпоративного действия</td>\n               <td bgcolor=\"#eeeeee\" style=\"word-wrap:break-word;word-break:break-all;\">1089454</td>\n            </tr>\n            <tr>\n               <td bgcolor=\"#eeeeee\">Код типа корпоративного действия</td>\n               <td bgcolor=\"#eeeeee\" style=\"word-wrap:break-word;word-break:break-all;\">BPUT</td>\n            </tr>\n            <tr>\n               <td bgcolor=\"#eeeeee\">Тип корпоративного действия</td>\n               <td bgcolor=\"#eeeeee\" style=\"word-wrap:break-word;word-break:break-all;\">Досрочное погашение ценных бумаг или приобретение их эмитентом</td>\n            </tr>\n            <tr>\n               <td bgcolor=\"#eeeeee\">Вид корпоративного действия</td>\n               <td bgcolor=\"#eeeeee\" style=\"word-wrap:break-word;word-break:break-all;\">Приобретение эмитентом облигаций по требованию их владельцев</td>\n            </tr>\n            <tr>\n               <td bgcolor=\"#eeeeee\">Дата КД (план.)</td>\n               <td bgcolor=\"#eeeeee\">14 октября 2026 г.</td>\n            </tr>\n         </tbody>\n      </table><br/>\n      <table cellspacing=\"1\" cellpadding=\"0\" width=\"100%\">\n         <thead bgcolor=\"#ffdddd\">\n            <tr>\n               <th colspan=\"10\" bgcolor=\"#bbbbbb\" align=\"center\">Информация о ценных бумагах</th>\n            </tr>\n            <tr>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Референс КД по ценной бумаге</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Эмитент</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Регистрационный номер</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Дата регистрации</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Тип фин.инструмента</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Депозитарный код выпуска</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">ISIN</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Номинальная стоимость</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Остаточная номинальная стоимость</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Валюта номинала</th>\n            </tr>\n         </thead>\n         <tbody>\n            <tr>\n               <td bgcolor=\"#eeeeee\">1089454X78090</td>\n               <td bgcolor=\"#eeeeee\">Акционерное общество \"Группа компаний \"Медси\"</td>\n               <td bgcolor=\"#eeeeee\">4B02-03-62024-H-001P</td>\n               <td bgcolor=\"#eeeeee\">12 июля 2023 г.</td>\n               <td bgcolor=\"#eeeeee\">облигации  </td>\n               <td bgcolor=\"#eeeeee\">RU000A106K27</td>\n               <td bgcolor=\"#eeeeee\">RU000A106K27</td>\n               <td bgcolor=\"#eeeeee\">1000</td>\n               <td bgcolor=\"#eeeeee\">1000</td>\n               <td bgcolor=\"#eeeeee\">RUB</td>\n            </tr>\n         </tbody>\n      </table><br/>\n      <p>Настоящим сообщаем о получении НКО АО НРД информации, предоставляемой эмитентом ценных\n         бумаг в соответствии с Положением ЦБ РФ N 751-П от 11 января 2021 года \"О перечне\n         информации, связанной с осуществлением прав по ценным бумагам, предоставляемой эмитентами\n         центральному депозитарию, порядке и сроках ее предоставления, а также о требованиях\n         к порядку предоставления центральным депозитарием доступа к такой информации\"</p>\n      <p>15.4 Информация о возникновении у владельцев облигаций права требовать от эмитента\n         приобретения принадлежащих им облигаций\n         </p>\n      <p>Через торговую систему.<br/>Эмитент действует с привлечением участника организованных торгов (далее – «Агент по\n         приобретению»): Акционерного общества Банк Синара, уполномоченного Эмитентом на приобретение\n         Биржевых облигаций, являющегося профессиональным участником рынка ценных бумаг (лицензия\n         на осуществление брокерской деятельности № 065-08840-100000 от 12.01.2006 г., лицензия\n         на осуществление дилерской деятельности № 065-08844-010000 от 12.01.2006 г.), идентификатор\n         агента по приобретению как участника торгов в Системе торгов ПАО Московская Биржа:\n         EC0106000000, e-mail DCM@sinara-finance.ru</p>\n      ",
   "news_theme_id": 4,
@@ -1021,6 +1021,366 @@
    }
   },
   "id": 1447534,
+  "category": "CORP_ACTION"
+ },
+ "apri_buyback_by_agreement": {
+  "title_ru": "(BPUT) О корпоративном действии \"Досрочное погашение ценных бумаг или приобретение их эмитентом\" с ценными бумагами эмитента ПАО \"АПРИ\" ИНН 7453326003 (облигация 4B02-14-12464-K-002P / ISIN RU000A10ERC0)",
+  "body_ru": "\n      <table class=\"table_C8_properties\" version=\"96\" cellspacing=\"1\" cellpadding=\"0\" width=\"100%\">\n         <thead bgcolor=\"#ffdddd\">\n            <tr>\n               <th colspan=\"2\" bgcolor=\"#bbbbbb\" align=\"center\">Реквизиты корпоративного действия</th>\n            </tr>\n         </thead>\n         <tbody>\n            <tr>\n               <td bgcolor=\"#eeeeee\">Референс корпоративного действия</td>\n               <td bgcolor=\"#eeeeee\" style=\"word-wrap:break-word;word-break:break-all;\">1223314</td>\n            </tr>\n            <tr>\n               <td bgcolor=\"#eeeeee\">Код типа корпоративного действия</td>\n               <td bgcolor=\"#eeeeee\" style=\"word-wrap:break-word;word-break:break-all;\">BPUT</td>\n            </tr>\n            <tr>\n               <td bgcolor=\"#eeeeee\">Тип корпоративного действия</td>\n               <td bgcolor=\"#eeeeee\" style=\"word-wrap:break-word;word-break:break-all;\">Досрочное погашение ценных бумаг или приобретение их эмитентом</td>\n            </tr>\n            <tr>\n               <td bgcolor=\"#eeeeee\">Вид корпоративного действия</td>\n               <td bgcolor=\"#eeeeee\" style=\"word-wrap:break-word;word-break:break-all;\">Приобретение эмитентом облигаций по соглашению с их владельцами</td>\n            </tr>\n            <tr>\n               <td bgcolor=\"#eeeeee\">Дата КД (план.)</td>\n               <td bgcolor=\"#eeeeee\">21 октября 2026 г.</td>\n            </tr>\n            <tr>\n               <td bgcolor=\"#eeeeee\">Дата принятия решения о приобретении облигаций</td>\n               <td bgcolor=\"#eeeeee\" style=\"word-wrap:break-word;word-break:break-all;\">28 сентября 2026 г.</td>\n            </tr>\n         </tbody>\n      </table><br/>\n      <table cellspacing=\"1\" cellpadding=\"0\" width=\"100%\">\n         <thead bgcolor=\"#ffdddd\">\n            <tr>\n               <th colspan=\"10\" bgcolor=\"#bbbbbb\" align=\"center\">Информация о ценных бумагах</th>\n            </tr>\n            <tr>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Референс КД по ценной бумаге</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Эмитент</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Регистрационный номер</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Дата регистрации</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Тип фин.инструмента</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Депозитарный код выпуска</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">ISIN</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Номинальная стоимость</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Остаточная номинальная стоимость</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Валюта номинала</th>\n            </tr>\n         </thead>\n         <tbody>\n            <tr>\n               <td bgcolor=\"#eeeeee\">1223314X88669</td>\n               <td bgcolor=\"#eeeeee\">Публичное акционерное общество \"АПРИ\"</td>\n               <td bgcolor=\"#eeeeee\">4B02-14-12464-K-002P</td>\n               <td bgcolor=\"#eeeeee\">19 марта 2026 г.</td>\n               <td bgcolor=\"#eeeeee\">облигации  </td>\n               <td bgcolor=\"#eeeeee\">RU000A10ERC0</td>\n               <td bgcolor=\"#eeeeee\">RU000A10ERC0</td>\n               <td bgcolor=\"#eeeeee\">1000</td>\n               <td bgcolor=\"#eeeeee\">1000</td>\n               <td bgcolor=\"#eeeeee\">RUB</td>\n            </tr>\n         </tbody>\n      </table><br/>\n      <p>Настоящим сообщаем о получении НКО АО НРД информации, предоставляемой эмитентом ценных\n         бумаг в соответствии с Положением ЦБ РФ N 751-П от 11 января 2021 года \"О перечне\n         информации, связанной с осуществлением прав по ценным бумагам, предоставляемой эмитентами\n         центральному депозитарию, порядке и сроках ее предоставления, а также о требованиях\n         к порядку предоставления центральным депозитарием доступа к такой информации\"</p>\n      <p>17.2 Информация об осуществлении права на получение денежных средств, выплачиваемых\n         при\n         приобретении облигаций эмитентом по соглашению с их владельцами\n         </p>\n      <p>Подача требований возможна или через депозитарий с блокированием ценных бумаг, или\n         путем подачи заявок на Бирже</p>\n      ",
+  "news_theme_id": 4,
+  "group_id": 26,
+  "pub_date": "2026-09-28 15:33:04",
+  "news_date": "2026-09-28 15:33:04",
+  "content_id_out": 47363720319,
+  "action_id": 1223314,
+  "announce_ru": "(BPUT) О корпоративном действии \"Досрочное погашение ценных бумаг или приобретение их эмитентом\" с ценными бумагами эмитента ПАО \"АПРИ\" ИНН 7453326003 (облигация 4B02-14-12464-K-002P / ISIN RU000A10ERC0)",
+  "for_qu_investor": "N",
+  "ca_type": "BPUT",
+  "data": {
+   "id": 1223314,
+   "link": "https://nsddata.ru/news/view/1448810",
+   "action_date_plan": "2026-10-21",
+   "corp_action_type": {
+    "id": 5,
+    "code": "BPUT",
+    "name": "Досрочное погашение ценных бумаг или приобретение их эмитентом",
+    "name_en": "Put Redemption"
+   },
+   "state": {
+    "id": 141,
+    "code": "N",
+    "name": "Не состоялось"
+   },
+   "securities": [
+    {
+     "id": 10088669,
+     "isin": "RU000A10ERC0",
+     "code_nsd": "RU000A10ERC0",
+     "name_full": "Биржевые облигации бездокументарные процентные неконвертируемые серии БО-002P-14",
+     "name_full_en": "PJSC \"APRI\" 24.75 08/03/31",
+     "instr_type": {
+      "id": 2,
+      "name": "облигации",
+      "name_en": "bonds"
+     },
+     "state_reg_number": "4B02-14-12464-K-002P",
+     "state_reg_date": "2026-03-19",
+     "bond": {
+      "number": "4-12464-K-002P-02E",
+      "reg_date": "2022-07-27",
+      "face_value": 1000,
+      "maturity_value": 1000,
+      "currency": {
+       "id": 6,
+       "code": "RUB",
+       "name_short": "руб.",
+       "name_full": "Рубли",
+       "digital_code": "643",
+       "_at": "2026-09-28 15:32:05",
+       "_at2": "2026-09-28 15:32:05"
+      }
+     },
+     "issuer": {
+      "id": 31906,
+      "code_nsd": "MC0450500000",
+      "name_full": "Публичное акционерное общество \"АПРИ\"",
+      "name_full_en": "Public joint stock company \"APRI\"",
+      "name_short": "ПАО \"АПРИ\"",
+      "name_short_en": "PJSC \"APRI\"",
+      "name_full_tr": "Public joint stock company \"APRI\"",
+      "name_short_tr": "PJSC \"APRI\"",
+      "inn": "7453326003",
+      "ogrn": "1197456003360"
+     }
+    }
+   ],
+   "repayment": {
+    "number": 1,
+    "currency": {
+     "id": 6,
+     "code": "RUB",
+     "name_short": "руб.",
+     "name_full": "Рубли",
+     "digital_code": "643"
+    },
+    "size_per_security_cur": 914.24,
+    "early_redemption": {
+     "type": {
+      "id": 503,
+      "code": "K",
+      "name": "Приобретение эмитентом облигаций по соглашению с владельцами"
+     },
+     "res_nom_value": 1000,
+     "price_of_bought_back_securities": 914.24,
+     "ep_price_percent": 90,
+     "issuer_start_date": "2026-10-08",
+     "issuer_end_date": "2026-10-14"
+    }
+   }
+  },
+  "id": 1448810,
+  "category": "CORP_ACTION"
+ },
+ "lkh_put_without_date": {
+  "title_ru": "(BPUT) О корпоративном действии \"Досрочное погашение ценных бумаг или приобретение их эмитентом\" с ценными бумагами эмитента ООО \"ЛКХ\" ИНН 9729293827 (облигация 4B02-02-00213-L / ISIN RU000A10AT01)",
+  "body_ru": "\n      <table class=\"table_C8_properties\" version=\"96\" cellspacing=\"1\" cellpadding=\"0\" width=\"100%\">\n         <thead bgcolor=\"#ffdddd\">\n            <tr>\n               <th colspan=\"2\" bgcolor=\"#bbbbbb\" align=\"center\">Реквизиты корпоративного действия</th>\n            </tr>\n         </thead>\n         <tbody>\n            <tr>\n               <td bgcolor=\"#eeeeee\">Референс корпоративного действия</td>\n               <td bgcolor=\"#eeeeee\" style=\"word-wrap:break-word;word-break:break-all;\">1218581</td>\n            </tr>\n            <tr>\n               <td bgcolor=\"#eeeeee\">Код типа корпоративного действия</td>\n               <td bgcolor=\"#eeeeee\" style=\"word-wrap:break-word;word-break:break-all;\">BPUT</td>\n            </tr>\n            <tr>\n               <td bgcolor=\"#eeeeee\">Тип корпоративного действия</td>\n               <td bgcolor=\"#eeeeee\" style=\"word-wrap:break-word;word-break:break-all;\">Досрочное погашение ценных бумаг или приобретение их эмитентом</td>\n            </tr>\n            <tr>\n               <td bgcolor=\"#eeeeee\">Вид корпоративного действия</td>\n               <td bgcolor=\"#eeeeee\" style=\"word-wrap:break-word;word-break:break-all;\">Досрочное погашение облигаций по требованию их владельцев</td>\n            </tr>\n            <tr>\n               <td bgcolor=\"#eeeeee\">Дата КД (план.)</td>\n               <td bgcolor=\"#eeeeee\">Неизвестно</td>\n            </tr>\n         </tbody>\n      </table><br/>\n      <table cellspacing=\"1\" cellpadding=\"0\" width=\"100%\">\n         <thead bgcolor=\"#ffdddd\">\n            <tr>\n               <th colspan=\"10\" bgcolor=\"#bbbbbb\" align=\"center\">Информация о ценных бумагах</th>\n            </tr>\n            <tr>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Референс КД по ценной бумаге</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Эмитент</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Регистрационный номер</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Дата регистрации</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Тип фин.инструмента</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Депозитарный код выпуска</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">ISIN</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Номинальная стоимость</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Остаточная номинальная стоимость</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Валюта номинала</th>\n            </tr>\n         </thead>\n         <tbody>\n            <tr>\n               <td bgcolor=\"#eeeeee\">1218581X83618</td>\n               <td bgcolor=\"#eeeeee\">Общество с ограниченной ответственностью \"ЛАНДСКЕЙП КОНСТРАКШН ХАБ\"</td>\n               <td bgcolor=\"#eeeeee\">4B02-02-00213-L</td>\n               <td bgcolor=\"#eeeeee\">26 декабря 2024 г.</td>\n               <td bgcolor=\"#eeeeee\">облигации  </td>\n               <td bgcolor=\"#eeeeee\">RU000A10AT01</td>\n               <td bgcolor=\"#eeeeee\">RU000A10AT01</td>\n               <td bgcolor=\"#eeeeee\">1000</td>\n               <td bgcolor=\"#eeeeee\">1000</td>\n               <td bgcolor=\"#eeeeee\">RUB</td>\n            </tr>\n         </tbody>\n      </table><br/>\n      <p>Настоящим сообщаем о получении НКО АО НРД информации, предоставляемой эмитентом ценных\n         бумаг в соответствии с Положением ЦБ РФ N 751-П от 11 января 2021 года \"О перечне\n         информации, связанной с осуществлением прав по ценным бумагам, предоставляемой эмитентами\n         центральному депозитарию, порядке и сроках ее предоставления, а также о требованиях\n         к порядку предоставления центральным депозитарием доступа к такой информации\"</p>\n      <p>15.8 Информация о прекращении у владельцев облигаций права требовать от эмитента\n         досрочного погашения эмитентом принадлежащих им облигаций\n         </p>\n      ",
+  "news_theme_id": 4,
+  "group_id": 26,
+  "pub_date": "2026-09-21 14:52:07",
+  "news_date": "2026-09-21 14:52:07",
+  "content_id_out": 47302766177,
+  "action_id": 1218581,
+  "announce_ru": "(BPUT) О корпоративном действии \"Досрочное погашение ценных бумаг или приобретение их эмитентом\" с ценными бумагами эмитента ООО \"ЛКХ\" ИНН 9729293827 (облигация 4B02-02-00213-L / ISIN RU000A10AT01)",
+  "for_qu_investor": "N",
+  "ca_type": "BPUT",
+  "data": {
+   "id": 1218581,
+   "link": "https://nsddata.ru/news/view/1446351",
+   "action_date_plan": "2111-01-01",
+   "corp_action_type": {
+    "id": 5,
+    "code": "BPUT",
+    "name": "Досрочное погашение ценных бумаг или приобретение их эмитентом",
+    "name_en": "Put Redemption"
+   },
+   "state": {
+    "id": 141,
+    "code": "N",
+    "name": "Не состоялось"
+   },
+   "securities": [
+    {
+     "id": 10083618,
+     "isin": "RU000A10AT01",
+     "code_nsd": "RU000A10AT01",
+     "name_full": "Биржевые облигации процентные неконвертируемые бездокументарные с обеспечением в форме поручительства серии БО-02",
+     "name_full_en": "LCH, LLC 31 20/01/28",
+     "instr_type": {
+      "id": 2,
+      "name": "облигации",
+      "name_en": "bonds"
+     },
+     "state_reg_number": "4B02-02-00213-L",
+     "state_reg_date": "2024-12-26",
+     "bond": {
+      "face_value": 1000,
+      "maturity_value": 1000,
+      "currency": {
+       "id": 6,
+       "code": "RUB",
+       "name_short": "руб.",
+       "name_full": "Рубли",
+       "digital_code": "643",
+       "_at": "2026-09-21 14:51:07",
+       "_at2": "2026-09-21 14:51:07"
+      }
+     },
+     "issuer": {
+      "id": 45701,
+      "code_nsd": "MC0724900000",
+      "name_full": "Общество с ограниченной ответственностью \"ЛАНДСКЕЙП КОНСТРАКШН ХАБ\"",
+      "name_full_en": "LANDSCAPE CONSTRUCTION HUB, LIMITED LIABILITY COMPANY",
+      "name_short": "ООО \"ЛКХ\"",
+      "name_short_en": "LCH, LLC",
+      "name_full_tr": "LANDSCAPE CONSTRUCTION HUB, LIMITED LIABILITY COMPANY",
+      "name_short_tr": "LCH, LLC",
+      "inn": "9729293827",
+      "ogrn": "1207700042615"
+     }
+    }
+   ]
+  },
+  "id": 1446351,
+  "category": "CORP_ACTION"
+ },
+ "lkh_put_with_date": {
+  "title_ru": "(BPUT) О корпоративном действии \"Досрочное погашение ценных бумаг или приобретение их эмитентом\" с ценными бумагами эмитента ООО \"ЛКХ\" ИНН 9729293827 (облигация 4B02-02-00213-L / ISIN RU000A10AT01)",
+  "body_ru": "\n      <table class=\"table_C8_properties\" version=\"96\" cellspacing=\"1\" cellpadding=\"0\" width=\"100%\">\n         <thead bgcolor=\"#ffdddd\">\n            <tr>\n               <th colspan=\"2\" bgcolor=\"#bbbbbb\" align=\"center\">Реквизиты корпоративного действия</th>\n            </tr>\n         </thead>\n         <tbody>\n            <tr>\n               <td bgcolor=\"#eeeeee\">Референс корпоративного действия</td>\n               <td bgcolor=\"#eeeeee\" style=\"word-wrap:break-word;word-break:break-all;\">1218581</td>\n            </tr>\n            <tr>\n               <td bgcolor=\"#eeeeee\">Код типа корпоративного действия</td>\n               <td bgcolor=\"#eeeeee\" style=\"word-wrap:break-word;word-break:break-all;\">BPUT</td>\n            </tr>\n            <tr>\n               <td bgcolor=\"#eeeeee\">Тип корпоративного действия</td>\n               <td bgcolor=\"#eeeeee\" style=\"word-wrap:break-word;word-break:break-all;\">Досрочное погашение ценных бумаг или приобретение их эмитентом</td>\n            </tr>\n            <tr>\n               <td bgcolor=\"#eeeeee\">Вид корпоративного действия</td>\n               <td bgcolor=\"#eeeeee\" style=\"word-wrap:break-word;word-break:break-all;\">Досрочное погашение облигаций по требованию их владельцев</td>\n            </tr>\n            <tr>\n               <td bgcolor=\"#eeeeee\">Дата КД (план.)</td>\n               <td bgcolor=\"#eeeeee\">23 сентября 2026 г.</td>\n            </tr>\n         </tbody>\n      </table><br/>\n      <table cellspacing=\"1\" cellpadding=\"0\" width=\"100%\">\n         <thead bgcolor=\"#ffdddd\">\n            <tr>\n               <th colspan=\"10\" bgcolor=\"#bbbbbb\" align=\"center\">Информация о ценных бумагах</th>\n            </tr>\n            <tr>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Референс КД по ценной бумаге</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Эмитент</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Регистрационный номер</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Дата регистрации</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Тип фин.инструмента</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Депозитарный код выпуска</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">ISIN</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Номинальная стоимость</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Остаточная номинальная стоимость</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Валюта номинала</th>\n            </tr>\n         </thead>\n         <tbody>\n            <tr>\n               <td bgcolor=\"#eeeeee\">1218581X83618</td>\n               <td bgcolor=\"#eeeeee\">Общество с ограниченной ответственностью \"ЛАНДСКЕЙП КОНСТРАКШН ХАБ\"</td>\n               <td bgcolor=\"#eeeeee\">4B02-02-00213-L</td>\n               <td bgcolor=\"#eeeeee\">26 декабря 2024 г.</td>\n               <td bgcolor=\"#eeeeee\">облигации  </td>\n               <td bgcolor=\"#eeeeee\">RU000A10AT01</td>\n               <td bgcolor=\"#eeeeee\">RU000A10AT01</td>\n               <td bgcolor=\"#eeeeee\">1000</td>\n               <td bgcolor=\"#eeeeee\">1000</td>\n               <td bgcolor=\"#eeeeee\">RUB</td>\n            </tr>\n         </tbody>\n      </table><br/>\n      <p>Настоящим сообщаем о получении НКО АО НРД информации, предоставляемой эмитентом ценных\n         бумаг в соответствии с Положением ЦБ РФ N 751-П от 11 января 2021 года \"О перечне\n         информации, связанной с осуществлением прав по ценным бумагам, предоставляемой эмитентами\n         центральному депозитарию, порядке и сроках ее предоставления, а также о требованиях\n         к порядку предоставления центральным депозитарием доступа к такой информации\"</p>\n      <p>15.2 Информация о возникновении у владельцев облигаций права требовать от эмитента\n         досрочного погашения принадлежащих им облигаций\n         </p>\n      ",
+  "news_theme_id": 4,
+  "group_id": 26,
+  "pub_date": "2026-09-23 14:23:03",
+  "news_date": "2026-09-23 14:23:03",
+  "content_id_out": 47322530233,
+  "action_id": 1218581,
+  "announce_ru": "(BPUT) О корпоративном действии \"Досрочное погашение ценных бумаг или приобретение их эмитентом\" с ценными бумагами эмитента ООО \"ЛКХ\" ИНН 9729293827 (облигация 4B02-02-00213-L / ISIN RU000A10AT01)",
+  "for_qu_investor": "N",
+  "ca_type": "BPUT",
+  "data": {
+   "id": 1218581,
+   "link": "https://nsddata.ru/news/view/1447244",
+   "action_date_plan": "2026-09-23",
+   "corp_action_type": {
+    "id": 5,
+    "code": "BPUT",
+    "name": "Досрочное погашение ценных бумаг или приобретение их эмитентом",
+    "name_en": "Put Redemption"
+   },
+   "state": {
+    "id": 141,
+    "code": "N",
+    "name": "Не состоялось"
+   },
+   "securities": [
+    {
+     "id": 10083618,
+     "isin": "RU000A10AT01",
+     "code_nsd": "RU000A10AT01",
+     "name_full": "Биржевые облигации процентные неконвертируемые бездокументарные с обеспечением в форме поручительства серии БО-02",
+     "name_full_en": "LCH, LLC 31 20/01/28",
+     "instr_type": {
+      "id": 2,
+      "name": "облигации",
+      "name_en": "bonds"
+     },
+     "state_reg_number": "4B02-02-00213-L",
+     "state_reg_date": "2024-12-26",
+     "bond": {
+      "face_value": 1000,
+      "maturity_value": 1000,
+      "currency": {
+       "id": 6,
+       "code": "RUB",
+       "name_short": "руб.",
+       "name_full": "Рубли",
+       "digital_code": "643",
+       "_at": "2026-09-23 14:21:57",
+       "_at2": "2026-09-23 14:21:57"
+      }
+     },
+     "issuer": {
+      "id": 45701,
+      "code_nsd": "MC0724900000",
+      "name_full": "Общество с ограниченной ответственностью \"ЛАНДСКЕЙП КОНСТРАКШН ХАБ\"",
+      "name_full_en": "LANDSCAPE CONSTRUCTION HUB, LIMITED LIABILITY COMPANY",
+      "name_short": "ООО \"ЛКХ\"",
+      "name_short_en": "LCH, LLC",
+      "name_full_tr": "LANDSCAPE CONSTRUCTION HUB, LIMITED LIABILITY COMPANY",
+      "name_short_tr": "LCH, LLC",
+      "inn": "9729293827",
+      "ogrn": "1207700042615"
+     }
+    }
+   ],
+   "repayment": {
+    "number": 1,
+    "currency": {
+     "id": 6,
+     "code": "RUB",
+     "name_short": "руб.",
+     "name_full": "Рубли",
+     "digital_code": "643"
+    },
+    "size_per_security_cur": 1022.08,
+    "early_redemption": {
+     "type": {
+      "id": 501,
+      "code": "I",
+      "name": "Досрочное погашение облигаций по требованию владельцев"
+     },
+     "res_nom_value": 1000,
+     "price_of_bought_back_securities": 1022.08,
+     "ep_price_percent": 100,
+     "issuer_start_date": "2026-09-14",
+     "issuer_end_date": "2026-09-17"
+    }
+   }
+  },
+  "id": 1447244,
+  "category": "CORP_ACTION"
+ },
+ "next_year_put": {
+  "title_ru": "(BPUT) О корпоративном действии \"Досрочное погашение ценных бумаг или приобретение их эмитентом\" с ценными бумагами эмитента ПАО \"НК \"Роснефть\" ИНН 7706107510 (облигация 4B02-12-00122-A-002P / ISIN RU000A1057S2)",
+  "body_ru": "\n      <table class=\"table_C8_properties\" version=\"96\" cellspacing=\"1\" cellpadding=\"0\" width=\"100%\">\n         <thead bgcolor=\"#ffdddd\">\n            <tr>\n               <th colspan=\"2\" bgcolor=\"#bbbbbb\" align=\"center\">Реквизиты корпоративного действия</th>\n            </tr>\n         </thead>\n         <tbody>\n            <tr>\n               <td bgcolor=\"#eeeeee\">Референс корпоративного действия</td>\n               <td bgcolor=\"#eeeeee\" style=\"word-wrap:break-word;word-break:break-all;\">1220512</td>\n            </tr>\n            <tr>\n               <td bgcolor=\"#eeeeee\">Код типа корпоративного действия</td>\n               <td bgcolor=\"#eeeeee\" style=\"word-wrap:break-word;word-break:break-all;\">BPUT</td>\n            </tr>\n            <tr>\n               <td bgcolor=\"#eeeeee\">Тип корпоративного действия</td>\n               <td bgcolor=\"#eeeeee\" style=\"word-wrap:break-word;word-break:break-all;\">Досрочное погашение ценных бумаг или приобретение их эмитентом</td>\n            </tr>\n            <tr>\n               <td bgcolor=\"#eeeeee\">Вид корпоративного действия</td>\n               <td bgcolor=\"#eeeeee\" style=\"word-wrap:break-word;word-break:break-all;\">Приобретение эмитентом облигаций по требованию их владельцев</td>\n            </tr>\n            <tr>\n               <td bgcolor=\"#eeeeee\">Дата КД (план.)</td>\n               <td bgcolor=\"#eeeeee\">17 сентября 2027 г.</td>\n            </tr>\n            <tr>\n               <td bgcolor=\"#eeeeee\">Возможность выбора валюты выплаты</td>\n               <td bgcolor=\"#eeeeee\" style=\"word-wrap:break-word;word-break:break-all;\">Да</td>\n            </tr>\n         </tbody>\n      </table><br/>\n      <table cellspacing=\"1\" cellpadding=\"0\" width=\"100%\">\n         <thead bgcolor=\"#ffdddd\">\n            <tr>\n               <th colspan=\"10\" bgcolor=\"#bbbbbb\" align=\"center\">Информация о ценных бумагах</th>\n            </tr>\n            <tr>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Референс КД по ценной бумаге</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Эмитент</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Регистрационный номер</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Дата регистрации</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Тип фин.инструмента</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Депозитарный код выпуска</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">ISIN</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Номинальная стоимость</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Остаточная номинальная стоимость</th>\n               <th bgcolor=\"#bbbbbb\" align=\"center\">Валюта номинала</th>\n            </tr>\n         </thead>\n         <tbody>\n            <tr>\n               <td bgcolor=\"#eeeeee\">1220512X75942</td>\n               <td bgcolor=\"#eeeeee\">публичное акционерное общество \"Нефтяная компания \"Роснефть\"</td>\n               <td bgcolor=\"#eeeeee\">4B02-12-00122-A-002P</td>\n               <td bgcolor=\"#eeeeee\">14 сентября 2022 г.</td>\n               <td bgcolor=\"#eeeeee\">облигации  </td>\n               <td bgcolor=\"#eeeeee\">RU000A1057S2</td>\n               <td bgcolor=\"#eeeeee\">RU000A1057S2</td>\n               <td bgcolor=\"#eeeeee\">1000</td>\n               <td bgcolor=\"#eeeeee\">1000</td>\n               <td bgcolor=\"#eeeeee\">CNY</td>\n            </tr>\n         </tbody>\n      </table><br/>\n      <p>Настоящим сообщаем о получении НКО АО НРД информации, предоставляемой эмитентом ценных\n         бумаг в соответствии с Положением ЦБ РФ N 751-П от 11 января 2021 года \"О перечне\n         информации, связанной с осуществлением прав по ценным бумагам, предоставляемой эмитентами\n         центральному депозитарию, порядке и сроках ее предоставления, а также о требованиях\n         к порядку предоставления центральным депозитарием доступа к такой информации\"</p>\n      <p>15.4 Информация о возникновении у владельцев облигаций права требовать от эмитента\n         приобретения принадлежащих им облигаций\n         </p>\n      <p>Путем подачи заявок на Бирже.</p>\n      ",
+  "news_theme_id": 4,
+  "group_id": 26,
+  "pub_date": "2026-09-18 13:28:07",
+  "news_date": "2026-09-18 13:28:07",
+  "content_id_out": 47276652588,
+  "action_id": 1220512,
+  "announce_ru": "(BPUT) О корпоративном действии \"Досрочное погашение ценных бумаг или приобретение их эмитентом\" с ценными бумагами эмитента ПАО \"НК \"Роснефть\" ИНН 7706107510 (облигация 4B02-12-00122-A-002P / ISIN RU000A1057S2)",
+  "for_qu_investor": "N",
+  "ca_type": "BPUT",
+  "data": {
+   "id": 1220512,
+   "link": "https://nsddata.ru/news/view/1445867",
+   "action_date_plan": "2027-09-17",
+   "corp_action_type": {
+    "id": 5,
+    "code": "BPUT",
+    "name": "Досрочное погашение ценных бумаг или приобретение их эмитентом",
+    "name_en": "Put Redemption"
+   },
+   "state": {
+    "id": 141,
+    "code": "N",
+    "name": "Не состоялось"
+   },
+   "securities": [
+    {
+     "id": 10075942,
+     "isin": "RU000A1057S2",
+     "code_nsd": "RU000A1057S2",
+     "name_full": "Биржевые облигации процентные неконвертируемые бездокументарные с централизованным учетом прав серии 002Р-12",
+     "name_full_en": "Rosneft VAR 07/09/32",
+     "instr_type": {
+      "id": 2,
+      "name": "облигации",
+      "name_en": "bonds"
+     },
+     "state_reg_number": "4B02-12-00122-A-002P",
+     "state_reg_date": "2022-09-14",
+     "bond": {
+      "number": "4-00122-A-002P-02E",
+      "reg_date": "2017-11-15",
+      "face_value": 1000,
+      "maturity_value": 1000,
+      "currency": {
+       "id": 14,
+       "code": "CNY",
+       "name_short": "Юань (Китай)",
+       "name_full": "Юань",
+       "digital_code": "156",
+       "_at": "2026-09-18 13:27:05",
+       "_at2": "2026-09-18 13:27:05"
+      }
+     },
+     "issuer": {
+      "id": 4746,
+      "code_nsd": "MS0241800000",
+      "name_full": "публичное акционерное общество \"Нефтяная компания \"Роснефть\"",
+      "name_full_en": "Rosneft Oil Company",
+      "name_short": "ПАО \"НК \"Роснефть\"",
+      "name_short_en": "Rosneft",
+      "name_full_tr": "Rosneft Oil Company",
+      "name_short_tr": "Rosneft",
+      "inn": "7706107510",
+      "ogrn": "1027700043502",
+      "lei_code": "253400JT3MQWNDKMJE44"
+     }
+    }
+   ],
+   "repayment": {
+    "number": 4,
+    "currency": {
+     "id": 14,
+     "code": "CNY",
+     "name_short": "Юань (Китай)",
+     "name_full": "Юань",
+     "digital_code": "156"
+    },
+    "early_redemption": {
+     "type": {
+      "id": 502,
+      "code": "J",
+      "name": "Приобретение эмитентом облигаций по требованию владельцев"
+     },
+     "res_nom_value": 1000,
+     "ep_price_percent": 100,
+     "issuer_start_date": "2027-09-08",
+     "issuer_end_date": "2027-09-14"
+    }
+   }
+  },
+  "id": 1445867,
   "category": "CORP_ACTION"
  }
 }

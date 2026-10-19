@@ -8,7 +8,8 @@ declare(strict_types=1);
  *   1. OffersImporter::rebuild() — таблица offers и признак
  *      securities.has_offer приводятся к спискам биржи. Биржа — двойник,
  *      база — SQLite в памяти (запросы импортёра переносимые).
- *   2. OfferNotice / OfferNoticeProcessor — объявление НРД о досрочном
+ *   2. OfferNotice / OfferNoticeProcessor — объявление НРД об оферте (с
+ *      18.10.2026: сравнение с датой у нас, у объявления приоритет), о досрочном
  *      погашении и отмена оферты, на НАСТОЯЩИХ сообщениях GetNews
  *      (tests/fixtures/getnews_offer_messages.json, выгрузка тестового
  *      доступа 18–30.09.2026): АльфаБО-21, СовкмФ 2Р5, ЧеркизБ2P2,
@@ -197,7 +198,7 @@ check('бумага в техдефолте остаётся в обращени
 check('признак оферты: только у торгуемых бумаг с предстоящей неотменённой офертой', [1, 3, 8, 9, 10, 11, 12],
     array_map('intval', $db->query('SELECT id FROM securities WHERE has_offer = 1 ORDER BY id')->fetchAll(PDO::FETCH_COLUMN)));
 check('отчёт: сколько строк не взято и почему', ['не наша бумага' => 130, 'бумага не торгуется' => 2, 'погашение по сроку, не оферта' => 1,
-    'не предстоящая (пометка биржи)' => 1, 'без даты' => 1, 'отменена НРД' => 1], $report['skipped']);
+    'не предстоящая (пометка биржи)' => 1, 'без даты' => 1, 'отменена НРД' => 1, 'уточнена объявлением НРД' => 0], $report['skipped']);
 check('отчёт: причины удаления', ['это погашение по сроку, не оферта' => 1, 'в таблице биржи больше нет' => 1, 'бумага не торгуется' => 1, 'дата прошла' => 1],
     array_count_values(array_column($report['removed'], 'reason')));
 check('отчёт: итог', [7, 9, 6, 1, 7, 7], [$report['before'], $report['after'], count($report['added']), $report['updated'], $report['flag_before'], $report['flag_after']]);
@@ -252,7 +253,15 @@ check('АльфаБО-21: отмена пута (дата действия у Н
 check('у отмены пута есть период предъявления', ['2026-10-05', '2026-10-09'], [$notice('alfa_put_cancelled')->periodStart, $notice('alfa_put_cancelled')->periodEnd]);
 check('ТБ-3_01: досрочно гасится остаток номинала — 9,877 %', ['call', 'announced', '2026-09-28', '9.877'],
     array_slice($fields($notice('tb3_call_remaining_nominal')), 1, 3) + [3 => $notice('tb3_call_remaining_nominal')->percent]);
-check('объявление НРД о самой оферте (BPUT) не разбирается', null, $notice('put_announcement_not_processed'));
+check('объявление НРД об оферте (BPUT, с 18.10.2026 читается): пут на 14.10.2026, период предъявления, цена, вид J',
+    ['RU000A106K27', 'put', 'announced', '2026-10-14', '2026-09-24', '1089454', '100.000', '2026-10-06', '2026-10-12', 'J'],
+    array_merge($fields($notice('put_announced')), [$notice('put_announced')->periodStart, $notice('put_announced')->periodEnd, $notice('put_announced')->kind]));
+check('АПРИ 2Р14: выкуп по соглашению (вид K) по 90 % на 21.10.2026', ['put', '2026-10-21', '90.000', 'K'],
+    [$notice('apri_buyback_by_agreement')->type, $notice('apri_buyback_by_agreement')->date, $notice('apri_buyback_by_agreement')->percent, $notice('apri_buyback_by_agreement')->kind]);
+check('ЛКХ-02: первое объявление без даты (заглушка НРД 2111-01-01) пропускается; то же действие с датой — читается, вид I', [null, '2026-09-23', 'I', '1218581'],
+    [$notice('lkh_put_without_date'), $notice('lkh_put_with_date')->date, $notice('lkh_put_with_date')->kind, $notice('lkh_put_with_date')->actionRef]);
+check('следующий пут НРД объявляет и за год: RU000A1057S2 — 18.09.2026 на 17.09.2027', ['2027-09-17', '2026-09-18'],
+    [$notice('next_year_put')->date, $notice('next_year_put')->messageDate]);
 check('сообщение о деньгах по досрочному погашению — не объявление', null, $notice('call_money_message'));
 check('купон — не про оферты', null, OfferNotice::fromRaw(['ca_type' => 'INTR', 'title_ru' => '(INTR) О корпоративном действии', 'data' => []]));
 
@@ -324,6 +333,84 @@ check('бумага вышла из обращения или её нет в б�
 $db->exec("INSERT INTO offers (security_id, issuer_id, offer_type, execution_date_planned, status, source, source_ref) VALUES (21, 1, 'put', '2026-10-20', 'announced', 'nsd', '999001')");
 check('повтор старой отмены не трогает оферту, объявленную позже другим действием НРД', ['no_change', true],
     [$run('alfa_put_cancelled', '2026-09-30'), in_array('put 2026-10-20 announced nsd', offersOf($db, 21), true)]);
+
+
+// =====================================================================
+echo "\n--- объявления НРД об офертах: сравнение с датой у нас, у объявления приоритет (18.10.2026) ---\n";
+$db = makeDb();
+$put = [
+    31 => ['RU000A106K27', 'Пут как у биржи', '2028-10-11'],
+    32 => ['RU000A10ERC0', 'АПРИ 2Р14', '2031-03-08'],
+    33 => ['RU000A1057S2', 'Пут через год', '2028-09-14'],
+    34 => ['RU000A10AT01', 'ЛКХ-02', '2028-01-20'],
+    35 => ['RU0000000035', 'Пут после «срока» биржи', '2027-10-06'],
+    36 => ['RU0000000036', 'Пут снова объявлен', '2030-01-01'],
+    37 => ['RU0000000037', 'Колл с другой датой', '2030-01-01'],
+];
+$insert = $db->prepare('INSERT INTO securities (id, isin, short_name, maturity_date) VALUES (?, ?, ?, ?)');
+foreach ($put as $id => $bond) {
+    $insert->execute([$id, ...$bond]);
+}
+$db->exec("INSERT INTO offers (security_id, issuer_id, offer_type, execution_date_planned, status, source, source_ref) VALUES
+    (31, 1, 'put', '2026-10-14', 'announced', 'moex', NULL),
+    (31, 1, 'put', '2026-10-17', 'announced', 'moex', NULL),
+    (32, 1, 'put', '2026-10-23', 'announced', 'moex', NULL),
+    (36, 1, 'put', '2026-11-11', 'cancelled', 'nsd', 'old-1'),
+    (37, 1, 'call', '2026-11-20', 'announced', 'moex', NULL)");
+$processor = new OfferNoticeProcessor($db);
+$go = static fn (string $label, string $today, bool $apply = true): array => $processor->process(OfferNotice::fromRaw($fixtures[$label]), $today, $apply);
+$details = static fn (int $id, string $date): array => array_values($db->query("SELECT source, source_ref, announcement_date, period_start, period_end, price_percent FROM offers
+    WHERE security_id = {$id} AND execution_date_planned = '{$date}'")->fetch());
+
+$before = $db->query('SELECT * FROM offers ORDER BY id')->fetchAll();
+check('просмотр (без записи) ничего не меняет', ['confirmed', $before], [$go('put_announced', '2026-09-24', false)['result'], $db->query('SELECT * FROM offers ORDER BY id')->fetchAll()]);
+$r = $go('put_announced', '2026-09-24');
+check('та же дата, что у биржи (14.10): пут подтверждён — администратору не сообщается; вторая строка биржи той же оферты (17.10) убрана',
+    ['confirmed', ['put 2026-10-14 announced moex']], [$r['result'], offersOf($db, 31)]);
+check('…у строки появились номер действия НРД, день объявления, период предъявления и цена', ['moex', '1089454', '2026-09-24', '2026-10-06', '2026-10-12', '100.000'], $details(31, '2026-10-14'));
+check('повтор того же сообщения ничего не меняет', 'no_change', $go('put_announced', '2026-09-25')['result']);
+
+$r = $go('apri_buyback_by_agreement', '2026-09-28');
+check('АПРИ 2Р14: у нас (биржа) 23.10, НРД объявил 21.10 — верна дата НРД: строка биржи убрана, строка НРД с ценой 90 %',
+    ['applied', '2026-10-23', ['put 2026-10-21 announced nsd'], '90.000'],
+    [$r['result'], $r['previous_date'], offersOf($db, 32), $details(32, '2026-10-21')[5]]);
+check('…в пояснении — какая дата была у нас', true, str_contains($r['note'], '23.10.2026'));
+$moved = new OfferNotice('RU000A10ERC0', 'put', 'announced', '2026-10-28', '2026-10-02', '1223314', '90.000', '2026-10-15', '2026-10-21', 'K');
+$r = $processor->process($moved, '2026-10-02');
+check('НРД перенёс дату того же действия (21.10 → 28.10): строка получила новую дату и новый период', ['applied', '2026-10-21', ['put 2026-10-28 announced nsd'], '2026-10-15'],
+    [$r['result'], $r['previous_date'], offersOf($db, 32), $details(32, '2026-10-28')[3]]);
+
+check('пута у нас нет — добавлен из объявления НРД (за год до даты), признак оферты стоит', ['applied', ['put 2027-09-17 announced nsd'], 1],
+    [$go('next_year_put', '2026-09-18')['result'], offersOf($db, 33), flagOf($db, 33)]);
+check('ЛКХ-02: досрочное погашение по требованию владельцев (вид I) — тоже оферта с датой НРД', ['applied', ['put 2026-09-23 announced nsd']],
+    [$go('lkh_put_with_date', '2026-09-23')['result'], offersOf($db, 34)]);
+check('пут после срока, который даёт биржа (у части выпусков это дата колла, МТС 2P-13), не отбрасывается', ['applied', ['put 2027-10-11 announced nsd']],
+    [$processor->process(new OfferNotice('RU0000000035', 'put', 'announced', '2027-10-11', '2026-10-01', '5001'), '2026-10-01')['result'], offersOf($db, 35)]);
+check('оферта на дату, которую НРД раньше отменил, объявлена снова другим действием — строка снова действует', ['applied', ['put 2026-11-11 announced nsd'], 'new-2'],
+    [$processor->process(new OfferNotice('RU0000000036', 'put', 'announced', '2026-11-11', '2026-10-01', 'new-2'), '2026-10-01')['result'], offersOf($db, 36),
+        $db->query("SELECT source_ref FROM offers WHERE security_id = 36")->fetchColumn()]);
+$r = $processor->process(new OfferNotice('RU0000000037', 'call', 'announced', '2026-11-18', '2026-10-01', '6001', '100.000'), '2026-10-01');
+check('колл: у биржи 20.11, НРД объявил досрочное погашение на 18.11 — верна дата НРД, второй строки нет', ['applied', '2026-11-20', ['call 2026-11-18 announced nsd']],
+    [$r['result'], $r['previous_date'], offersOf($db, 37)]);
+
+// Ночная загрузка: биржа по-прежнему отдаёт свои даты.
+$iss = new FakeIss();
+$iss->market = array_merge(array_column($put, 0), array_map(static fn (int $i): string => sprintf('XX%010d', $i), range(1, 1200)));
+$iss->offers = [
+    $offer('RU000A106K27', '2026-10-14', 'Оферта'), $offer('RU000A106K27', '2026-10-17', 'Оферта'),
+    $offer('RU000A10ERC0', '2026-10-23', 'Оферта'),
+    $offer('RU0000000037', '2026-11-20', 'Оферта/Погашение'),
+];
+foreach (range(1, 130) as $i) {
+    $iss->offers[] = $offer(sprintf('XX%010d', $i), '2027-01-15', 'Оферта');
+}
+$report = (new OffersImporter($iss, $db))->rebuild('2026-10-02', true);
+check('ночная загрузка: строки биржи рядом с датой НРД не возвращаются (3 строки), строки НРД и подтверждённая строка остаются',
+    [3, ['put 2026-10-14 announced moex'], ['put 2026-10-28 announced nsd'], ['call 2026-11-18 announced nsd'], ['put 2027-09-17 announced nsd']],
+    [$report['skipped']['уточнена объявлением НРД'], offersOf($db, 31), offersOf($db, 32), offersOf($db, 37), offersOf($db, 33)]);
+$iss->offers = array_values(array_filter($iss->offers, static fn (array $o): bool => $o['isin'] !== 'RU000A106K27'));
+(new OffersImporter($iss, $db))->rebuild('2026-10-03', true);
+check('биржа перестала отдавать пут, который подтвердил НРД, — строка остаётся до своей даты', ['put 2026-10-14 announced moex'], offersOf($db, 31));
 
 echo "\n";
 if ($failures === 0) {

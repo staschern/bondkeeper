@@ -6,7 +6,7 @@ namespace BondKeeper\Payments;
 
 /**
  * Сообщение НРД, которое меняет наши сведения об офертах (11.10.2026,
- * docs/OFFERS.md). Таких видов два — по выгрузке GetNews за 18–30.09.2026:
+ * docs/OFFERS.md). Таких видов три — по выгрузке GetNews за 18–30.09.2026:
  *
  *   1. Объявление о досрочном погашении по решению эмитента: «(MCAL) О
  *      корпоративном действии "Досрочное обязательное погашение
@@ -22,9 +22,18 @@ namespace BondKeeper\Payments;
  *      день объявления колла НРД отменил запланированный пут, а у биржи он
  *      остался в таблице оферт.
  *
- * Объявления НРД о самой оферте (BPUT, «О корпоративном действии») не
- * разбираются: даты путов даёт биржа. В них есть период предъявления, цена
- * и вид выкупа — это возможное уточнение на будущее.
+ *   3. Объявление об оферте (с 18.10.2026, решение пользователя: «объявления
+ *      НРД об офертах тоже нужно трекать и сравнивать с датой, которая у нас
+ *      в БД, и у объявлений приоритет»): «(BPUT) О корпоративном действии
+ *      "Досрочное погашение ценных бумаг или приобретение их эмитентом"». В
+ *      нём дата, период предъявления, цена и вид выкупа ($kind): J —
+ *      приобретение по требованию владельцев (обычный пут), K — по
+ *      соглашению с владельцами (добровольный выкуп, цена бывает 77–90 %),
+ *      I — досрочное погашение по требованию владельцев (право владельцев
+ *      после нарушения эмитентом условий). НРД объявляет следующую оферту
+ *      часто задолго, иногда за год. Первое объявление иногда выходит без
+ *      даты (заглушка 2111-01-01), дату НРД присылает позже тем же номером
+ *      действия — такое объявление пропускаем.
  */
 final class OfferNotice
 {
@@ -45,12 +54,14 @@ final class OfferNotice
         public readonly ?string $percent = null,
         public readonly ?string $periodStart = null,
         public readonly ?string $periodEnd = null,
+        /** Вид выкупа у объявления оферты: J, K или I (см. докблок класса). */
+        public readonly ?string $kind = null,
     ) {
     }
 
     /**
      * @param array<string, mixed> $rawMessage один элемент ответа GetNewsClient::fetchNews()
-     * @return ?self null — сообщение не про объявление колла и не про отмену
+     * @return ?self null — сообщение не про объявление оферты или колла и не про отмену
      */
     public static function fromRaw(array $rawMessage): ?self
     {
@@ -68,7 +79,7 @@ final class OfferNotice
         $stateCode = (string) ($data['state']['code'] ?? '');
         if (preg_match('/об отмене корпоративного действия/ui', $title) === 1) {
             $action = self::ACTION_CANCELLED;
-        } elseif ($type === 'call' && preg_match('/о корпоративном действии/ui', $title) === 1 && in_array($stateCode, ['N', 'A'], true)) {
+        } elseif (preg_match('/о корпоративном действии/ui', $title) === 1 && in_array($stateCode, ['N', 'A'], true)) {
             $action = self::ACTION_ANNOUNCED;
         } else {
             return null;
@@ -80,6 +91,10 @@ final class OfferNotice
         $messageDate = substr((string) ($rawMessage['pub_date'] ?? ''), 0, 10);
         $actionRef = (string) ($rawMessage['action_id'] ?? $data['id'] ?? '');
         if ($isin === '' || $actionRef === '' || preg_match('/^\d{4}-\d{2}-\d{2}$/', $date) !== 1 || preg_match('/^\d{4}-\d{2}-\d{2}$/', $messageDate) !== 1) {
+            return null;
+        }
+        // Заглушка НРД «дата ещё не назначена» (2111-01-01): настоящую дату пришлёт следующее объявление.
+        if ($date >= '2100-01-01') {
             return null;
         }
 
@@ -97,6 +112,8 @@ final class OfferNotice
             percent: is_numeric($percent) && (float) $percent > 0 && (float) $percent < 1000 ? number_format((float) $percent, 3, '.', '') : null,
             periodStart: self::date($early['issuer_start_date'] ?? null),
             periodEnd: self::date($early['issuer_end_date'] ?? null),
+            kind: $type === 'put' && is_array($early['type'] ?? null) && in_array($early['type']['code'] ?? null, ['J', 'K', 'I'], true)
+                ? (string) $early['type']['code'] : null,
         );
     }
 

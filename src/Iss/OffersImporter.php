@@ -69,6 +69,13 @@ use RuntimeException;
  * Строки из объявлений НРД (source = nsd) живут до своей даты. Оферта,
  * отменённая НРД (status = cancelled), с биржи заново не загружается.
  *
+ * У объявления НРД приоритет над биржей (решение пользователя,
+ * 18.10.2026, OfferNoticeProcessor): строка биржи того же вида рядом по
+ * дате (CANCEL_WINDOW_DAYS) с офертой, которую объявил НРД, но с другой
+ * датой, не загружается и удаляется («уточнена объявлением НРД»); строка
+ * биржи, которую подтвердило объявление НРД (у неё есть source_ref), не
+ * удаляется, даже если биржа перестала её отдавать.
+ *
  * === Защита ===
  *
  * Если список торгуемых бумаг или список оферт выглядит неполным (сбой у
@@ -138,7 +145,7 @@ final class OffersImporter
 
         $exchangeRows = $this->fetchUpcoming($today);
         $existing = $this->db->query(
-            'SELECT id, security_id, offer_type, execution_date_planned, period_start, period_end, price_percent, status, source FROM offers ORDER BY id'
+            'SELECT id, security_id, offer_type, execution_date_planned, period_start, period_end, price_percent, status, source, source_ref FROM offers ORDER BY id'
         )->fetchAll(PDO::FETCH_ASSOC);
 
         $knownIsins = array_fill_keys(array_map(static fn (array $s): string => (string) $s['isin'], $securities), true);
@@ -152,15 +159,20 @@ final class OffersImporter
         }
         /** @var array<int, array<int, array{type: string, date: string}>> $cancelled отмены НРД по бумагам */
         $cancelled = [];
+        /** @var array<int, array<int, array{type: string, date: string}>> $announced оферты, объявленные или подтверждённые НРД */
+        $announced = [];
         foreach ($existing as $row) {
+            $mark = ['type' => (string) $row['offer_type'], 'date' => (string) $row['execution_date_planned']];
             if ($row['status'] === 'cancelled') {
-                $cancelled[(int) $row['security_id']][] = ['type' => (string) $row['offer_type'], 'date' => (string) $row['execution_date_planned']];
+                $cancelled[(int) $row['security_id']][] = $mark;
+            } elseif ($row['source'] === 'nsd' || (string) ($row['source_ref'] ?? '') !== '') {
+                $announced[(int) $row['security_id']][] = $mark;
             }
         }
 
         // --- Что должно быть в таблице по данным биржи -----------------------
         $skipped = ['не наша бумага' => 0, 'бумага не торгуется' => 0, 'погашение по сроку, не оферта' => 0, 'не предстоящая (пометка биржи)' => 0,
-            'без даты' => 0, 'отменена НРД' => 0];
+            'без даты' => 0, 'отменена НРД' => 0, 'уточнена объявлением НРД' => 0];
         /** @var array<string, array{security_id: int, issuer_id: int, type: string, date: string, period_start: ?string, period_end: ?string, price: ?string}> $desired */
         $desired = [];
         /** @var array<string, true> $redemptions «бумага|дата» строк биржи, которые оказались погашением по сроку */
@@ -194,6 +206,10 @@ final class OffersImporter
             $securityId = (int) $security['id'];
             if (self::nearCancelled($cancelled[$securityId] ?? [], $type, $date)) {
                 $skipped['отменена НРД']++;
+                continue;
+            }
+            if (self::nearOtherDate($announced[$securityId] ?? [], $type, $date)) {
+                $skipped['уточнена объявлением НРД']++;
                 continue;
             }
 
@@ -230,8 +246,12 @@ final class OffersImporter
             $reason = match (true) {
                 $date === '' || $date < $today => 'дата прошла',
                 !isset($tradableIds[$securityId]) => 'бумага не торгуется',
-                $row['status'] !== 'cancelled' && $row['source'] === 'moex' && !isset($desired[$key])
-                    => isset($redemptions["{$securityId}|{$date}"]) ? 'это погашение по сроку, не оферта' : 'в таблице биржи больше нет',
+                $row['status'] !== 'cancelled' && $row['source'] === 'moex' && !isset($desired[$key]) && (string) ($row['source_ref'] ?? '') === ''
+                    => match (true) {
+                        isset($redemptions["{$securityId}|{$date}"]) => 'это погашение по сроку, не оферта',
+                        self::nearOtherDate($announced[$securityId] ?? [], $type, $date) => 'уточнена объявлением НРД',
+                        default => 'в таблице биржи больше нет',
+                    },
                 default => null,
             };
             if ($reason !== null) {
@@ -400,6 +420,22 @@ final class OffersImporter
     {
         foreach ($cancelled as $mark) {
             if ($mark['type'] === $type && abs(strtotime($mark['date']) - strtotime($date)) <= self::CANCEL_WINDOW_DAYS * 86400) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Есть ли оферта того же вида, объявленная НРД, рядом по дате, но в другой день: тогда верна дата НРД.
+     *
+     * @param array<int, array{type: string, date: string}> $announced
+     */
+    private static function nearOtherDate(array $announced, string $type, string $date): bool
+    {
+        foreach ($announced as $mark) {
+            if ($mark['type'] === $type && $mark['date'] !== $date && abs(strtotime($mark['date']) - strtotime($date)) <= self::CANCEL_WINDOW_DAYS * 86400) {
                 return true;
             }
         }

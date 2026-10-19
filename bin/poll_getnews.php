@@ -56,11 +56,14 @@ declare(strict_types=1);
  *     того, что НРД изменил формат.
  *
  * === Оферты (11.10.2026, docs/OFFERS.md) ===
- * Из той же ленты берутся два вида сообщений об офертах: объявление о
- * досрочном погашении по решению эмитента (MCAL) и отмена оферты или
- * досрочного погашения. Они меняют таблицу offers и признак оферты у
- * бумаги; клиентам по ним ничего не уходит, администратор получает
- * короткую сводку (в тихом прогоне — нет).
+ * Из той же ленты берутся три вида сообщений об офертах: объявление об
+ * оферте (BPUT, с 18.10.2026), объявление о досрочном погашении по
+ * решению эмитента (MCAL) и отмена оферты или досрочного погашения. Они
+ * меняют таблицу offers и признак оферты у бумаги; у объявления НРД
+ * приоритет над датой биржи (OfferNoticeProcessor). Администратор
+ * получает короткую сводку (в тихом прогоне — нет): новые оферты,
+ * изменённые даты — с прежней датой, отмены; пут, который объявление
+ * только подтвердило (та же дата), в сводку не попадает.
  *
  * Запуск:
  *   php bin/poll_getnews.php --dry-run                           (просмотр последних 3 дней со сверкой по базе)
@@ -225,7 +228,7 @@ $skipped = [];
 $unreadable = [];
 /** @var array<int, array{0: string, 1: \BondKeeper\Payments\PaymentMessage}> $messages */
 $messages = [];
-/** @var array<int, array{0: string, 1: OfferNotice}> $offerNotices объявленные коллы и отмены оферт */
+/** @var array<int, array{0: string, 1: OfferNotice}> $offerNotices объявленные оферты и коллы, отмены */
 $offerNotices = [];
 
 try {
@@ -264,7 +267,7 @@ try {
 }
 
 Logger::info("Получено сообщений: {$received} (запросов: {$pager->requestsMade()}); о выплатах: " . count($messages)
-    . '; об офертах (объявленное досрочное погашение, отмена): ' . count($offerNotices));
+    . '; об офертах (объявления, отмены): ' . count($offerNotices));
 foreach ($skipped as $reason => $count) {
     Logger::info("  пропущено — {$reason}: {$count}");
 }
@@ -307,10 +310,17 @@ $processOfferNotices = static function (PDO $db, array $offerNotices, string $to
         }
         $counts[$result['result']] = ($counts[$result['result']] ?? 0) + 1;
         if ($result['result'] === OfferNoticeProcessor::RESULT_APPLIED) {
-            $what = $notice->action === OfferNotice::ACTION_CANCELLED
-                ? ($notice->type === 'call' ? 'отменено досрочное погашение' : 'отменена оферта')
-                : 'объявлено досрочное погашение' . ($notice->percent !== null ? ' (' . rtrim(rtrim($notice->percent, '0'), '.') . ' % номинала)' : '');
-            $line = "{$result['security_name']} ({$notice->isin}): {$what}, дата " . date('d.m.Y', (int) strtotime($notice->date));
+            $percent = $notice->percent !== null ? rtrim(rtrim($notice->percent, '0'), '.') . ' % номинала' : null;
+            $what = match (true) {
+                $notice->action === OfferNotice::ACTION_CANCELLED => $notice->type === 'call' ? 'отменено досрочное погашение' : 'отменена оферта',
+                $notice->type === 'call' => 'объявлено досрочное погашение' . ($percent !== null ? " ({$percent})" : ''),
+                $notice->kind === 'K' => 'объявлен выкуп по соглашению с владельцами' . ($percent !== null ? " по цене {$percent}" : ''),
+                $notice->kind === 'I' => 'объявлено досрочное погашение по требованию владельцев',
+                default => 'объявлена оферта (пут)' . ($percent !== null ? " по цене {$percent}" : ''),
+            };
+            // Дата у НРД другая, чем была у нас: у объявления приоритет (решение пользователя, 18.10.2026) — говорим, что изменилось.
+            $was = ($result['previous_date'] ?? null) !== null ? ' (у нас было ' . date('d.m.Y', (int) strtotime((string) $result['previous_date'])) . ')' : '';
+            $line = "{$result['security_name']} ({$notice->isin}): {$what}, дата " . date('d.m.Y', (int) strtotime($notice->date)) . $was;
             $lines[] = '• ' . $line;
             Logger::info(($apply ? '' : '[просмотр] ') . "оферты: {$line} — {$result['note']}");
             if ($notice->action !== OfferNotice::ACTION_CANCELLED) {
@@ -319,9 +329,10 @@ $processOfferNotices = static function (PDO $db, array $offerNotices, string $to
         }
     }
     Logger::info(sprintf(
-        'Оферты по сообщениям НРД: %s %d; без изменений: %d; не оферта или дата прошла: %d; чужие бумаги: %d',
+        'Оферты по сообщениям НРД: %s %d; подтверждено (та же дата): %d; без изменений: %d; не оферта или дата прошла: %d; чужие бумаги: %d',
         $apply ? 'применено' : 'было бы применено',
         $counts[OfferNoticeProcessor::RESULT_APPLIED] ?? 0,
+        $counts[OfferNoticeProcessor::RESULT_CONFIRMED] ?? 0,
         $counts[OfferNoticeProcessor::RESULT_NO_CHANGE] ?? 0,
         $counts[OfferNoticeProcessor::RESULT_IGNORED] ?? 0,
         $counts[OfferNoticeProcessor::RESULT_FOREIGN] ?? 0,
