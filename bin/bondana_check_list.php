@@ -17,16 +17,15 @@ declare(strict_types=1);
  * НРД уже объявил колл (offers: offer_type='call', source='nsd') — для
  * них Bondana не нужна; наличие/отсутствие пута на решение не влияет.
  *
- * Выгружает по одному ISIN на строку, разбитыми на части по CHUNK_SIZE
- * штук — ровно формат, который ждёт run_part.sh/bondana_offers_runner.php
- * (файлы no_offer_part1.txt, no_offer_part2.txt, ...). Части складываются
- * в var/bondana/ — оттуда их нужно скопировать в папку раннера рядом с
- * run_part.sh и запустить, например:
+ * Выгружает по одному ISIN на строку в помесячный файл
+ * /parser_offer/bondana_ГГГГММ.txt (месяц и год — текущие на момент
+ * запуска скрипта). Если файл за этот месяц уже существует — новые ISIN
+ * дописываются в конец без повторов, уже имеющиеся в файле не трогаются.
+ * Раннер запускается из /parser_offer тем же именем файла:
  *
- *   nohup bash run_part.sh 1 2 3 >> out/nohup.log 2>&1 &
+ *   nohup php bondana_offers_runner.php run --isins=bondana_202610.txt >> out/nohup.log 2>&1 &
  *
  *   php bin/bondana_check_list.php
- *   php bin/bondana_check_list.php --chunk=300
  */
 
 require __DIR__ . '/bootstrap.php';
@@ -35,19 +34,7 @@ use BondKeeper\Database;
 use BondKeeper\Securities\SecurityStatus;
 use BondKeeper\Support\Logger;
 
-const OUT_DIR = __DIR__ . '/../var/bondana';
-const DEFAULT_CHUNK_SIZE = 500;
-
-$chunkSize = DEFAULT_CHUNK_SIZE;
-foreach ($argv as $arg) {
-    if (str_starts_with($arg, '--chunk=')) {
-        $chunkSize = (int) substr($arg, 8);
-    }
-}
-if ($chunkSize < 1) {
-    fwrite(STDERR, "--chunk должен быть положительным числом\n");
-    exit(1);
-}
+const OUT_DIR = '/parser_offer';
 
 $db = Database::connection();
 $isins = $db->query(
@@ -67,21 +54,37 @@ if ($isins === []) {
     exit(0);
 }
 
-if (!is_dir(OUT_DIR)) {
-    mkdir(OUT_DIR, 0775, true);
+if (!is_dir(OUT_DIR) && !mkdir(OUT_DIR, 0775, true) && !is_dir(OUT_DIR)) {
+    fwrite(STDERR, "Не удалось создать каталог " . OUT_DIR . "\n");
+    exit(1);
 }
 
-$parts = array_chunk($isins, $chunkSize);
-foreach ($parts as $i => $part) {
-    $file = OUT_DIR . '/no_offer_part' . ($i + 1) . '.txt';
-    file_put_contents($file, implode("\n", $part) . "\n");
+$file = OUT_DIR . '/bondana_' . date('Ym') . '.txt';
+$existing = is_file($file)
+    ? array_flip(file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES))
+    : [];
+
+$new = array_values(array_diff($isins, array_keys($existing)));
+
+if ($new === []) {
+    Logger::info('Все ' . count($isins) . " бумаг уже есть в {$file} — ничего не добавлено.");
+    exit(0);
 }
+
+$handle = fopen($file, 'a');
+if ($handle === false) {
+    fwrite(STDERR, "Не удалось открыть на запись {$file}\n");
+    exit(1);
+}
+foreach ($new as $isin) {
+    fwrite($handle, $isin . "\n");
+}
+fclose($handle);
 
 Logger::info(sprintf(
-    'Бумаг на проверку по Bondana: %d — записано в %d файл(ов) по %d в %s',
+    'Бумаг на проверку по Bondana: %d, из них новых: %d (уже было в файле: %d) — записано в %s',
     count($isins),
-    count($parts),
-    $chunkSize,
-    OUT_DIR,
+    count($new),
+    count($isins) - count($new),
+    $file,
 ));
-Logger::info('Скопировать no_offer_part*.txt в папку раннера и запустить run_part.sh с нужными номерами частей.');
