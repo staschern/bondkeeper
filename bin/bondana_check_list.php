@@ -17,15 +17,16 @@ declare(strict_types=1);
  * НРД уже объявил колл (offers: offer_type='call', source='nsd') — для
  * них Bondana не нужна; наличие/отсутствие пута на решение не влияет.
  *
- * Выгружает не CSV/txt, а сразу готовый массив LIST — ровно то, что ждёт
- * bondana_offers_check.js (строка `const LIST = [...]`, формат [ISIN,
- * наша дата погашения или '']): скрипт получает ISIN не из отдельного
- * файла, а как JS-литерал, вставленный прямо в его код. Выгрузка
- * сохраняется в var/bondana_check_list.js — открыть, скопировать
- * содержимое, вставить вместо строки `const LIST = [...]` в
- * bondana_offers_check.js, запустить в консоли браузера на bondana.app.
+ * Выгружает по одному ISIN на строку, разбитыми на части по CHUNK_SIZE
+ * штук — ровно формат, который ждёт run_part.sh/bondana_offers_runner.php
+ * (файлы no_offer_part1.txt, no_offer_part2.txt, ...). Части складываются
+ * в var/bondana/ — оттуда их нужно скопировать в папку раннера рядом с
+ * run_part.sh и запустить, например:
+ *
+ *   nohup bash run_part.sh 1 2 3 >> out/nohup.log 2>&1 &
  *
  *   php bin/bondana_check_list.php
+ *   php bin/bondana_check_list.php --chunk=300
  */
 
 require __DIR__ . '/bootstrap.php';
@@ -34,11 +35,23 @@ use BondKeeper\Database;
 use BondKeeper\Securities\SecurityStatus;
 use BondKeeper\Support\Logger;
 
-const OUT_FILE = __DIR__ . '/../var/bondana_check_list.js';
+const OUT_DIR = __DIR__ . '/../var/bondana';
+const DEFAULT_CHUNK_SIZE = 500;
+
+$chunkSize = DEFAULT_CHUNK_SIZE;
+foreach ($argv as $arg) {
+    if (str_starts_with($arg, '--chunk=')) {
+        $chunkSize = (int) substr($arg, 8);
+    }
+}
+if ($chunkSize < 1) {
+    fwrite(STDERR, "--chunk должен быть положительным числом\n");
+    exit(1);
+}
 
 $db = Database::connection();
-$rows = $db->query(
-    "SELECT s.isin, s.maturity_date
+$isins = $db->query(
+    "SELECT s.isin
      FROM securities s
      WHERE s.bondana_checked_at IS NULL
        AND s.status IN (" . SecurityStatus::inCirculationSql() . ")
@@ -47,24 +60,28 @@ $rows = $db->query(
            WHERE o.security_id = s.id AND o.offer_type = 'call' AND o.source = 'nsd'
        )
      ORDER BY s.isin"
-)->fetchAll();
+)->fetchAll(\PDO::FETCH_COLUMN);
 
-if ($rows === []) {
+if ($isins === []) {
     Logger::info('Новых бумаг на проверку по Bondana нет — список не создан.');
     exit(0);
 }
 
-$items = array_map(
-    static fn (array $r): string => '[' . json_encode((string) $r['isin'], JSON_UNESCAPED_UNICODE) . ',' . json_encode((string) ($r['maturity_date'] ?? '')) . ']',
-    $rows,
-);
-
-$js = "const LIST = [\n" . implode(",\n", $items) . "\n];\n";
-
-if (!is_dir(dirname(OUT_FILE))) {
-    mkdir(dirname(OUT_FILE), 0775, true);
+if (!is_dir(OUT_DIR)) {
+    mkdir(OUT_DIR, 0775, true);
 }
-file_put_contents(OUT_FILE, $js);
 
-Logger::info('Бумаг на проверку по Bondana: ' . count($rows) . ' — записано в ' . OUT_FILE);
-Logger::info('Вставить содержимое файла вместо строки "const LIST = [...]" в bondana_offers_check.js и запустить в консоли браузера на bondana.app.');
+$parts = array_chunk($isins, $chunkSize);
+foreach ($parts as $i => $part) {
+    $file = OUT_DIR . '/no_offer_part' . ($i + 1) . '.txt';
+    file_put_contents($file, implode("\n", $part) . "\n");
+}
+
+Logger::info(sprintf(
+    'Бумаг на проверку по Bondana: %d — записано в %d файл(ов) по %d в %s',
+    count($isins),
+    count($parts),
+    $chunkSize,
+    OUT_DIR,
+));
+Logger::info('Скопировать no_offer_part*.txt в папку раннера и запустить run_part.sh с нужными номерами частей.');
