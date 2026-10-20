@@ -18,10 +18,12 @@ declare(strict_types=1);
  * них Bondana не нужна; наличие/отсутствие пута на решение не влияет.
  *
  * Выгружает по одному ISIN на строку в помесячный файл
- * /parser_offer/bondana_ГГГГММ.txt (месяц и год — текущие на момент
- * запуска скрипта). Если файл за этот месяц уже существует — новые ISIN
- * дописываются в конец без повторов, уже имеющиеся в файле не трогаются.
- * Раннер запускается из /parser_offer тем же именем файла:
+ * parser_offer/bondana_ГГГГММ.txt (месяц и год — текущие на момент
+ * запуска скрипта; каталог — рядом с bin/, т.е.
+ * /var/www/www-root/data/bondkeeper-app/parser_offer/ на сервере). Если
+ * файл за этот месяц уже существует — новые ISIN дописываются в конец
+ * без повторов, уже имеющиеся в файле не трогаются. Раннер запускается
+ * из этого же каталога тем же именем файла:
  *
  *   nohup php bondana_offers_runner.php run --isins=bondana_202610.txt >> out/nohup.log 2>&1 &
  *
@@ -34,7 +36,7 @@ use BondKeeper\Database;
 use BondKeeper\Securities\SecurityStatus;
 use BondKeeper\Support\Logger;
 
-const OUT_DIR = '/parser_offer';
+const OUT_DIR = __DIR__ . '/../parser_offer';
 
 $db = Database::connection();
 $isins = $db->query(

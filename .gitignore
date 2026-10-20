@@ -6,3 +6,4 @@ config/payments.php
 config/nsd_api.php
 /data/acra_issuers.json
 /var/
+/parser_offer/
