@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace BondKeeper\Fns;
 
+use BondKeeper\Database;
 use BondKeeper\Events\EventPublisher;
 use BondKeeper\Payments\WorkingCalendar;
 use BondKeeper\Support\Logger;
@@ -144,8 +145,8 @@ final class FnsBlocksImporter
      */
     public function __construct(
         private readonly NalogBiClientInterface $client,
-        private readonly PDO $db,
-        private readonly EventPublisher $events,
+        private PDO $db,
+        private EventPublisher $events,
         private readonly int $delaySeconds = 5,
         private readonly ?WorkingCalendar $calendar = null,
         private readonly ?\Closure $today = null,
@@ -202,7 +203,34 @@ final class FnsBlocksImporter
         $this->printReport();
     }
 
+    /**
+     * При большом списке эмитентов и паузах между ними ($delaySeconds,
+     * $retryDelaySeconds) весь прогон может занять дольше, чем MySQL
+     * `wait_timeout` для простаивающего соединения — тогда очередной
+     * запрос падает с "MySQL server has gone away" (найдено вживую,
+     * 21.10.2026, на check_fns_blocks.php). Тот же приём, что у
+     * bin/daemon_telegram_bot.php (см. докблок Database): отличаем именно
+     * "соединение протухло само" от содержательной ошибки и один раз
+     * переподключаемся, не теряя остальной список и накопленные счётчики
+     * (они живут на $this, а не пересоздаются вместе с $db).
+     */
     private function checkOne(int $issuerId, string $inn): bool
+    {
+        try {
+            return $this->attemptCheckOne($issuerId, $inn);
+        } catch (PDOException $e) {
+            if (!Database::isConnectionLost($e)) {
+                throw $e;
+            }
+            Logger::warn("ФНС: ИНН {$inn} — MySQL-соединение протухло (простой между проверками), переподключаюсь");
+            $this->db = Database::reconnect();
+            $this->events = new EventPublisher($this->db);
+
+            return $this->attemptCheckOne($issuerId, $inn);
+        }
+    }
+
+    private function attemptCheckOne(int $issuerId, string $inn): bool
     {
         try {
             $result = $this->client->check($inn);
